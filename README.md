@@ -77,7 +77,7 @@ Macro files are the same on both platforms. Keys are saved by name, but **screen
 | **Title bar** | MacroFlow's own dark title bar: the app name (top left), show/hide panel, New / Open / Save, the macro name (click it to rename), Mouse moves toggle, **● Record**, **◎ Record step** and **▶ Run** / **■ Stop**. On macOS the traffic lights sit in it. On Windows it has minimise / maximise / close buttons. Drag empty space to move the window. |
 | **Left panel** | Three tabs. **Steps**: every step type, grouped (Mouse, Keyboard, Smart checks, Flow & timing, Recording). Click one to add it. **Edit**: settings for the selected step (opens automatically when you click a step). **Macro**: macro-wide settings (name, speed, repeat, start delay, bulk delay tools). ⌘B / Ctrl+B shows or hides the panel. |
 | **Canvas** | Drag steps to move them. Drag from a step's **right-hand dot** to another step to connect them. Click the **×** on a line, or right-click a dot, to disconnect. Drag empty space or scroll to pan. |
-| **Status bar** | Shows what's happening and which step is running. The running step is outlined in yellow. |
+| **Status bar** | Shows what's happening and which step is running. The running step is outlined in yellow. When a run ends, it says **why** (reached an End step, a path with nothing connected, you pressed Esc/Stop, or a step went wrong), and the step responsible is outlined in **red** with a "stopped here" tag. If it ended on an unconnected output, that output's dot is red too. **Show step** jumps to it, even inside a group. ✕ clears the highlight. |
 
 If a step is selected, new steps are placed after it and connected automatically.
 If you close the window or quit with unsaved changes, MacroFlow asks whether to **Save**, **Don't Save** or **Cancel**.
@@ -89,7 +89,7 @@ If you close the window or quit with unsaved changes, MacroFlow asks whether to 
 | Step | Outputs | Notes |
 |---|---|---|
 | **Start** | next | Every run begins here. |
-| **Click** | next | Left / right / middle, single or double click, at a fixed spot, at the found image (+ offset), or wherever the pointer is. "Pick position on screen" captures the pointer position after 3 s. |
+| **Click** | next | Left / right / middle, single or double click, at a fixed spot, **randomly inside an area** (drag a box around it), at the found image (+ offset), or wherever the pointer is. **Random offset (px)** moves each click up to that many pixels in a random direction, so it never clicks exactly the same place twice in a row. "Pick position on screen" captures the pointer position after 3 s. |
 | **Move mouse** | next | Same targeting options as Click. |
 | **Key press** | next | Any key plus ⌃⌥⇧⌘. Use "Capture key from keyboard" to set it by pressing the keys. |
 | **Type text** | next | Types a string, optionally followed by Return. |
@@ -99,6 +99,7 @@ If you close the window or quit with unsaved changes, MacroFlow asks whether to 
 | **Find image** | **found** / **not found** | Looks for an image on every display until it appears or the timeout runs out. **Drag a box on screen** around what to find, snip the area around the pointer, or choose a PNG. **Look in → One area** limits the search to part of the screen you drag a box around: much faster, and it can't match the same picture somewhere else. "Test now" checks it straight away. You can make it click the image when found. Later Click / Move steps can target the found image. |
 | **Window check** | **yes** / **no** | Checks whether the **current window** (the front window of the app you're using) or **any open window** has a title / app name that contains, equals or starts with some text. Optional match case, "keep checking for N ms" (to wait for a window to open or come to the front) and "bring it to the front if found". **Show open windows** lists what's open right now. Click one to fill in the text. |
 | **Read text** | **match** / **no match** | Reads the text in a screen area using the OCR built into the system (Apple Vision on macOS, Windows OCR on Windows). Each read cleans the image up (enlarges it, boosts contrast, flips light-on-dark text, adds a margin), reads three versions at once and takes the answer they agree on, re-reading if they don't. Number comparisons (and **Only read a number**) fix common misreads (O→0, l→1, S→5), join split digits and handle thousands separators. Click **Select area (drag a box)**: MacroFlow minimises and you drag a box around the text or number anywhere on your screen. Compare as **text** (contains, is exactly, starts with, matches regex, has any text, has changed) or as a **number** (=, ≠, >, ≥, <, ≤, using the first number in the area). "Read now" shows what it reads. "Keep reading for N ms" waits for the condition. A Type text step can type what was read with `{text}`. |
+| **Pop-up** | next | Shows a small card at the top of the screen (top centre or top right) with a title, message and style (Info / Success / Warning / Error), optionally with a sound. It never takes focus, so it doesn't interrupt what the macro is typing or clicking. It fades out after a set time, or with **Pause until I click it** the macro waits for you to click it. `{text}` shows what the last Read text step read. **Preview pop-up** shows it without running the macro. |
 | **Group** | next | A collapsed run of steps that shows as one step (a little stack of cards). Double-click it to open it. See **Groups** below. |
 | **Loop** | **repeat** / **done** | Runs the "repeat" branch N times (0 = forever), then follows "done". Connect the last step of the loop back into the Loop step. |
 | **End** | none | Stops the macro. A step with nothing connected also stops it. |
@@ -179,6 +180,8 @@ src/
   engine.rs  background threads: playback, recording, position picking, snipping
   vision.rs  screen capture, area selection, OCR, window list, template matching
 helpers/
+  notify.swift macOS pop-up helper, compiled by build.rs
+  notify.ps1   Windows pop-up helper (WinForms), embedded into the app
   ocr.swift  macOS OCR helper (Apple Vision), compiled by build.rs
   ocr.ps1    Windows OCR helper (Windows.Media.Ocr), embedded into the app
 build.rs     compiles the macOS OCR helper
@@ -195,6 +198,7 @@ Main libraries: `gpui` (UI), `enigo` (sending input), `device_query` (reading in
 - **`link.exe not found` / MSVC errors**: install Visual Studio Build Tools with "Desktop development with C++".
 - **`fxc.exe` not found** (release builds): set `GPUI_FXC_PATH` (see Setup).
 - **Clicks/keys don't reach an app**: that app is probably running as administrator. Run MacroFlow as administrator.
+- **Pop-up doesn't appear**: errors are logged to `%TEMP%\macroflow-notify.log`. The very first pop-up after starting MacroFlow can take a second to appear while Windows prepares it.
 - **Select area shows an error / no box**: MacroFlow shows the selector's error in the status bar. Details are also logged to `%TEMP%\macroflow-select.log`.
 - **Read text says no OCR language**: install a language pack that includes OCR (Settings → Time & language).
 

@@ -1,6 +1,6 @@
 //! The MacroFlow window: toolbar, step palette, flowchart canvas and inspector.
 
-use crate::engine::{self, AreaPurpose, WorkerMsg};
+use crate::engine::{self, AreaPurpose, EndKind, RunEnd, WorkerMsg};
 use crate::keys;
 use crate::model::*;
 use crate::vision;
@@ -119,6 +119,10 @@ enum Field {
     CompareValue,
     WinText,
     GroupName,
+    ToastTitle,
+    ToastText,
+    ToastMs,
+    ClickJitter,
 }
 
 impl Field {
@@ -131,6 +135,8 @@ impl Field {
                 | Field::CompareValue
                 | Field::WinText
                 | Field::GroupName
+                | Field::ToastTitle
+                | Field::ToastText
         )
     }
     fn is_decimal(self) -> bool {
@@ -177,6 +183,10 @@ pub struct MacroApp {
     capture_started: Option<Instant>,
     /// MacroFlow minimised itself for "Read now" / "Test now": bring it back afterwards.
     restore_after_test: bool,
+    /// The pop-up shown by "Preview" (a new preview replaces it).
+    preview_toast: Option<std::process::Child>,
+    /// Why the last run ended; its step is highlighted in red until the next run.
+    last_end: Option<RunEnd>,
 }
 
 impl MacroApp {
@@ -247,6 +257,8 @@ impl MacroApp {
             _activation: activation,
             capture_started: None,
             restore_after_test: false,
+            preview_toast: None,
+            last_end: None,
         }
     }
 
@@ -261,10 +273,11 @@ impl MacroApp {
             match msg {
                 WorkerMsg::Status(s) => self.status = s,
                 WorkerMsg::Active(id) => self.active_node = id,
-                WorkerMsg::RunFinished(s) => {
+                WorkerMsg::RunFinished(end) => {
                     self.mode = Mode::Idle;
                     self.active_node = None;
-                    self.status = s;
+                    self.status = end.message.clone();
+                    self.last_end = Some(end);
                 }
                 WorkerMsg::Recorded(events) => {
                     self.mode = Mode::Idle;
@@ -350,7 +363,7 @@ impl MacroApp {
                             });
                             self.status = format!("Saved {}. Use “Test now” to check it.", path.display());
                         }
-                        AreaPurpose::SearchArea(_) => {}
+                        AreaPurpose::SearchArea(_) | AreaPurpose::ClickArea(_) => {}
                     }
                 }
                 WorkerMsg::Windows(list) => {
@@ -395,6 +408,7 @@ impl MacroApp {
 
     fn start_run(&mut self) {
         if self.begin_worker(Mode::Running) {
+            self.last_end = None;
             self.status = "Starting…".into();
             engine::run_macro(self.doc.clone(), self.tx.clone(), self.stop.clone());
         }
@@ -511,6 +525,24 @@ impl MacroApp {
                 self.status = format!(
                     "Find image will only look inside {w}×{h} at ({gx}, {gy}). Press “Test now” to check it."
                 );
+                return;
+            }
+            AreaPurpose::ClickArea(id) => {
+                let _ = std::fs::remove_file(&shot.path);
+                let rect = ScreenRect {
+                    x: gx,
+                    y: gy,
+                    w: w as i32,
+                    h: h as i32,
+                };
+                self.update_node(id, |k| match k {
+                    NodeKind::Click { area, target, .. } | NodeKind::MoveMouse { area, target, .. } => {
+                        *area = Some(rect);
+                        *target = Target::Area;
+                    }
+                    _ => {}
+                });
+                self.status = format!("It will click a random spot inside {w}×{h} at ({gx}, {gy}) each time.");
                 return;
             }
         }
@@ -868,6 +900,7 @@ impl MacroApp {
         self.selected = None;
         self.extra.clear();
         self.view.clear();
+        self.last_end = None;
         self.editing = None;
         self.pan = (0.0, 0.0);
         self.status = "New macro.".into();
@@ -908,6 +941,7 @@ impl MacroApp {
                 self.selected = None;
                 self.extra.clear();
                 self.view.clear();
+                self.last_end = None;
                 self.editing = None;
                 self.pan = (0.0, 0.0);
                 self.status = format!("Opened {}", path.display());
@@ -1026,6 +1060,13 @@ impl MacroApp {
             (Field::CompareValue, NodeKind::ReadText { value, .. }) => value.clone(),
             (Field::WinText, NodeKind::WindowCheck { text, .. }) => text.clone(),
             (Field::GroupName, NodeKind::Group { name, .. }) => name.clone(),
+            (Field::ToastTitle, NodeKind::Notify { title, .. }) => title.clone(),
+            (Field::ToastText, NodeKind::Notify { message, .. }) => message.clone(),
+            (Field::ToastMs, NodeKind::Notify { duration_ms, .. }) => duration_ms.to_string(),
+            (
+                Field::ClickJitter,
+                NodeKind::Click { jitter_px, .. } | NodeKind::MoveMouse { jitter_px, .. },
+            ) => jitter_px.to_string(),
             (
                 Field::OffX,
                 NodeKind::Click { offset_x, .. } | NodeKind::MoveMouse { offset_x, .. },
@@ -1121,6 +1162,15 @@ impl MacroApp {
             (Field::CompareValue, NodeKind::ReadText { value, .. }) => *value = raw.to_string(),
             (Field::WinText, NodeKind::WindowCheck { text, .. }) => *text = raw.to_string(),
             (Field::GroupName, NodeKind::Group { name, .. }) => *name = raw.trim().to_string(),
+            (Field::ToastTitle, NodeKind::Notify { title, .. }) => *title = raw.to_string(),
+            (Field::ToastText, NodeKind::Notify { message, .. }) => *message = raw.to_string(),
+            (Field::ToastMs, NodeKind::Notify { duration_ms, .. }) => {
+                *duration_ms = int()?.clamp(500, 120_000) as u64
+            }
+            (
+                Field::ClickJitter,
+                NodeKind::Click { jitter_px, .. } | NodeKind::MoveMouse { jitter_px, .. },
+            ) => *jitter_px = int()?.clamp(0, 500) as i32,
             (
                 Field::OffX,
                 NodeKind::Click { offset_x, .. } | NodeKind::MoveMouse { offset_x, .. },
@@ -1819,10 +1869,11 @@ impl MacroApp {
                 .into_any_element(),
         );
 
-        let groups: [(&'static str, usize); 5] = [
+        let groups: [(&'static str, usize); 6] = [
             ("Mouse", 0),
             ("Keyboard", 1),
             ("Smart checks", 2),
+            ("Notify", 5),
             ("Flow & timing", 3),
             ("Recording", 4),
         ];
@@ -1945,8 +1996,17 @@ impl MacroApp {
             .into_any_element()]
     }
 
-    fn render_statusbar(&self) -> Div {
-        let (badge, color) = match self.mode {
+    fn render_statusbar(&self, cx: &mut Context<Self>) -> Div {
+        // After a run, explain why it ended (until something else is shown).
+        let end = self
+            .last_end
+            .as_ref()
+            .filter(|e| self.mode == Mode::Idle && e.message == self.status);
+        let (badge, color) = match (self.mode, end.map(|e| e.kind)) {
+            (Mode::Idle, Some(EndKind::Error)) => ("ERROR", RED),
+            (Mode::Idle, Some(EndKind::Stopped)) => ("STOPPED", RED),
+            (Mode::Idle, Some(EndKind::Finished)) => ("ENDED", RED),
+            _ => match self.mode {
             Mode::Idle => ("READY", MUTED),
             Mode::Running => ("RUNNING", GREEN),
             Mode::Recording => ("● REC", RED),
@@ -1956,7 +2016,9 @@ impl MacroApp {
             Mode::Testing => ("SEARCH", YELLOW),
             Mode::Capturing => ("CAPTURE", YELLOW),
             Mode::Working => ("BUSY", YELLOW),
+            },
         };
+        let culprit = end.and_then(|e| e.step).filter(|id| self.doc.node(*id).is_some());
         div()
             .flex()
             .flex_none()
@@ -1977,7 +2039,58 @@ impl MacroApp {
                     .font_weight(FontWeight::BOLD)
                     .child(badge),
             )
-            .child(div().flex_1().truncate().text_color(rgb(TEXT)).child(self.status.clone()))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex_shrink()
+                            .min_w(px(0.))
+                            .truncate()
+                            .text_color(if end.is_some() { rgb(0xffb4b4) } else { rgb(TEXT) })
+                            .child(self.status.clone()),
+                    )
+                    .when_some(culprit, |d, id| {
+                        d.child(
+                            div()
+                                .id("status-show-step")
+                                .flex_none()
+                                .px_1p5()
+                                .rounded_sm()
+                                .text_color(rgb(TEXT))
+                                .bg(rgb(BTN))
+                                .hover(|s| s.bg(rgb(BTN_HOVER)))
+                                .cursor_pointer()
+                                .child("Show step")
+                                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                    this.jump_to_step(id);
+                                    cx.notify();
+                                })),
+                        )
+                    })
+                    .when(end.is_some(), |d| {
+                        d.child(
+                            div()
+                                .id("status-clear-end")
+                                .flex_none()
+                                .px_1()
+                                .rounded_sm()
+                                .text_color(rgb(MUTED))
+                                .hover(|s| s.bg(rgb(BTN_HOVER)).text_color(rgb(TEXT)))
+                                .cursor_pointer()
+                                .child("✕")
+                                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                    this.last_end = None;
+                                    this.status = "Ready.".into();
+                                    cx.notify();
+                                })),
+                        )
+                    }),
+            )
             .child(
                 div()
                     .text_color(rgb(MUTED))
@@ -2309,6 +2422,32 @@ impl MacroApp {
         )
     }
 
+    /// Did this step end the last run (for a group: did one of its steps)?
+    fn is_culprit(&self, n: &Node) -> bool {
+        match (self.last_end.as_ref().and_then(|e| e.step), &n.kind) {
+            (Some(s), _) if s == n.id => true,
+            (Some(s), NodeKind::Group { graph, .. }) => graph.contains(s),
+            _ => false,
+        }
+    }
+
+    /// Open whichever group a step is in, select it and scroll it into view.
+    fn jump_to_step(&mut self, id: u64) {
+        let Some(path) = self.doc.root.path_to(id) else {
+            self.status = "That step no longer exists.".into();
+            return;
+        };
+        self.commit_edit();
+        self.view = path;
+        self.clear_selection();
+        self.selected = Some(id);
+        self.side_tab = SideTab::Edit;
+        self.sidebar_open = true;
+        if let Some(n) = self.doc.node(id) {
+            self.pan = (240.0 - n.x, 160.0 - n.y);
+        }
+    }
+
     /// Is this step running right now (for a group: is one of its steps running)?
     fn is_active(&self, n: &Node) -> bool {
         match (self.active_node, &n.kind) {
@@ -2399,8 +2538,17 @@ impl MacroApp {
         let selected = self.selected == Some(id) || self.extra.contains(&id);
         let active = self.is_active(n);
         let color = n.kind.color();
+        let culprit = !active && self.is_culprit(n);
+        // The exact output that led nowhere (only on the step itself, not its group).
+        let culprit_port = self
+            .last_end
+            .as_ref()
+            .filter(|e| culprit && e.step == Some(id))
+            .and_then(|e| e.port);
         let border = if active {
             rgb(YELLOW)
+        } else if culprit {
+            rgb(RED)
         } else if selected {
             rgb(ACCENT)
         } else {
@@ -2503,6 +2651,7 @@ impl MacroApp {
         for (i, label) in outputs.iter().enumerate() {
             let y = port_offset(outputs.len(), i);
             let connected = self.doc.next(id, i).is_some();
+            let dead_end = culprit_port == Some(i);
             el = el.child(
                 div()
                     .absolute()
@@ -2510,9 +2659,15 @@ impl MacroApp {
                     .top(px(y - 8.))
                     .size(px(14.))
                     .rounded_full()
-                    .bg(if connected { rgb(color) } else { rgb(PORT_BG) })
+                    .bg(if dead_end {
+                        rgb(RED)
+                    } else if connected {
+                        rgb(color)
+                    } else {
+                        rgb(PORT_BG)
+                    })
                     .border_2()
-                    .border_color(rgb(color))
+                    .border_color(if dead_end { rgb(RED) } else { rgb(color) })
                     .cursor_crosshair()
                     .hover(|s| s.border_color(rgb(0xffffff)))
                     .on_mouse_down(
@@ -2545,6 +2700,33 @@ impl MacroApp {
                         .child(*label),
                 );
             }
+        }
+        if culprit {
+            let (tag, why) = match self.last_end.as_ref().map(|e| e.kind) {
+                Some(EndKind::Error) => ("✕", "went wrong here"),
+                Some(EndKind::Stopped) => ("■", "stopped here"),
+                _ if n.kind.is_group() => ("■", "ended inside"),
+                _ if culprit_port.is_some() => ("■", "ended here – nothing connected"),
+                _ => ("■", "ended here"),
+            };
+            el = el.child(
+                div()
+                    .absolute()
+                    .left(px(0.))
+                    .top(px(-24.))
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .px_1p5()
+                    .h(px(18.))
+                    .rounded_md()
+                    .bg(rgb(RED))
+                    .text_xs()
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(rgb(0xffffff))
+                    .child(tag)
+                    .child(why),
+            );
         }
         el
     }
@@ -2880,6 +3062,15 @@ impl MacroApp {
                 out.push(self.num_field("Times (0 = forever)", Field::LoopCount, 1.0, cx).into_any_element());
                 out.push(help("Connect “repeat” to the steps you want repeated, and connect the last of them back into this Loop. When the count runs out it follows “done”.").into_any_element());
             }
+            NodeKind::Notify {
+                style,
+                position,
+                wait_for_click,
+                sound,
+                ..
+            } => {
+                out.extend(self.notify_settings(id, *style, *position, *wait_for_click, *sound, cx));
+            }
         }
         out
     }
@@ -2887,18 +3078,27 @@ impl MacroApp {
     fn target_row(&self, id: u64, target: Target, cx: &mut Context<Self>) -> Div {
         let opts = [
             (Target::Fixed, "Fixed spot"),
+            (Target::Area, "Random in area"),
             (Target::FoundImage, "Found image"),
             (Target::Current, "Where it is"),
         ];
+        let has_area = matches!(
+            self.doc.node(id).map(|n| &n.kind),
+            Some(NodeKind::Click { area: Some(_), .. } | NodeKind::MoveMouse { area: Some(_), .. })
+        );
         labeled(
             "Where",
-            div().flex().gap_1().children(opts.into_iter().map(|(t, label)| {
+            div().flex().flex_wrap().gap_1().children(opts.into_iter().map(|(t, label)| {
                 chip(("tgt", t as usize), label, t == target).on_click(cx.listener(
-                    move |this, _: &ClickEvent, _, cx| {
+                    move |this, ev: &ClickEvent, window, cx| {
                         this.update_node(id, |k| match k {
                             NodeKind::Click { target, .. } | NodeKind::MoveMouse { target, .. } => *target = t,
                             _ => {}
                         });
+                        // No area yet: go straight to dragging a box for it.
+                        if t == Target::Area && !has_area {
+                            this.start_area(AreaPurpose::ClickArea(id), ev.modifiers().shift, window, cx);
+                        }
                         cx.notify();
                     },
                 ))
@@ -2907,7 +3107,7 @@ impl MacroApp {
     }
 
     fn position_fields(&self, id: u64, target: Target, cx: &mut Context<Self>) -> Vec<AnyElement> {
-        match target {
+        let mut out: Vec<AnyElement> = match target {
             Target::Fixed => vec![
                 self.num_field("X", Field::X, 1.0, cx).into_any_element(),
                 self.num_field("Y", Field::Y, 1.0, cx).into_any_element(),
@@ -2918,13 +3118,42 @@ impl MacroApp {
                     }))
                     .into_any_element(),
             ],
+            Target::Area => {
+                let area = match self.doc.node(id).map(|n| &n.kind) {
+                    Some(NodeKind::Click { area, .. } | NodeKind::MoveMouse { area, .. }) => *area,
+                    _ => None,
+                };
+                let mut v = vec![match area {
+                    Some(r) => help(&format!(
+                        "Picks a different random spot inside {} × {} at ({}, {}) every time.",
+                        r.w, r.h, r.x, r.y
+                    ))
+                    .into_any_element(),
+                    None => help("No area yet – drag a box around where it should click.").into_any_element(),
+                }];
+                v.push(
+                    small_btn("click-area", if area.is_some() { "Select click area again" } else { "Select click area" })
+                        .on_click(cx.listener(move |this, ev: &ClickEvent, window, cx| {
+                            this.start_area(AreaPurpose::ClickArea(id), ev.modifiers().shift, window, cx);
+                            cx.notify();
+                        }))
+                        .into_any_element(),
+                );
+                v
+            }
             Target::FoundImage => vec![
                 self.num_field("Offset X", Field::OffX, 1.0, cx).into_any_element(),
                 self.num_field("Offset Y", Field::OffY, 1.0, cx).into_any_element(),
                 help("Uses the centre of whatever the last Find image step found, moved by the offset.").into_any_element(),
             ],
             Target::Current => vec![help("Acts wherever the mouse pointer already is.").into_any_element()],
-        }
+        };
+        out.push(self.num_field("Random offset (px)", Field::ClickJitter, 1.0, cx).into_any_element());
+        out.push(
+            help("0 = exactly on the spot. Otherwise it moves up to this many pixels in a random direction each time, and never lands on exactly the same spot twice in a row.")
+                .into_any_element(),
+        );
+        out
     }
 
     fn recording_settings(&self, id: u64, events: &[RecEvent], cx: &mut Context<Self>) -> Vec<AnyElement> {
@@ -3221,6 +3450,150 @@ impl MacroApp {
         );
         out.push(help("Follows “found” as soon as the image appears, or “not found” after the time runs out. Later Click / Move steps can aim at the found image (set Where → Found image). Threshold 0.85 is a good start; lower it if it misses, raise it if it finds the wrong thing.").into_any_element());
         out
+    }
+
+    fn notify_settings(
+        &self,
+        id: u64,
+        style: NoticeStyle,
+        position: NoticePos,
+        wait_for_click: bool,
+        sound: bool,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        let mut out: Vec<AnyElement> = Vec::new();
+        out.push(self.text_field("Title", Field::ToastTitle, cx).into_any_element());
+        out.push(self.text_field("Message", Field::ToastText, cx).into_any_element());
+        out.push(help("Use {text} to show what the last Read text step read, e.g. “Gold is now {text}”.").into_any_element());
+        out.push(
+            labeled(
+                "Style",
+                div().flex().flex_wrap().gap_1().children(NoticeStyle::ALL.into_iter().enumerate().map(
+                    |(i, v)| {
+                        chip(("nstyle", i), v.label(), v == style).on_click(cx.listener(
+                            move |this, _: &ClickEvent, _, cx| {
+                                this.update_node(id, |k| {
+                                    if let NodeKind::Notify { style, .. } = k {
+                                        *style = v;
+                                    }
+                                });
+                                cx.notify();
+                            },
+                        ))
+                    },
+                )),
+            )
+            .into_any_element(),
+        );
+        let places = [(NoticePos::TopCenter, "Top centre"), (NoticePos::TopRight, "Top right")];
+        out.push(
+            labeled(
+                "Where",
+                div().flex().flex_wrap().gap_1().children(places.into_iter().enumerate().map(
+                    |(i, (v, label))| {
+                        chip(("npos", i), label, v == position).on_click(cx.listener(
+                            move |this, _: &ClickEvent, _, cx| {
+                                this.update_node(id, |k| {
+                                    if let NodeKind::Notify { position, .. } = k {
+                                        *position = v;
+                                    }
+                                });
+                                cx.notify();
+                            },
+                        ))
+                    },
+                )),
+            )
+            .into_any_element(),
+        );
+        out.push(
+            div()
+                .flex()
+                .flex_wrap()
+                .gap_1()
+                .child(chip("n-wait", "Pause until I click it", wait_for_click).on_click(cx.listener(
+                    move |this, _: &ClickEvent, _, cx| {
+                        this.update_node(id, |k| {
+                            if let NodeKind::Notify { wait_for_click, .. } = k {
+                                *wait_for_click = !*wait_for_click;
+                            }
+                        });
+                        cx.notify();
+                    },
+                )))
+                .child(chip("n-sound", "Play a sound", sound).on_click(cx.listener(
+                    move |this, _: &ClickEvent, _, cx| {
+                        this.update_node(id, |k| {
+                            if let NodeKind::Notify { sound, .. } = k {
+                                *sound = !*sound;
+                            }
+                        });
+                        cx.notify();
+                    },
+                )))
+                .into_any_element(),
+        );
+        if !wait_for_click {
+            out.push(self.num_field("Show for (ms)", Field::ToastMs, 500.0, cx).into_any_element());
+        }
+        out.push(
+            small_btn("n-preview", "Preview pop-up")
+                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                    this.preview_notification(id);
+                    cx.notify();
+                }))
+                .into_any_element(),
+        );
+        out.push(help(if wait_for_click {
+            "The macro pauses until you click the pop-up (Esc still stops it). Handy for “check this, then carry on”."
+        } else {
+            "The macro carries on straight away; the pop-up fades out by itself, or click it to close it. A new pop-up replaces the old one."
+        })
+        .into_any_element());
+        out.push(help("Pop-ups never take focus, so they won't interrupt typing or clicks the macro is doing.").into_any_element());
+        out
+    }
+
+    /// Show what a Pop-up step looks like, without running the macro.
+    fn preview_notification(&mut self, id: u64) {
+        self.commit_edit();
+        let Some(NodeKind::Notify {
+            title,
+            message,
+            style,
+            position,
+            duration_ms,
+            sound,
+            ..
+        }) = self.doc.node(id).map(|n| n.kind.clone())
+        else {
+            return;
+        };
+        if let Some(mut old) = self.preview_toast.take() {
+            let _ = old.kill();
+            let _ = old.wait();
+        }
+        let toast = vision::Toast {
+            title: title.replace("{text}", "12345"),
+            message: message.replace("{text}", "12345"),
+            style: style.key(),
+            position: position.key(),
+            // A preview never pauses anything, so it always closes by itself.
+            duration_ms: duration_ms.max(2500),
+            wait: false,
+            sound,
+        };
+        match vision::show_notification(&toast) {
+            Ok(child) => {
+                self.preview_toast = Some(child);
+                self.status = if cfg!(target_os = "windows") {
+                    "Showing a preview pop-up ({text} shows as 12345). The very first one can take a second to appear.".into()
+                } else {
+                    "Showing a preview pop-up ({text} shows as 12345).".into()
+                };
+            }
+            Err(e) => self.status = e,
+        }
     }
 
     fn group_settings(&self, id: u64, graph: &Graph, cx: &mut Context<Self>) -> Vec<AnyElement> {
@@ -3749,7 +4122,7 @@ impl Render for MacroApp {
                     .when(self.sidebar_open, |d| d.child(self.render_sidebar(cx)))
                     .child(self.render_graph(cx)),
             )
-            .child(self.render_statusbar())
+            .child(self.render_statusbar(cx))
     }
 }
 
@@ -3930,6 +4303,7 @@ fn step_group(k: &NodeKind) -> usize {
         NodeKind::KeyPress { .. } | NodeKind::TypeText { .. } => 1,
         NodeKind::FindImage { .. } | NodeKind::WindowCheck { .. } | NodeKind::ReadText { .. } => 2,
         NodeKind::Recording { .. } => 4,
+        NodeKind::Notify { .. } => 5,
         _ => 3,
     }
 }
@@ -3952,6 +4326,7 @@ fn step_blurb(k: &NodeKind) -> &'static str {
         NodeKind::GroupIn => "Where a group starts",
         NodeKind::GroupOut => "Leave the group and carry on",
         NodeKind::Recording { .. } => "Empty recording to fill or edit",
+        NodeKind::Notify { .. } => "Show a pop-up at the top of the screen",
     }
 }
 

@@ -369,12 +369,14 @@ fn selector_command(_shot: &Shot, _hint: &str) -> Result<Command, String> {
     Err("Selecting an area is only supported on macOS and Windows.".into())
 }
 
-/// Windows: compile the selector once in the background when MacroFlow starts, so
-/// the first "Select area" opens straight away instead of after a few seconds.
+/// Windows: compile the area selector and the pop-up once in the background when
+/// MacroFlow starts, so the first "Select area" or Pop-up appears straight away
+/// instead of after a few seconds.
 pub fn warm_up_selector() {
     #[cfg(target_os = "windows")]
     std::thread::spawn(|| {
-        if let Ok(script) = write_select_script() {
+        let scripts = [write_select_script(), write_notify_script()];
+        for script in scripts.into_iter().flatten() {
             let _ = hidden_powershell()
                 .arg("-File")
                 .arg(&script)
@@ -385,6 +387,117 @@ pub fn warm_up_selector() {
                 .status();
         }
     });
+}
+
+// ---------------------------------------------------------------------------
+// Pop-up notifications
+// ---------------------------------------------------------------------------
+
+/// A pop-up card to show at the top of the screen.
+#[derive(Clone, Debug)]
+pub struct Toast {
+    pub title: String,
+    pub message: String,
+    /// "info" | "success" | "warning" | "error"
+    pub style: &'static str,
+    /// "top-center" | "top-right"
+    pub position: &'static str,
+    pub duration_ms: u64,
+    /// Stay until clicked.
+    pub wait: bool,
+    pub sound: bool,
+}
+
+/// Show a pop-up without taking focus from the app you're using. Returns the helper
+/// process: it exits when the pop-up closes (timed out or clicked), and killing it
+/// removes the pop-up straight away.
+pub fn show_notification(t: &Toast) -> Result<std::process::Child, String> {
+    notify_command(t)?
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("Couldn't show the pop-up: {e}"))
+}
+
+#[cfg(target_os = "macos")]
+fn notify_command(t: &Toast) -> Result<Command, String> {
+    let helper = mac_helper(
+        option_env!("MACROFLOW_NOTIFY_HELPER"),
+        "macroflow-notify",
+        "pop-up helper",
+    )?;
+    let mut cmd = Command::new(helper);
+    cmd.arg(&t.title)
+        .arg(&t.message)
+        .arg(t.style)
+        .arg(t.position)
+        .arg(t.duration_ms.to_string())
+        .arg(if t.wait { "1" } else { "0" })
+        .arg(if t.sound { "1" } else { "0" });
+    Ok(cmd)
+}
+
+#[cfg(target_os = "windows")]
+const WINDOWS_NOTIFY_SCRIPT: &str = include_str!("../helpers/notify.ps1");
+
+#[cfg(target_os = "windows")]
+fn write_notify_script() -> Result<PathBuf, String> {
+    let script = std::env::temp_dir().join("macroflow-notify.ps1");
+    // Only rewrite it when it changed: pop-ups can start close together.
+    if std::fs::read_to_string(&script).ok().as_deref() != Some(WINDOWS_NOTIFY_SCRIPT) {
+        std::fs::write(&script, WINDOWS_NOTIFY_SCRIPT)
+            .map_err(|e| format!("Couldn't write the pop-up script: {e}"))?;
+    }
+    Ok(script)
+}
+
+/// "b64:" + base64 of the UTF-8 text, so any characters (and empty text) survive
+/// being passed to PowerShell on the command line.
+#[cfg(target_os = "windows")]
+fn b64_arg(text: &str) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let bytes = text.as_bytes();
+    let mut out = String::from("b64:");
+    for chunk in bytes.chunks(3) {
+        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
+        out.push(ALPHABET[(n >> 18) as usize & 63] as char);
+        out.push(ALPHABET[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 { ALPHABET[(n >> 6) as usize & 63] as char } else { '=' });
+        out.push(if chunk.len() > 2 { ALPHABET[n as usize & 63] as char } else { '=' });
+    }
+    out
+}
+
+#[cfg(target_os = "windows")]
+fn notify_command(t: &Toast) -> Result<Command, String> {
+    let script = write_notify_script()?;
+    let mut cmd = hidden_powershell();
+    cmd.arg("-File")
+        .arg(&script)
+        .arg("-Title")
+        .arg(b64_arg(&t.title))
+        .arg("-Message")
+        .arg(b64_arg(&t.message))
+        .arg("-Style")
+        .arg(t.style)
+        .arg("-Position")
+        .arg(t.position)
+        .arg("-DurationMs")
+        .arg(t.duration_ms.to_string());
+    if t.wait {
+        cmd.arg("-Wait");
+    }
+    if t.sound {
+        cmd.arg("-Sound");
+    }
+    Ok(cmd)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn notify_command(_t: &Toast) -> Result<Command, String> {
+    Err("Pop-ups are only supported on macOS and Windows.".into())
 }
 
 /// Capture a live area of the screen (global points) at full resolution.
@@ -666,6 +779,11 @@ fn ocr_variants(img: &RgbaImage, mode: OcrMode) -> Vec<GrayImage> {
     if smaller.height() >= 32 {
         out.push(pad_white(&smaller, (smaller.height() / 3).clamp(16, 120)));
     }
+    // And a bit bigger: narrow digits like a lone "1" in "1 892 039" are easier to see.
+    let bigger = scaled(&base, 1.5);
+    if bigger.width().max(bigger.height()) as f32 <= max_side {
+        out.push(pad_white(&bigger, (bigger.height() / 3).clamp(16, 160)));
+    }
     out
 }
 
@@ -703,14 +821,22 @@ fn vote(raw: Vec<String>, mode: OcrMode) -> OcrRead {
             OcrMode::Number => crate::model::clean_number(r).unwrap_or_default(),
         })
         .collect();
-    // Most common non-empty answer wins; ties go to the longest (OCR more often
-    // drops characters than invents them), then to the earlier, cleaner version.
+    // Most common non-empty answer wins; ties go to the longest, then to the earlier,
+    // cleaner version. For numbers, a read that's part of a longer read ("892" inside
+    // "892390", "892039" inside "1892039") counts as agreeing with the longer one:
+    // OCR drops digits far more often than it invents them.
     let mut best: Option<(usize, usize, usize, String)> = None; // (votes, len, -order, text)
     for (order, a) in answers.iter().enumerate() {
         if a.is_empty() {
             continue;
         }
-        let votes = answers.iter().filter(|b| *b == a).count();
+        let votes = answers
+            .iter()
+            .filter(|b| {
+                *b == a
+                    || (mode == OcrMode::Number && !b.is_empty() && b.len() < a.len() && a.contains(b.as_str()))
+            })
+            .count();
         let len = a.chars().count();
         let key = (votes, len, usize::MAX - order);
         if best.as_ref().map_or(true, |(v, l, o, _)| key > (*v, *l, *o)) {

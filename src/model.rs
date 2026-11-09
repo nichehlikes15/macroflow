@@ -36,6 +36,8 @@ pub enum Target {
     FoundImage,
     /// Wherever the mouse already is.
     Current,
+    /// A random spot inside an area you drag a box around.
+    Area,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -99,6 +101,74 @@ pub struct ScreenRect {
     pub y: i32,
     pub w: i32,
     pub h: i32,
+}
+
+/// The look of a pop-up notification.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NoticeStyle {
+    #[default]
+    Info,
+    Success,
+    Warning,
+    Error,
+}
+
+impl NoticeStyle {
+    pub const ALL: [NoticeStyle; 4] = [
+        NoticeStyle::Info,
+        NoticeStyle::Success,
+        NoticeStyle::Warning,
+        NoticeStyle::Error,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            NoticeStyle::Info => "Info",
+            NoticeStyle::Success => "Success",
+            NoticeStyle::Warning => "Warning",
+            NoticeStyle::Error => "Error",
+        }
+    }
+
+    /// The name the pop-up helpers understand.
+    pub fn key(self) -> &'static str {
+        match self {
+            NoticeStyle::Info => "info",
+            NoticeStyle::Success => "success",
+            NoticeStyle::Warning => "warning",
+            NoticeStyle::Error => "error",
+        }
+    }
+
+    pub fn color(self) -> u32 {
+        match self {
+            NoticeStyle::Info => 0x7c5cff,
+            NoticeStyle::Success => 0x34c77b,
+            NoticeStyle::Warning => 0xf5b84a,
+            NoticeStyle::Error => 0xef5b5b,
+        }
+    }
+}
+
+/// Where a pop-up notification appears.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NoticePos {
+    #[default]
+    TopCenter,
+    TopRight,
+}
+
+impl NoticePos {
+    pub fn key(self) -> &'static str {
+        match self {
+            NoticePos::TopCenter => "top-center",
+            NoticePos::TopRight => "top-right",
+        }
+    }
+}
+
+fn default_notice_ms() -> u64 {
+    3000
 }
 
 /// How a "Read text" step compares what it reads.
@@ -245,6 +315,12 @@ pub enum NodeKind {
         offset_y: i32,
         button: MouseBtn,
         clicks: u32,
+        /// The area for `Target::Area`. Optional, so older macros still open.
+        #[serde(default)]
+        area: Option<ScreenRect>,
+        /// Move up to this many pixels in a random direction each time (0 = exact).
+        #[serde(default)]
+        jitter_px: i32,
     },
     MoveMouse {
         target: Target,
@@ -252,6 +328,10 @@ pub enum NodeKind {
         y: i32,
         offset_x: i32,
         offset_y: i32,
+        #[serde(default)]
+        area: Option<ScreenRect>,
+        #[serde(default)]
+        jitter_px: i32,
     },
     KeyPress {
         key: String,
@@ -326,6 +406,25 @@ pub enum NodeKind {
     },
     /// The start point inside a group.
     GroupIn,
+    /// Show a pop-up card at the top of the screen.
+    /// Every field is optional so the step can grow without breaking saved macros.
+    Notify {
+        #[serde(default)]
+        title: String,
+        #[serde(default)]
+        message: String,
+        #[serde(default)]
+        style: NoticeStyle,
+        #[serde(default)]
+        position: NoticePos,
+        #[serde(default = "default_notice_ms")]
+        duration_ms: u64,
+        /// Pause the macro until the pop-up is clicked.
+        #[serde(default)]
+        wait_for_click: bool,
+        #[serde(default)]
+        sound: bool,
+    },
     /// Leaving a group: playback carries on after the Group step.
     GroupOut,
 }
@@ -341,6 +440,8 @@ impl NodeKind {
                 offset_y: 0,
                 button: MouseBtn::Left,
                 clicks: 1,
+                area: None,
+                jitter_px: 0,
             },
             NodeKind::MoveMouse {
                 target: Target::Fixed,
@@ -348,6 +449,8 @@ impl NodeKind {
                 y: 400,
                 offset_x: 0,
                 offset_y: 0,
+                area: None,
+                jitter_px: 0,
             },
             NodeKind::KeyPress {
                 key: "enter".into(),
@@ -360,6 +463,15 @@ impl NodeKind {
             NodeKind::Wait {
                 ms: 500,
                 jitter_ms: 0,
+            },
+            NodeKind::Notify {
+                title: "Macro update".into(),
+                message: "Step reached".into(),
+                style: NoticeStyle::Info,
+                position: NoticePos::TopCenter,
+                duration_ms: default_notice_ms(),
+                wait_for_click: false,
+                sound: false,
             },
             NodeKind::Scroll {
                 amount: 3,
@@ -426,6 +538,7 @@ impl NodeKind {
             NodeKind::End => "End",
             NodeKind::Group { .. } => "Group",
             NodeKind::GroupIn => "Group start",
+            NodeKind::Notify { .. } => "Pop-up",
             NodeKind::GroupOut => "Group end",
         }
     }
@@ -447,6 +560,7 @@ impl NodeKind {
             NodeKind::End => "■",
             NodeKind::Group { .. } => "▤",
             NodeKind::GroupIn => "▷",
+            NodeKind::Notify { .. } => "✦",
             NodeKind::GroupOut => "➜",
         }
     }
@@ -467,6 +581,7 @@ impl NodeKind {
             NodeKind::ReadText { .. } => 0xff7eb6,
             NodeKind::End => 0x7f8796,
             NodeKind::Group { .. } | NodeKind::GroupIn | NodeKind::GroupOut => GROUP_COLOR,
+            NodeKind::Notify { style, .. } => style.color(),
         }
     }
 
@@ -496,12 +611,21 @@ impl NodeKind {
     }
 
     pub fn summary(&self) -> String {
-        fn place(target: &Target, x: i32, y: i32, ox: i32, oy: i32) -> String {
-            match target {
+        fn place(target: &Target, x: i32, y: i32, ox: i32, oy: i32, area: &Option<ScreenRect>, jitter: i32) -> String {
+            let at = match target {
                 Target::Fixed => format!("at ({x}, {y})"),
                 Target::FoundImage if ox == 0 && oy == 0 => "on found image".into(),
                 Target::FoundImage => format!("on found image {ox:+}, {oy:+}"),
                 Target::Current => "at current position".into(),
+                Target::Area => match area {
+                    Some(r) => format!("randomly in {}×{}", r.w, r.h),
+                    None => "randomly in an area (not set)".into(),
+                },
+            };
+            if jitter > 0 {
+                format!("{at} ±{jitter}px")
+            } else {
+                at
             }
         }
         match self {
@@ -514,6 +638,8 @@ impl NodeKind {
                 offset_y,
                 button,
                 clicks,
+                area,
+                jitter_px,
             } => {
                 let times = if *clicks > 1 {
                     format!(" ×{clicks}")
@@ -523,7 +649,7 @@ impl NodeKind {
                 format!(
                     "{}{times} {}",
                     button.label(),
-                    place(target, *x, *y, *offset_x, *offset_y)
+                    place(target, *x, *y, *offset_x, *offset_y, area, *jitter_px)
                 )
             }
             NodeKind::MoveMouse {
@@ -532,7 +658,9 @@ impl NodeKind {
                 y,
                 offset_x,
                 offset_y,
-            } => format!("Move {}", place(target, *x, *y, *offset_x, *offset_y)),
+                area,
+                jitter_px,
+            } => format!("Move {}", place(target, *x, *y, *offset_x, *offset_y, area, *jitter_px)),
             NodeKind::KeyPress { key, mods } => crate::keys::combo_label(key, mods),
             NodeKind::TypeText { text, press_enter } => {
                 let short: String = text.chars().take(28).collect();
@@ -626,6 +754,30 @@ impl NodeKind {
                 format!("{label} · {n} step{} · double-click to open", if n == 1 { "" } else { "s" })
             }
             NodeKind::GroupIn => "The group starts here".into(),
+            NodeKind::Notify {
+                title,
+                message,
+                style,
+                duration_ms,
+                wait_for_click,
+                ..
+            } => {
+                let text = if !title.trim().is_empty() {
+                    title.trim().to_string()
+                } else if !message.trim().is_empty() {
+                    message.trim().to_string()
+                } else {
+                    "(empty pop-up)".to_string()
+                };
+                let short: String = text.chars().take(24).collect();
+                let more = if text.chars().count() > 24 { "…" } else { "" };
+                let how = if *wait_for_click {
+                    "waits for a click".to_string()
+                } else {
+                    format!("{:.1}s", *duration_ms as f32 / 1000.0)
+                };
+                format!("{} · “{short}{more}” · {how}", style.label())
+            }
             NodeKind::GroupOut => "Leave the group and carry on".into(),
         }
     }
@@ -1510,8 +1662,29 @@ pub fn clean_number(raw: &str) -> Option<String> {
     }
 
     let is_letter = |k: Option<&char>| k.map_or(false, |c| c.is_alphabetic());
-    // Mostly real digits...
-    let strict: Vec<&Run> = runs.iter().filter(|r| r.real > 0 && r.fake <= r.real + 1).collect();
+    let all_digits = |t: &str| !t.is_empty() && t.chars().all(|c| c.is_ascii_digit());
+    let three_digits = |r: &Run| r.text.len() == 3 && all_digits(&r.text);
+    let spaces_between = |a: usize, b: usize| a < b && chars[a..b].iter().all(|c| c.is_whitespace());
+    // A lone look-alike ("l", "I", "|") right before a 3-digit group is the leading digit
+    // of a spaced number: "l 892 039" is 1 892 039, not 892 039.
+    let lone_lead = |idx: usize| -> bool {
+        let r = &runs[idx];
+        if r.real != 0 || r.text.len() > 3 || !all_digits(&r.text) {
+            return false;
+        }
+        if is_letter(r.start.checked_sub(1).and_then(|p| chars.get(p))) || is_letter(chars.get(r.end)) {
+            return false;
+        }
+        runs.get(idx + 1)
+            .map_or(false, |n| n.real >= 2 && three_digits(n) && spaces_between(r.end, n.start))
+    };
+    // Mostly real digits (or a leading look-alike as above)...
+    let strict: Vec<&Run> = runs
+        .iter()
+        .enumerate()
+        .filter(|(i, r)| (r.real > 0 && r.fake <= r.real + 1) || lone_lead(*i))
+        .map(|(_, r)| r)
+        .collect();
     // ...or, if there are none, a whole word made only of look-alikes (e.g. "lOO").
     let loose: Vec<&Run> = runs
         .iter()
@@ -1532,24 +1705,26 @@ pub fn clean_number(raw: &str) -> Option<String> {
         c.is_whitespace() || confusable_digit(*c).is_some() || matches!(c, '.' | ',' | '-' | '+')
     });
 
-    // Join neighbouring runs separated only by spaces when they look like one number.
-    let mut groups: Vec<(usize, String)> = Vec::new();
+    // Join neighbouring runs separated only by spaces when they form one number:
+    // "1 892 039" (a 1-3 digit lead, then groups of exactly 3) or a read that's only digits.
+    // (start, text, still a valid "spaced thousands" chain)
+    let mut groups: Vec<(usize, String, bool)> = Vec::new();
     let mut prev_end: Option<usize> = None;
     for r in keep {
-        let gap_is_space = prev_end.map_or(false, |e| {
-            e <= r.start && chars[e..r.start].iter().all(|c| c.is_whitespace())
-        });
-        let looks_grouped = r.text.len() == 3 && r.text.chars().all(|c| c.is_ascii_digit());
-        if let Some((_, last)) = groups.last_mut() {
-            if gap_is_space && (only_number || looks_grouped) {
+        let gap_is_space = prev_end.map_or(false, |e| spaces_between(e, r.start));
+        if let Some((_, last, chain)) = groups.last_mut() {
+            if gap_is_space && (only_number || (three_digits(r) && *chain)) {
                 last.push_str(&r.text);
+                *chain = *chain && three_digits(r);
                 prev_end = Some(r.end);
                 continue;
             }
         }
-        groups.push((r.start, r.text.clone()));
+        let chain = all_digits(&r.text) && r.text.len() <= 3;
+        groups.push((r.start, r.text.clone(), chain));
         prev_end = Some(r.end);
     }
+    let groups: Vec<(usize, String)> = groups.into_iter().map(|(s, t, _)| (s, t)).collect();
 
     // Longest number wins; on a tie, the first one.
     let mut best: Option<(usize, String)> = None;
@@ -1692,6 +1867,15 @@ mod tests {
         assert_eq!(clean_number("1500pts").as_deref(), Some("1500"));
         assert_eq!(clean_number("Level 3   98765").as_deref(), Some("98765"));
         assert_eq!(clean_number("no digits here"), None);
+        // Numbers spaced into thousands, including a leading 1 misread as l / I / |.
+        assert_eq!(clean_number("1 892 039").as_deref(), Some("1892039"));
+        assert_eq!(clean_number("l 892 039").as_deref(), Some("1892039"));
+        assert_eq!(clean_number("I 892 039").as_deref(), Some("1892039"));
+        assert_eq!(clean_number("Gold: | 892 039").as_deref(), Some("1892039"));
+        assert_eq!(clean_number("892 390").as_deref(), Some("892390"));
+        assert_eq!(clean_number("Gold: 892 390").as_deref(), Some("892390"));
+        assert_eq!(clean_number("12 345 678").as_deref(), Some("12345678"));
+        assert_eq!(clean_number("Level 3   98765").as_deref(), Some("98765"));
     }
 
     #[test]
@@ -1720,6 +1904,22 @@ mod tests {
         let old = r#"{"type":"FindImage","template":null,"threshold":0.85,"timeout_ms":5000,"interval_ms":250,"click_when_found":false}"#;
         let k: NodeKind = serde_json::from_str(old).expect("old Find image step should load");
         assert!(matches!(k, NodeKind::FindImage { search_area: None, .. }));
+    }
+
+    #[test]
+    fn old_click_steps_still_open() {
+        let old = r#"{"type":"Click","target":"Fixed","x":10,"y":20,"offset_x":0,"offset_y":0,"button":"Left","clicks":1}"#;
+        let k: NodeKind = serde_json::from_str(old).expect("old Click step should load");
+        assert!(matches!(k, NodeKind::Click { area: None, jitter_px: 0, .. }));
+    }
+
+    #[test]
+    fn notify_steps_load_with_missing_fields() {
+        let k: NodeKind = serde_json::from_str(r#"{"type":"Notify","title":"Hi"}"#).unwrap();
+        assert!(matches!(
+            k,
+            NodeKind::Notify { duration_ms: 3000, wait_for_click: false, style: NoticeStyle::Info, .. }
+        ));
     }
 
     #[test]

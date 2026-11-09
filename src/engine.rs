@@ -25,7 +25,7 @@ enum Exit {
 pub enum WorkerMsg {
     Status(String),
     Active(Option<u64>),
-    RunFinished(String),
+    RunFinished(RunEnd),
     Recorded(Vec<RecEvent>),
     StepRecorded(NodeKind),
     Position { x: i32, y: i32 },
@@ -53,6 +53,8 @@ pub enum AreaPurpose {
     Template(u64),
     /// The only part of the screen a Find image step searches.
     SearchArea(u64),
+    /// Where a Click / Move mouse step picks a random spot.
+    ClickArea(u64),
 }
 
 pub type Tx = Sender<WorkerMsg>;
@@ -132,17 +134,51 @@ fn countdown(tx: &Tx, stop: &AtomicBool, what: &str, secs: u32) -> Result<(), St
 // Playback
 // ---------------------------------------------------------------------------
 
+/// Why a run of the macro ended, so the editor can highlight the step responsible.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RunEnd {
+    pub message: String,
+    /// The step that ended the run (shown in red).
+    pub step: Option<u64>,
+    /// When it ended because this output of `step` isn't connected to anything.
+    pub port: Option<usize>,
+    pub kind: EndKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EndKind {
+    /// Reached an End step, or a step with nothing connected after it.
+    Finished,
+    /// You pressed Esc or Stop.
+    Stopped,
+    /// A step went wrong.
+    Error,
+}
+
+/// Where the path through the macro last ran out.
+#[derive(Clone, Copy, Debug)]
+enum EndAt {
+    EndStep(u64),
+    /// This output of this step isn't connected to anything.
+    Dangling(u64, usize),
+}
+
 pub fn run_macro(doc: Macro, tx: Tx, stop: Arc<AtomicBool>) {
     thread::spawn(move || {
-        let result = Runner::new(&doc, &tx, stop.clone()).and_then(|mut r| r.run());
+        let end = match Runner::new(&doc, &tx, stop.clone()) {
+            Ok(mut r) => {
+                let result = r.run();
+                r.describe_end(result)
+            }
+            Err(e) => RunEnd {
+                message: e,
+                step: None,
+                port: None,
+                kind: EndKind::Error,
+            },
+        };
         send(&tx, WorkerMsg::Active(None));
-        send(
-            &tx,
-            WorkerMsg::RunFinished(match result {
-                Ok(s) => s,
-                Err(e) => e,
-            }),
-        );
+        send(&tx, WorkerMsg::RunFinished(end));
     });
 }
 
@@ -156,6 +192,14 @@ struct Runner<'a> {
     last_text: Option<String>,
     /// Last reading of each Read text step (for "has changed").
     prev_reads: HashMap<u64, String>,
+    /// The pop-up currently on screen (a new one replaces it).
+    toast: Option<std::process::Child>,
+    /// The step running right now (blamed if something goes wrong).
+    current: Option<u64>,
+    /// Where the path last ran out (blamed when the run ends).
+    ended_at: Option<EndAt>,
+    /// Where each mouse step last went, so a random spot is never repeated.
+    last_points: HashMap<u64, (i32, i32)>,
     loops: HashMap<u64, u32>,
     held_keys: Vec<Key>,
     held_buttons: Vec<Button>,
@@ -178,6 +222,10 @@ impl<'a> Runner<'a> {
             found: None,
             last_text: None,
             prev_reads: HashMap::new(),
+            toast: None,
+            current: None,
+            ended_at: None,
+            last_points: HashMap::new(),
             loops: HashMap::new(),
             held_keys: Vec::new(),
             held_buttons: Vec::new(),
@@ -211,11 +259,13 @@ impl<'a> Runner<'a> {
         send(self.tx, WorkerMsg::Status(s));
     }
 
-    fn run(&mut self) -> Result<String, String> {
+    /// Run the macro. Returns how many times it ran.
+    fn run(&mut self) -> Result<u32, String> {
         let start = self
             .doc
             .start_id()
             .ok_or_else(|| "Add a Start step first.".to_string())?;
+        self.current = Some(start);
         if self.doc.next(start, 0).is_none() {
             return Err("Connect the Start step to your first step (drag from its right-hand dot).".into());
         }
@@ -238,10 +288,84 @@ impl<'a> Runner<'a> {
                 break;
             }
         }
-        Ok(format!(
-            "Finished – ran {iteration} time{}.",
-            if iteration == 1 { "" } else { "s" }
-        ))
+        Ok(iteration)
+    }
+
+    /// A step's name for messages: its title (or group name), plus its note if it has one.
+    fn step_label(&self, id: u64) -> String {
+        let Some(n) = self.doc.node(id) else {
+            return "a step".into();
+        };
+        let title = match &n.kind {
+            NodeKind::Group { name, .. } if !name.trim().is_empty() => name.trim().to_string(),
+            k => k.title().to_string(),
+        };
+        if n.note.trim().is_empty() {
+            format!("“{title}”")
+        } else {
+            format!("“{title}” ({})", n.note.trim())
+        }
+    }
+
+    /// Explain why the run ended, and which step caused it.
+    fn describe_end(&self, result: Result<u32, String>) -> RunEnd {
+        match result {
+            Ok(times) => {
+                let ran = if times == 1 {
+                    String::new()
+                } else {
+                    format!(" after {times} runs")
+                };
+                match self.ended_at {
+                    Some(EndAt::EndStep(id)) => RunEnd {
+                        message: format!("Finished{ran}: reached the {} step.", self.step_label(id)),
+                        step: Some(id),
+                        port: None,
+                        kind: EndKind::Finished,
+                    },
+                    Some(EndAt::Dangling(id, port)) => {
+                        let outputs = self.doc.node(id).map(|n| n.kind.outputs()).unwrap_or(&[]);
+                        let label = self.step_label(id);
+                        let message = if outputs.len() > 1 {
+                            let path = outputs.get(port).copied().unwrap_or("next");
+                            format!("Stopped{ran} at {label}: it went down its “{path}” path, and nothing is connected there.")
+                        } else {
+                            format!("Stopped{ran} after {label}: nothing is connected after it.")
+                        };
+                        RunEnd {
+                            message,
+                            step: Some(id),
+                            port: Some(port),
+                            kind: EndKind::Finished,
+                        }
+                    }
+                    None => RunEnd {
+                        message: format!("Finished{ran}."),
+                        step: None,
+                        port: None,
+                        kind: EndKind::Finished,
+                    },
+                }
+            }
+            Err(e) if e == STOPPED => RunEnd {
+                message: match self.current {
+                    Some(id) => format!("Stopped by you during {}.", self.step_label(id)),
+                    None => "Stopped by you.".into(),
+                },
+                step: self.current,
+                port: None,
+                kind: EndKind::Stopped,
+            },
+            Err(e) => RunEnd {
+                message: match self.current {
+                    Some(id) => format!("{} went wrong: {e}", self.step_label(id)),
+                    None => e,
+                },
+                step: self.current,
+                port: None,
+                kind: EndKind::Error,
+            },
+        }
     }
 
     /// Run steps from `start` until the path ends. Group steps run their own
@@ -261,12 +385,16 @@ impl<'a> Runner<'a> {
                 // Markers inside a group: nothing to do or wait for.
                 NodeKind::GroupIn => {
                     cur = self.doc.next(id, 0);
+                    if cur.is_none() {
+                        self.ended_at = Some(EndAt::Dangling(id, 0));
+                    }
                     continue;
                 }
                 NodeKind::GroupOut => return Ok(Exit::LeftGroup),
                 _ => {}
             }
             send(self.tx, WorkerMsg::Active(Some(id)));
+            self.current = Some(id);
             let of = if total == 0 {
                 String::new()
             } else {
@@ -297,28 +425,99 @@ impl<'a> Runner<'a> {
                         return Ok(Exit::Ended);
                     }
                 }
+                self.current = Some(id);
                 cur = self.doc.next(id, 0);
+                if cur.is_none() {
+                    self.ended_at = Some(EndAt::Dangling(id, 0));
+                }
                 continue;
             }
             if matches!(node.kind, NodeKind::End) {
+                self.ended_at = Some(EndAt::EndStep(id));
                 return Ok(Exit::Ended);
             }
-            let port = self.exec(&node)?;
-            cur = port.and_then(|p| self.doc.next(id, p));
+            match self.exec(&node)? {
+                Some(p) => {
+                    cur = self.doc.next(id, p);
+                    if cur.is_none() {
+                        self.ended_at = Some(EndAt::Dangling(id, p));
+                    }
+                }
+                None => {
+                    self.ended_at = Some(EndAt::EndStep(id));
+                    cur = None;
+                }
+            }
         }
         // Ran out of connections: inside a group that means "carry on after the group".
         Ok(Exit::LeftGroup)
     }
 
-    fn resolve(&self, target: Target, x: i32, y: i32, ox: i32, oy: i32) -> Result<Option<(i32, i32)>, String> {
-        match target {
-            Target::Fixed => Ok(Some((x, y))),
-            Target::Current => Ok(None),
-            Target::FoundImage => self
-                .found
-                .map(|(fx, fy)| Some((fx + ox, fy + oy)))
-                .ok_or_else(|| "A step targets the found image, but no Find image step has found anything yet.".to_string()),
+    /// Put what the last Read text step read wherever `{text}` appears.
+    fn fill_text(&self, s: &str) -> String {
+        s.replace("{text}", self.last_text.as_deref().unwrap_or(""))
+    }
+
+    /// A random number from 0 to 1.
+    fn unit(&mut self) -> f64 {
+        self.random(1_000_000) as f64 / 1_000_000.0
+    }
+
+    /// Where a mouse step should go, including any randomness.
+    /// None means "stay where the mouse already is".
+    #[allow(clippy::too_many_arguments)]
+    fn resolve(
+        &mut self,
+        step: u64,
+        target: Target,
+        x: i32,
+        y: i32,
+        ox: i32,
+        oy: i32,
+        area: Option<ScreenRect>,
+        jitter: i32,
+    ) -> Result<Option<(i32, i32)>, String> {
+        let jitter = jitter.clamp(0, 2000);
+        // Pick a spot; with randomness, try again if it's the same as last time.
+        for attempt in 0..8 {
+            let base = match target {
+                Target::Fixed => Some((x, y)),
+                Target::Current if jitter == 0 => return Ok(None),
+                Target::Current => Some(self.enigo.location().map_err(input_err)?),
+                Target::FoundImage => Some(
+                    self.found
+                        .map(|(fx, fy)| (fx + ox, fy + oy))
+                        .ok_or_else(|| "It aims at the found image, but no Find image step has found anything yet.".to_string())?,
+                ),
+                Target::Area => {
+                    let r = area.ok_or_else(|| {
+                        "It clicks randomly in an area, but no area is selected yet. Use “Select click area”.".to_string()
+                    })?;
+                    // Stay a couple of pixels inside the edge.
+                    let inset = if r.w >= 8 && r.h >= 8 { 2.0 } else { 0.0 };
+                    let rx = r.x as f64 + inset + self.unit() * (r.w as f64 - 1.0 - inset * 2.0).max(0.0);
+                    let ry = r.y as f64 + inset + self.unit() * (r.h as f64 - 1.0 - inset * 2.0).max(0.0);
+                    Some((rx.round() as i32, ry.round() as i32))
+                }
+            };
+            let Some((bx, by)) = base else { return Ok(None) };
+            let p = if jitter > 0 {
+                // A random point within `jitter` pixels (evenly spread over the circle).
+                let angle = self.unit() * std::f64::consts::TAU;
+                let dist = self.unit().sqrt() * jitter as f64;
+                (bx + (angle.cos() * dist).round() as i32, by + (angle.sin() * dist).round() as i32)
+            } else {
+                (bx, by)
+            };
+            let random = jitter > 0 || target == Target::Area;
+            if !random || attempt == 7 || self.last_points.get(&step) != Some(&p) {
+                if random {
+                    self.last_points.insert(step, p);
+                }
+                return Ok(Some(p));
+            }
         }
+        unreachable!("the loop always returns")
     }
 
     fn move_to(&mut self, x: i32, y: i32) -> Result<(), String> {
@@ -362,8 +561,12 @@ impl<'a> Runner<'a> {
                 offset_y,
                 button,
                 clicks,
+                area,
+                jitter_px,
             } => {
-                if let Some((px, py)) = self.resolve(*target, *x, *y, *offset_x, *offset_y)? {
+                if let Some((px, py)) =
+                    self.resolve(node.id, *target, *x, *y, *offset_x, *offset_y, *area, *jitter_px)?
+                {
                     self.move_to(px, py)?;
                     self.sleep(25)?;
                 }
@@ -383,8 +586,12 @@ impl<'a> Runner<'a> {
                 y,
                 offset_x,
                 offset_y,
+                area,
+                jitter_px,
             } => {
-                if let Some((px, py)) = self.resolve(*target, *x, *y, *offset_x, *offset_y)? {
+                if let Some((px, py)) =
+                    self.resolve(node.id, *target, *x, *y, *offset_x, *offset_y, *area, *jitter_px)?
+                {
                     self.move_to(px, py)?;
                 }
                 Ok(Some(0))
@@ -406,10 +613,7 @@ impl<'a> Runner<'a> {
             }
 
             NodeKind::TypeText { text, press_enter } => {
-                let text = match &self.last_text {
-                    Some(read) => text.replace("{text}", read),
-                    None => text.replace("{text}", ""),
-                };
+                let text = self.fill_text(text);
                 if !text.is_empty() {
                     self.enigo.text(&text).map_err(input_err)?;
                 }
@@ -612,6 +816,49 @@ impl<'a> Runner<'a> {
                     }
                     self.sleep((*interval_ms).max(100))?;
                 }
+            }
+
+            NodeKind::Notify {
+                title,
+                message,
+                style,
+                position,
+                duration_ms,
+                wait_for_click,
+                sound,
+            } => {
+                let toast = vision::Toast {
+                    title: self.fill_text(title),
+                    message: self.fill_text(message),
+                    style: style.key(),
+                    position: position.key(),
+                    duration_ms: *duration_ms,
+                    wait: *wait_for_click,
+                    sound: *sound,
+                };
+                // A new pop-up replaces the one already showing.
+                if let Some(mut old) = self.toast.take() {
+                    let _ = old.kill();
+                    let _ = old.wait();
+                }
+                let mut child = vision::show_notification(&toast)?;
+                if *wait_for_click {
+                    self.status("✦ Paused – click the pop-up to carry on (Esc stops)".into());
+                    loop {
+                        if self.stop.load(Ordering::Relaxed) {
+                            let _ = child.kill();
+                            let _ = child.wait();
+                            return Err(STOPPED.into());
+                        }
+                        match child.try_wait() {
+                            Ok(Some(_)) | Err(_) => break,
+                            Ok(None) => thread::sleep(Duration::from_millis(30)),
+                        }
+                    }
+                } else {
+                    self.toast = Some(child);
+                }
+                Ok(Some(0))
             }
 
             NodeKind::Loop { count } => {
@@ -824,6 +1071,8 @@ pub fn record_step(tx: Tx, stop: Arc<AtomicBool>) {
                             offset_y: 0,
                             button: *b,
                             clicks,
+                            area: None,
+                            jitter_px: 0,
                         }),
                     );
                 }
@@ -952,6 +1201,7 @@ pub fn capture_for_area(tx: Tx, stop: Arc<AtomicBool>, countdown_first: bool, pu
                 AreaPurpose::ReadText(_) => "Drag a box around the text or number to read",
                 AreaPurpose::Template(_) => "Drag a box around what to look for",
                 AreaPurpose::SearchArea(_) => "Drag a box around where the image can appear",
+                AreaPurpose::ClickArea(_) => "Drag a box around where to click",
             };
             // Esc cancels even if the selector never got keyboard focus.
             let esc_was_down = ds.get_keys().contains(&Keycode::Escape);

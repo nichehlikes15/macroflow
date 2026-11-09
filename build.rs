@@ -1,6 +1,7 @@
 //! Builds the small native helpers MacroFlow uses on macOS:
 //!   helpers/ocr.swift    -> macroflow-ocr     (Read text steps)
 //!   helpers/select.swift -> macroflow-select  (the drag-a-box area selector)
+//!   helpers/notify.swift -> macroflow-notify  (Pop-up steps)
 //! If one can't be built, MacroFlow still builds; only that feature reports an error.
 //! (On Windows the helpers are PowerShell scripts embedded into the app instead.)
 
@@ -41,9 +42,17 @@ fn main() {
     if target_os != "macos" {
         println!("cargo:rustc-env=MACROFLOW_OCR_HELPER=");
         println!("cargo:rustc-env=MACROFLOW_SELECT_HELPER=");
+        println!("cargo:rustc-env=MACROFLOW_NOTIFY_HELPER=");
         return;
     }
     build_swift("helpers/ocr.swift", &out_dir, "macroflow-ocr", "MACROFLOW_OCR_HELPER", "Read text steps");
+    build_swift(
+        "helpers/notify.swift",
+        &out_dir,
+        "macroflow-notify",
+        "MACROFLOW_NOTIFY_HELPER",
+        "pop-up steps",
+    );
     build_swift(
         "helpers/select.swift",
         &out_dir,
