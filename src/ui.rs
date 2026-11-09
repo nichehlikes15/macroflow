@@ -213,6 +213,7 @@ enum Field {
     DragToY,
     DragMs,
     MouseSpeed,
+    ScrollStrength,
 }
 
 impl Field {
@@ -267,6 +268,13 @@ pub struct MacroApp {
     /// Where each text box's text starts on screen, and its font, so a click can
     /// put the cursor between the right letters.
     field_geom: Rc<RefCell<HashMap<Field, (f32, Font, f32)>>>,
+    /// Variables some step sets, plus the built-in ones (refreshed every frame).
+    vars_known: std::collections::BTreeSet<String>,
+    /// What each Read text / Find image step saw the last time it ran (or was tested).
+    seen: HashMap<u64, SeenShot>,
+    /// Show the original picture (the area when it was selected / the image to find)
+    /// instead of what the step last saw.
+    show_original: bool,
     capturing_key: bool,
     mode: Mode,
     status: String,
@@ -373,6 +381,13 @@ impl MacroApp {
             edit_anchor: None,
             field_drag: false,
             field_geom: Rc::new(RefCell::new(HashMap::new())),
+            vars_known: Default::default(),
+            seen: {
+                // Pictures from an earlier session aren't needed any more.
+                let _ = std::fs::remove_dir_all(engine::seen_dir());
+                HashMap::new()
+            },
+            show_original: false,
             capturing_key: false,
             mode: Mode::Idle,
             status: "Welcome! Add steps from the left, or record a macro. Drag from a step's right-hand dot to connect it.".into(),
@@ -504,6 +519,7 @@ impl MacroApp {
                 }
                 WorkerMsg::Snipped(path) => {
                     if let Mode::Snipping(id) = self.mode {
+                        self.forget_seen(id);
                         if let Some(n) = self.doc.node_mut(id) {
                             if let NodeKind::FindImage { template, .. } = &mut n.kind {
                                 *template = Some(path.clone());
@@ -513,6 +529,11 @@ impl MacroApp {
                         self.status = format!("Saved snip to {}. Use “Test now” to check it.", path.display());
                     }
                     self.mode = Mode::Idle;
+                }
+                WorkerMsg::Seen { step, path, caption, ok } => {
+                    if let Some(old) = self.seen.insert(step, SeenShot { path, caption, ok }) {
+                        let _ = std::fs::remove_file(old.path);
+                    }
                 }
                 WorkerMsg::TestResult(s) => {
                     self.mode = Mode::Idle;
@@ -538,6 +559,8 @@ impl MacroApp {
                     self.mode = Mode::Idle;
                     match purpose {
                         AreaPurpose::ReadText(id) => {
+                            // A new area: what it saw before is out of date.
+                            self.forget_seen(id);
                             self.update_node(id, |k| {
                                 if let NodeKind::ReadText { preview, .. } = k {
                                     *preview = Some(path.clone());
@@ -545,6 +568,7 @@ impl MacroApp {
                             });
                         }
                         AreaPurpose::Template(id) => {
+                            self.forget_seen(id);
                             self.update_node(id, |k| {
                                 if let NodeKind::FindImage { template, .. } = k {
                                     *template = Some(path.clone());
@@ -582,6 +606,82 @@ impl MacroApp {
 
     fn idle(&self) -> bool {
         self.mode == Mode::Idle
+    }
+
+    /// Drop the picture of what a step last saw (e.g. it has a new area now).
+    fn forget_seen(&mut self, id: u64) {
+        if let Some(old) = self.seen.remove(&id) {
+            let _ = std::fs::remove_file(old.path);
+        }
+    }
+
+    /// The picture box at the top of a Read text / Find image step: what it saw the
+    /// last time it ran, or the original picture (`original`, with its label).
+    fn picture_box(
+        &self,
+        id: u64,
+        height: f32,
+        original: AnyElement,
+        original_label: &'static str,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        let mut out: Vec<AnyElement> = Vec::new();
+        let seen = self.seen.get(&id);
+        let showing_seen = seen.is_some() && !self.show_original;
+        if seen.is_some() {
+            let tab = |key: &'static str, label: &'static str, on: bool, to_original: bool| {
+                chip(SharedString::from(format!("{key}-{id}")), label, on).on_click(cx.listener(
+                    move |this, _: &ClickEvent, _, cx| {
+                        this.show_original = to_original;
+                        cx.notify();
+                    },
+                ))
+            };
+            out.push(
+                div()
+                    .flex()
+                    .flex_row()
+                    .gap_1()
+                    .child(tab("seen-last", "Last run", showing_seen, false))
+                    .child(tab("seen-orig", original_label, !showing_seen, true))
+                    .into_any_element(),
+            );
+        }
+        let (content, border): (AnyElement, u32) = match seen {
+            Some(sh) if showing_seen => (
+                img(sh.path.clone())
+                    .size_full()
+                    .object_fit(ObjectFit::Contain)
+                    .into_any_element(),
+                if sh.ok { GREEN } else { VAR_WARN },
+            ),
+            _ => (original, BORDER),
+        };
+        out.push(
+            div()
+                .h(px(height))
+                .w_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded_md()
+                .bg(rgb(BG))
+                .border_1()
+                .border_color(rgb(border))
+                .p_1()
+                .child(content)
+                .into_any_element(),
+        );
+        if let Some(sh) = seen.filter(|_| showing_seen) {
+            out.push(
+                div()
+                    .text_xs()
+                    .text_color(rgb(if sh.ok { TEXT } else { VAR_WARN }))
+                    .child(sh.caption.clone())
+                    .into_any_element(),
+            );
+        }
+        out
     }
 
     fn begin_worker(&mut self, mode: Mode) -> bool {
@@ -801,7 +901,7 @@ impl MacroApp {
             // Get out of the way so MacroFlow (and its preview of the image) isn't searched.
             self.restore_after_test = true;
             window.minimize_window();
-            engine::test_find(self.tx.clone(), path, threshold, search_area, scale, 600);
+            engine::test_find(self.tx.clone(), id, path, threshold, search_area, scale, 600);
         }
     }
 
@@ -970,6 +1070,21 @@ impl MacroApp {
         }
     }
 
+    /// Scroll wherever the mouse is in 3 seconds, the way this Scroll step would.
+    fn start_scroll_test(&mut self, id: u64) {
+        self.commit_edit();
+        let Some(NodeKind::Scroll { amount, horizontal, strength }) = self.doc.node(id).map(|n| n.kind.clone()) else {
+            return;
+        };
+        if amount == 0 {
+            self.status = "Set how many wheel clicks to scroll first.".into();
+            return;
+        }
+        if self.begin_worker(Mode::Testing) {
+            engine::test_scroll(self.tx.clone(), amount, horizontal, strength);
+        }
+    }
+
     fn start_read_test(&mut self, id: u64, window: &mut Window) {
         self.commit_edit();
         let Some(NodeKind::ReadText {
@@ -1000,6 +1115,7 @@ impl MacroApp {
             window.minimize_window();
             engine::test_read(
                 self.tx.clone(),
+                id,
                 (x, y, w, h),
                 compare,
                 value,
@@ -1707,6 +1823,7 @@ impl MacroApp {
             (Field::WaitMs, NodeKind::Wait { ms, .. }) => ms.to_string(),
             (Field::Jitter, NodeKind::Wait { jitter_ms, .. }) => jitter_ms.to_string(),
             (Field::ScrollAmt, NodeKind::Scroll { amount, .. }) => amount.to_string(),
+            (Field::ScrollStrength, NodeKind::Scroll { strength, .. }) => strength.to_string(),
             (Field::RecSpeed, NodeKind::Recording { speed, .. }) => format!("{speed:.2}"),
             (Field::RecDelay(i), NodeKind::Recording { events, .. }) => events
                 .get(i)
@@ -1855,6 +1972,9 @@ impl MacroApp {
             (Field::Jitter, NodeKind::Wait { jitter_ms, .. }) => *jitter_ms = int()?.max(0) as u64,
             (Field::ScrollAmt, NodeKind::Scroll { amount, .. }) => {
                 *amount = int()?.clamp(-500, 500) as i32
+            }
+            (Field::ScrollStrength, NodeKind::Scroll { strength, .. }) => {
+                *strength = int()?.clamp(1, 20) as u32
             }
             (Field::RecSpeed, NodeKind::Recording { speed, .. }) => *speed = num()?.clamp(0.05, 20.0),
             (Field::RecDelay(i), NodeKind::Recording { events, .. }) => {
@@ -2023,6 +2143,10 @@ impl MacroApp {
             let mut ed = TextEdit::new(&buf, self.edit_cursor, self.edit_anchor);
             let len = ed.chars.len();
             let shift = m.shift;
+            // `{name}` pills move and delete as one block.
+            let pills: Vec<(usize, usize)> = f.edit_pills(&buf).iter().map(|r| (r.start, r.end)).collect();
+            let pill_ending = |at: usize| pills.iter().find(|p| p.1 == at).map(|p| p.0);
+            let pill_starting = |at: usize| pills.iter().find(|p| p.0 == at).map(|p| p.1);
             // Word jumps: ⌥ on a Mac, Ctrl on Windows. ⌘ ← / → on a Mac jumps to the start / end.
             let word = if IS_MACOS { m.alt } else { m.control };
             let line = IS_MACOS && m.platform;
@@ -2040,7 +2164,7 @@ impl MacroApp {
                     } else if let (false, Some((a, _))) = (shift, ed.selection()) {
                         a
                     } else {
-                        ed.cur.saturating_sub(1)
+                        pill_ending(ed.cur).unwrap_or(ed.cur.saturating_sub(1))
                     };
                     ed.move_to(to, shift);
                 }
@@ -2052,7 +2176,7 @@ impl MacroApp {
                     } else if let (false, Some((_, b))) = (shift, ed.selection()) {
                         b
                     } else {
-                        (ed.cur + 1).min(len)
+                        pill_starting(ed.cur).unwrap_or((ed.cur + 1).min(len))
                     };
                     ed.move_to(to, shift);
                 }
@@ -2065,7 +2189,7 @@ impl MacroApp {
                         } else if word {
                             prev_word(&ed.chars, ed.cur)
                         } else {
-                            ed.cur.saturating_sub(1)
+                            pill_ending(ed.cur).unwrap_or(ed.cur.saturating_sub(1))
                         };
                         ed.delete(from, ed.cur);
                     }
@@ -2077,7 +2201,7 @@ impl MacroApp {
                         } else if word {
                             next_word(&ed.chars, ed.cur)
                         } else {
-                            (ed.cur + 1).min(len)
+                            pill_starting(ed.cur).unwrap_or((ed.cur + 1).min(len))
                         };
                         ed.delete(ed.cur, to);
                     }
@@ -4176,7 +4300,7 @@ impl MacroApp {
                     .text_size(s(12.))
                     .text_color(rgb(TEXT))
                     .truncate()
-                    .child(n.kind.summary()),
+                    .child(self.summary_view(&n.kind, z)),
             )
             .child(
                 div()
@@ -4368,6 +4492,57 @@ impl MacroApp {
             help("Scaling affects waits, recordings and step delays. “Set every…” leaves Wait steps alone.").into_any_element(),
         ];
 
+        // Variables.
+        out.push(div().h(px(8.)).into_any_element());
+        out.push(section_title("Variables").into_any_element());
+        {
+            let set = self.doc.variables_set();
+            let never_set: Vec<String> = self
+                .doc
+                .variables_used()
+                .into_iter()
+                .filter(|n| !self.is_known_var(n))
+                .collect();
+            let pills = |names: Vec<String>, known: bool| {
+                names.into_iter().fold(
+                    div().flex().flex_row().flex_wrap().gap_y_1().text_xs(),
+                    |row, n| row.child(var_pill(&n, known, false, 1.0)),
+                )
+            };
+            if set.is_empty() {
+                out.push(help("No steps set a variable yet. Add a Set variable step, or a Read text step that saves what it reads.").into_any_element());
+            } else {
+                out.push(pills(set.into_iter().collect(), true).into_any_element());
+            }
+            out.push(
+                div()
+                    .flex()
+                    .flex_row()
+                    .flex_wrap()
+                    .items_center()
+                    .gap_y_1()
+                    .text_xs()
+                    .child(div().text_color(rgb(MUTED)).mr_1().child("Always there:"))
+                    .child(pills(BUILTIN_VARS.iter().map(|v| v.to_string()).collect(), true))
+                    .into_any_element(),
+            );
+            if !never_set.is_empty() {
+                out.push(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .flex_wrap()
+                        .items_center()
+                        .gap_y_1()
+                        .text_xs()
+                        .child(div().text_color(rgb(VAR_WARN)).mr_1().child("Used but never set:"))
+                        .child(pills(never_set, false))
+                        .into_any_element(),
+                );
+            }
+            out.push(help("Use a variable in text as {name}: it turns into a tag like the ones above once you type the closing }. Amber tags are variables no step sets, which is usually a typo.").into_any_element());
+        }
+
         // Scaling to the screen size.
         out.push(div().h(px(8.)).into_any_element());
         out.push(section_title("Screen size").into_any_element());
@@ -4512,7 +4687,26 @@ impl MacroApp {
                 }))
                 .into_any_element(),
         );
-        out.push(help("Shows when a step goes wrong or the macro runs into a path with nothing connected. Reaching an End step or pressing Stop doesn't count.").into_any_element());
+        out.push(help("Shows when a step goes wrong (including an internal crash) or the macro runs into a path with nothing connected.").into_any_element());
+        out.push(
+            chip("alert-on-finish", "Green pop-up when it finishes", self.doc.alert_on_finish)
+                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                    this.doc.alert_on_finish = !this.doc.alert_on_finish;
+                    this.dirty = true;
+                    cx.notify();
+                }))
+                .into_any_element(),
+        );
+        out.push(help("Shows when it reaches an End step or has done every repeat. Pressing Stop / Esc never shows a pop-up.").into_any_element());
+        out.push(
+            chip("alert-on-breakpoint", "Pop-up when it pauses at a breakpoint", self.doc.alert_on_breakpoint)
+                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                    this.doc.alert_on_breakpoint = !this.doc.alert_on_breakpoint;
+                    this.dirty = true;
+                    cx.notify();
+                }))
+                .into_any_element(),
+        );
         out.push(
             chip("failsafe", "Failsafe: stop when the mouse hits a screen corner", self.doc.failsafe)
                 .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
@@ -4787,7 +4981,8 @@ impl MacroApp {
                 out.push(help("Random extra adds 0…N ms each time, so the macro looks less robotic.").into_any_element());
             }
             NodeKind::Scroll { horizontal, .. } => {
-                out.push(self.num_field("Lines", Field::ScrollAmt, 1.0, cx).into_any_element());
+                out.push(self.num_field("Wheel clicks", Field::ScrollAmt, 1.0, cx).into_any_element());
+                out.push(self.num_field("Strength (× per click)", Field::ScrollStrength, 1.0, cx).into_any_element());
                 out.push(
                     chip("scroll-h", "Sideways", *horizontal)
                         .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
@@ -4800,7 +4995,15 @@ impl MacroApp {
                         }))
                         .into_any_element(),
                 );
-                out.push(help("Positive scrolls down/right, negative scrolls up/left.").into_any_element());
+                out.push(help("Positive scrolls down/right, negative scrolls up/left. Each click is sent separately, like turning the wheel by hand. If it still scrolls less than your mouse does, raise the strength.").into_any_element());
+                out.push(
+                    small_btn("scroll-test", "Test (scrolls in 3 s)")
+                        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                            this.start_scroll_test(id);
+                            cx.notify();
+                        }))
+                        .into_any_element(),
+                );
             }
             NodeKind::Recording { events, .. } => {
                 out.extend(self.recording_settings(id, events, cx));
@@ -5130,21 +5333,26 @@ impl MacroApp {
                 .child("No image yet")
                 .into_any_element(),
         };
-        out.push(
-            div()
-                .h(px(110.))
-                .w_full()
-                .flex()
-                .items_center()
-                .justify_center()
-                .rounded_md()
-                .bg(rgb(BG))
-                .border_1()
-                .border_color(rgb(BORDER))
-                .p_1()
-                .child(preview)
-                .into_any_element(),
-        );
+        if show_preview {
+            out.extend(self.picture_box(id, 110., preview, "Image to find", cx));
+        } else {
+            // While searching, show nothing that could be found on screen.
+            out.push(
+                div()
+                    .h(px(110.))
+                    .w_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded_md()
+                    .bg(rgb(BG))
+                    .border_1()
+                    .border_color(rgb(BORDER))
+                    .p_1()
+                    .child(preview)
+                    .into_any_element(),
+            );
+        }
         if let Some(p) = &template {
             out.push(help(&p.display().to_string()).into_any_element());
         }
@@ -5557,7 +5765,7 @@ impl MacroApp {
                             .text_xs()
                             .text_color(rgb(MUTED))
                             .truncate()
-                            .child(n.kind.summary()),
+                            .child(self.summary_view(&n.kind, 1.0)),
                     )
                     .into_any_element(),
             );
@@ -5609,7 +5817,7 @@ impl MacroApp {
                                 .text_xs()
                                 .text_color(rgb(MUTED))
                                 .truncate()
-                                .child(n.kind.summary()),
+                                .child(self.summary_view(&n.kind, 1.0)),
                         )
                         .into_any_element(),
                 );
@@ -5796,21 +6004,7 @@ impl MacroApp {
                 .child(if has_area { "Area set" } else { "No area yet" })
                 .into_any_element(),
         };
-        out.push(
-            div()
-                .h(px(80.))
-                .w_full()
-                .flex()
-                .items_center()
-                .justify_center()
-                .rounded_md()
-                .bg(rgb(BG))
-                .border_1()
-                .border_color(rgb(BORDER))
-                .p_1()
-                .child(preview_el)
-                .into_any_element(),
-        );
+        out.extend(self.picture_box(id, 80., preview_el, "When selected", cx));
         out.push(
             div()
                 .flex()
@@ -5993,8 +6187,20 @@ impl MacroApp {
                 cx.listener(|this, _: &MouseUpEvent, _, _| this.field_drag = false),
             );
         base = match editing_buf {
-            None => base.child(div().truncate().child(self.get_field(field))),
-            Some(buf) => base.child(self.render_edit_text(&buf)),
+            None => {
+                let text = self.get_field(field);
+                let known = |n: &str| self.is_known_var(n);
+                match field.var_mode() {
+                    Some(mode) if var_ranges(&text, mode, &known).len() > 0 => {
+                        base.child(spans_view(&var_spans(&text, mode, &known), &known, 1.0))
+                    }
+                    _ => base.child(div().truncate().child(text)),
+                }
+            }
+            Some(buf) => {
+                let pills = field.edit_pills(&buf);
+                base.child(self.render_edit_text(&buf, &pills))
+            }
         };
         if width > 0.0 {
             base.w(px(width)).flex_none()
@@ -6004,43 +6210,92 @@ impl MacroApp {
     }
 
     /// The text being edited, with the cursor and any selection.
-    fn render_edit_text(&self, buf: &str) -> Div {
+    fn render_edit_text(&self, buf: &str, pills: &[VarRange]) -> Div {
         let chars: Vec<char> = buf.chars().collect();
         let len = chars.len();
         let cur = self.edit_cursor.min(len);
-        let seg = |a: usize, b: usize| -> String { chars[a..b].iter().collect() };
         let caret = || div().flex_none().w(px(1.5)).h(px(15.)).mx(px(-0.75)).bg(rgb(TEXT));
         let sel = match self.edit_anchor {
             Some(a) if a.min(len) != cur => Some((a.min(len).min(cur), a.min(len).max(cur))),
             _ => None,
         };
-        let mut row = div().flex().flex_row().items_center().whitespace_nowrap();
-        let push = |row: Div, text: String| if text.is_empty() { row } else { row.child(text) };
-        match sel {
-            None => {
-                row = push(row, seg(0, cur));
-                row = row.child(caret());
-                row = push(row, seg(cur, len));
+        let in_sel = |p: usize| sel.map_or(false, |(a, b)| p >= a && p < b);
+        let text_piece = |text: String, selected: bool| {
+            let d = div().flex_none().child(text);
+            if selected {
+                d.rounded_sm().bg(rgba((ACCENT << 8) | 0x77)).text_color(rgb(0xffffff))
+            } else {
+                d
             }
-            Some((a, b)) => {
-                row = push(row, seg(0, a));
-                if cur == a {
-                    row = row.child(caret());
+        };
+        let mut row = div().flex().flex_row().items_center().whitespace_nowrap();
+        for seg in edit_segments(len, pills, cur, sel) {
+            match seg {
+                EditSeg::Pill(a, _, name) => {
+                    if cur == a {
+                        row = row.child(caret());
+                    }
+                    row = row.child(var_pill(&name, self.is_known_var(&name), in_sel(a), 1.0));
                 }
-                row = row.child(
-                    div()
-                        .rounded_sm()
-                        .bg(rgba((ACCENT << 8) | 0x77))
-                        .text_color(rgb(0xffffff))
-                        .child(seg(a, b)),
-                );
-                if cur == b {
-                    row = row.child(caret());
+                EditSeg::Plain(a, b) => {
+                    // Split the run where the caret and the selection's ends fall.
+                    let mut cuts = vec![a, b, cur];
+                    if let Some((x, y)) = sel {
+                        cuts.push(x);
+                        cuts.push(y);
+                    }
+                    cuts.retain(|c| *c >= a && *c <= b);
+                    cuts.sort();
+                    cuts.dedup();
+                    for w in cuts.windows(2) {
+                        if w[0] == cur {
+                            row = row.child(caret());
+                        }
+                        let text: String = chars[w[0]..w[1]].iter().collect();
+                        row = row.child(text_piece(text, in_sel(w[0])));
+                    }
                 }
-                row = push(row, seg(b, len));
             }
         }
+        if cur == len {
+            row = row.child(caret());
+        }
         row
+    }
+
+    /// Is this a variable some step sets (or a built-in one)?
+    fn is_known_var(&self, name: &str) -> bool {
+        self.vars_known.contains(name)
+    }
+
+    /// A step's summary, with any variables shown as pills.
+    fn summary_view(&self, kind: &NodeKind, z: f32) -> AnyElement {
+        let known = |n: &str| self.is_known_var(n);
+        match kind.summary_spans(&known) {
+            Some(spans) => spans_view(&spans, &known, z).into_any_element(),
+            None => kind.summary().into_any_element(),
+        }
+    }
+
+    /// Put a variable into the box being edited: `{name}` at the cursor, or (for a
+    /// box that holds a variable's name) the name itself.
+    fn insert_var(&mut self, field: Field, name: &str) {
+        let Some((f, buf)) = self.editing.take() else { return };
+        if f != field {
+            self.editing = Some((f, buf));
+            return;
+        }
+        let mut ed = TextEdit::new(&buf, self.edit_cursor, self.edit_anchor);
+        if field.var_mode() == Some(VarMode::Name) {
+            ed.anchor = Some(0);
+            ed.cur = ed.chars.len();
+            ed.insert(name);
+        } else {
+            ed.insert(&format!("{{{name}}}"));
+        }
+        self.edit_cursor = ed.cur;
+        self.edit_anchor = ed.anchor;
+        self.editing = Some((f, ed.text()));
     }
 
     /// Which character a click at window x lands on, in the field being edited.
@@ -6055,19 +6310,49 @@ impl MacroApp {
         let Some((origin, font, size)) = self.field_geom.borrow().get(&field).cloned() else {
             return len;
         };
-        let run = TextRun {
-            len: text.len(),
-            font,
-            color: hsla(TEXT),
-            background_color: None,
-            underline: None,
-            strikethrough: None,
+        let ts = window.text_system().clone();
+        let shape = |t: &str| {
+            let run = TextRun {
+                len: t.len(),
+                font: font.clone(),
+                color: hsla(TEXT),
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+            };
+            ts.shape_line(SharedString::from(t.to_string()), px(size), &[run], None)
         };
-        let line = window
-            .text_system()
-            .shape_line(SharedString::from(text.clone()), px(size), &[run], None);
-        let byte = line.closest_index_for_x(px(x - origin)).min(text.len());
-        text.get(..byte).map_or(len, |s| s.chars().count())
+        // Walk along the text: plain runs are measured letter by letter, a pill
+        // counts as one block (a click on it goes to whichever end is nearer).
+        let chars: Vec<char> = text.chars().collect();
+        let pills = field.edit_pills(text);
+        let sel = self
+            .edit_anchor
+            .filter(|a| *a != self.edit_cursor)
+            .map(|a| (a.min(self.edit_cursor), a.max(self.edit_cursor)));
+        let mut left = origin;
+        for seg in edit_segments(len, &pills, self.edit_cursor.min(len), sel) {
+            match seg {
+                EditSeg::Pill(a, b, name) => {
+                    let w = f32::from(shape(&format!("{VAR_MARK}{name}")).width) + PILL_EXTRA;
+                    if x < left + w {
+                        return if x < left + w / 2.0 { a } else { b };
+                    }
+                    left += w;
+                }
+                EditSeg::Plain(a, b) => {
+                    let piece: String = chars[a..b].iter().collect();
+                    let line = shape(&piece);
+                    let w = f32::from(line.width);
+                    if x < left + w {
+                        let byte = line.closest_index_for_x(px(x - left)).min(piece.len());
+                        return a + piece.get(..byte).map_or(0, |s| s.chars().count());
+                    }
+                    left += w;
+                }
+            }
+        }
+        len
     }
 
     fn num_field(&self, label: &str, field: Field, step: f64, cx: &mut Context<Self>) -> Div {
@@ -6099,12 +6384,54 @@ impl MacroApp {
 
     fn text_field(&self, label: &str, field: Field, cx: &mut Context<Self>) -> Div {
         debug_assert!(field.is_text());
+        let editing = matches!(&self.editing, Some((f, _)) if *f == field);
         div()
             .flex()
             .flex_col()
             .gap_1()
             .child(div().text_xs().text_color(rgb(MUTED)).child(label.to_string()))
             .child(div().flex().child(self.value_box(field, 0.0, cx)))
+            .when(editing && field.var_mode().is_some(), |d| d.child(self.var_picker(field, cx)))
+    }
+
+    /// While a box that can use variables is being edited: the variables you can put in.
+    fn var_picker(&self, field: Field, cx: &mut Context<Self>) -> Div {
+        let name_box = field.var_mode() == Some(VarMode::Name);
+        let mut row = div().flex().flex_row().flex_wrap().items_center().gap_y_1().text_xs();
+        row = row.child(div().text_color(rgb(MUTED)).mr_1().child(if name_box {
+            "Use an existing name:"
+        } else {
+            "Insert (or type {name}):"
+        }));
+        let names: Vec<String> = self
+            .vars_known
+            .iter()
+            .filter(|n| !(name_box && BUILTIN_VARS.contains(&n.as_str())))
+            .cloned()
+            .collect();
+        if names.is_empty() {
+            return row.child(div().text_color(rgb(MUTED)).child("no variables yet"));
+        }
+        for name in names {
+            let n = name.clone();
+            row = row.child(
+                div()
+                    .id(SharedString::from(format!("insert-var-{field:?}-{name}")))
+                    .cursor_pointer()
+                    .hover(|d| d.opacity(0.8))
+                    .child(var_pill(&name, true, false, 1.0))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _: &MouseDownEvent, _, cx| {
+                            // Keep editing (a click elsewhere would finish the edit).
+                            cx.stop_propagation();
+                            this.insert_var(field, &n);
+                            cx.notify();
+                        }),
+                    ),
+            );
+        }
+        row
     }
 }
 
@@ -6112,6 +6439,8 @@ impl Render for MacroApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Remember the macro for undo whenever it has changed.
         self.checkpoint();
+        self.vars_known = self.doc.variables_set();
+        self.vars_known.extend(BUILTIN_VARS.iter().map(|v| v.to_string()));
         let menu = self.menu.clone().map(|m| self.render_menu(&m, window, cx));
         div()
             .relative()
@@ -6303,6 +6632,115 @@ fn section_title(text: &'static str) -> Div {
         .font_weight(FontWeight::BOLD)
         .text_color(rgb(MUTED))
         .child(text.to_uppercase())
+}
+
+// ---------------------------------------------------------------------------
+// Variable pills: wherever a variable is used it's shown as a small tinted tag
+// ---------------------------------------------------------------------------
+
+/// What a Read text / Find image step saw when it last ran.
+struct SeenShot {
+    path: PathBuf,
+    caption: String,
+    /// It matched / found the image.
+    ok: bool,
+}
+
+/// Text colour of a variable pill.
+const VAR_TEXT: u32 = 0xc9bdff;
+/// A variable that no step sets (probably a typo): amber.
+const VAR_WARN: u32 = 0xf0b429;
+/// The space a pill adds around its text: 1 px margin, 1 px border and 4 px padding
+/// on each side (at 100% zoom). Used to work out where clicks land in a text box.
+const PILL_EXTRA: f32 = 12.0;
+/// The marker in front of a variable's name.
+const VAR_MARK: &str = "#";
+
+/// A variable shown as a pill: `# gold`. `known` = some step sets it (else amber);
+/// `selected` = it's inside the selected text of a box being edited.
+fn var_pill(name: &str, known: bool, selected: bool, z: f32) -> Div {
+    let color = if known { ACCENT } else { VAR_WARN };
+    let bg = if selected { (ACCENT << 8) | 0x99 } else { (color << 8) | 0x24 };
+    div()
+        .flex_none()
+        .flex()
+        .flex_row()
+        .items_center()
+        .mx(px(1. * z))
+        .px(px(4. * z))
+        .rounded(px(4. * z))
+        .border_1()
+        .border_color(rgba((color << 8) | 0x55))
+        .bg(rgba(bg))
+        .text_color(rgb(if selected { 0xffffff } else if known { VAR_TEXT } else { VAR_WARN }))
+        .child(div().text_color(rgba((color << 8) | 0xcc)).child(VAR_MARK))
+        .child(name.to_string())
+}
+
+/// Text with its variables shown as pills (all on one line, cut off if too long).
+fn spans_view(spans: &[Span], known: &dyn Fn(&str) -> bool, z: f32) -> Div {
+    let mut row = div().flex().flex_row().items_center().whitespace_nowrap().overflow_hidden().min_w(px(0.));
+    for sp in spans {
+        row = match sp {
+            Span::Text(t) if t.is_empty() => row,
+            Span::Text(t) => row.child(div().flex_none().child(t.clone())),
+            Span::Var(n) => row.child(var_pill(n, known(n), false, z)),
+        };
+    }
+    row
+}
+
+/// A piece of the text box being edited: plain letters, or a `{name}` pill.
+#[derive(Clone, Debug)]
+enum EditSeg {
+    Plain(usize, usize),
+    Pill(usize, usize, String),
+}
+
+/// Split the text being edited into plain runs and pills. A pill the cursor is inside,
+/// or that the selection only partly covers, is shown as its plain `{name}` text.
+fn edit_segments(len: usize, pills: &[VarRange], cur: usize, sel: Option<(usize, usize)>) -> Vec<EditSeg> {
+    let pills: Vec<&VarRange> = pills
+        .iter()
+        .filter(|r| !(cur > r.start && cur < r.end))
+        .filter(|r| match sel {
+            Some((a, b)) => (a <= r.start && b >= r.end) || b <= r.start || a >= r.end,
+            None => true,
+        })
+        .collect();
+    let mut out = Vec::new();
+    let mut at = 0;
+    for r in pills {
+        if r.start > at {
+            out.push(EditSeg::Plain(at, r.start));
+        }
+        out.push(EditSeg::Pill(r.start, r.end, r.name.clone()));
+        at = r.end;
+    }
+    if at < len {
+        out.push(EditSeg::Plain(at, len));
+    }
+    out
+}
+
+impl Field {
+    /// How this box uses variables (None = it doesn't).
+    fn var_mode(self) -> Option<VarMode> {
+        match self {
+            Field::Text | Field::ToastTitle | Field::ToastText | Field::CompareValue => Some(VarMode::Text),
+            Field::VarExpr | Field::IfLeft | Field::IfRight => Some(VarMode::Expr),
+            Field::VarName | Field::ReadSaveTo => Some(VarMode::Name),
+            _ => None,
+        }
+    }
+
+    /// The `{name}` pills in this box's text while it's being edited.
+    fn edit_pills(self, text: &str) -> Vec<VarRange> {
+        match self.var_mode() {
+            Some(VarMode::Text) | Some(VarMode::Expr) => var_ranges(text, VarMode::Text, &|_| true),
+            _ => Vec::new(),
+        }
+    }
 }
 
 fn help(text: &str) -> Div {

@@ -40,6 +40,9 @@ pub enum WorkerMsg {
     Log(LogEntry),
     /// A position and the colour under it (for Pixel colour steps).
     Pixel { x: i32, y: i32, color: u32 },
+    /// What a Read text / Find image step just looked at (a picture saved in
+    /// `images/last-run/`), so the editor can show it in place of the original.
+    Seen { step: u64, path: PathBuf, caption: String, ok: bool },
     /// The user finished (or cancelled) dragging a box on the screen.
     /// `sel` is (x0, y0, x1, y1) in the screenshot's display coordinates.
     AreaPicked {
@@ -64,6 +67,49 @@ pub enum AreaPurpose {
 }
 
 pub type Tx = Sender<WorkerMsg>;
+
+/// Where the pictures of what steps saw are kept (emptied when MacroFlow starts).
+pub fn seen_dir() -> PathBuf {
+    images_dir().join("last-run")
+}
+
+/// Save what a step just looked at and tell the editor.
+fn send_seen(tx: &Tx, step: u64, img: image::RgbaImage, caption: String, ok: bool) {
+    static COUNT: AtomicU64 = AtomicU64::new(0);
+    let dir = seen_dir();
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    // A new name every time: the editor keeps pictures it has shown by file name.
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let n = COUNT.fetch_add(1, Ordering::Relaxed);
+    let path = dir.join(format!("step{step}-{stamp}-{n}.png"));
+    if vision::shrink_for_display(img).save(&path).is_ok() {
+        send(tx, WorkerMsg::Seen { step, path, caption, ok });
+    }
+}
+
+/// "Read “123”", plus what each read saw if they didn't all agree.
+fn read_caption(r: &vision::OcrRead) -> String {
+    let shown = if r.text.is_empty() {
+        "nothing".to_string()
+    } else {
+        format!("“{}”", r.text.replace('\n', " ⏎ "))
+    };
+    if r.agreed < r.tries {
+        let raw: Vec<String> = r
+            .raw
+            .iter()
+            .map(|s| if s.is_empty() { "–".to_string() } else { format!("“{}”", s.replace('\n', " ⏎ ")) })
+            .collect();
+        format!("Read {shown} ({}/{} reads agreed: {})", r.agreed, r.tries, raw.join(", "))
+    } else {
+        format!("Read {shown}")
+    }
+}
 
 const STOPPED: &str = "Stopped.";
 #[cfg(target_os = "macos")]
@@ -285,6 +331,8 @@ pub fn run_macro(
         );
         if doc.alert_on_stop && end.unexpected() {
             alert(&end);
+        } else if doc.alert_on_finish && end.kind == EndKind::Finished && !end.unexpected() {
+            popup("Macro finished", &end.message, "success", 6000);
         }
         send(&tx, WorkerMsg::Active(None));
         send(&tx, WorkerMsg::RunFinished(end));
@@ -292,6 +340,62 @@ pub fn run_macro(
     if let Err(e) = spawned {
         send(&tx, WorkerMsg::Failed(format!("Couldn't start the macro: {e}")));
     }
+}
+
+/// One wheel click (`back` = up / left). `strength` makes the click scroll further.
+fn scroll_click(enigo: &mut Enigo, back: bool, horizontal: bool, strength: u32) -> Result<(), String> {
+    let axis = if horizontal { Axis::Horizontal } else { Axis::Vertical };
+    let n = strength.clamp(1, 20) as i32;
+    enigo.scroll(if back { -n } else { n }, axis).map_err(input_err)
+}
+
+/// Scroll wherever the mouse is in 3 seconds, to check how far a Scroll step goes.
+pub fn test_scroll(tx: Tx, amount: i32, horizontal: bool, strength: u32) {
+    thread::spawn(move || {
+        for left in (1..=3).rev() {
+            send(
+                &tx,
+                WorkerMsg::Status(format!("Point the mouse at what to scroll – scrolling in {left}…")),
+            );
+            thread::sleep(Duration::from_secs(1));
+        }
+        let result = (|| -> Result<(), String> {
+            let mut enigo = Enigo::new(&Settings::default()).map_err(input_err)?;
+            for i in 0..amount.unsigned_abs() {
+                if i > 0 {
+                    thread::sleep(Duration::from_millis(35));
+                }
+                scroll_click(&mut enigo, amount < 0, horizontal, strength)?;
+            }
+            Ok(())
+        })();
+        send(
+            &tx,
+            WorkerMsg::TestResult(match result {
+                Ok(()) => format!(
+                    "Scrolled {} wheel click{}. Too little? Raise the strength. Too much? Lower the clicks.",
+                    amount.unsigned_abs(),
+                    if amount.unsigned_abs() == 1 { "" } else { "s" }
+                ),
+                Err(e) => e,
+            }),
+        );
+    });
+}
+
+/// A pop-up that isn't tied to a step (alerts from MacroFlow itself).
+fn popup(title: &str, message: &str, style: &'static str, duration_ms: u64) {
+    let toast = vision::Toast {
+        title: title.into(),
+        message: message.into(),
+        style,
+        position: "top-center",
+        duration_ms,
+        wait: false,
+        sound: true,
+    };
+    // The pop-up is its own little program, so it's fine to let it run on its own.
+    let _ = vision::show_notification(&toast);
 }
 
 /// Show a red pop-up saying why the macro stopped.
@@ -692,6 +796,15 @@ impl<'a> Runner<'a> {
                 let why = if node.breakpoint { "Breakpoint" } else { "Step by step" };
                 self.paused.store(true, Ordering::Relaxed);
                 self.log(LogLevel::Warn, format!("⏸ {why} – paused before “{}”", node.label()));
+                // Step-by-step pauses before every step, so only breakpoints pop up.
+                if node.breakpoint && !stepping && self.doc.alert_on_breakpoint {
+                    popup(
+                        "Paused at a breakpoint",
+                        &format!("Before “{}”. F9 carries on · F10 runs just this step · Esc stops", node.label()),
+                        "info",
+                        8000,
+                    );
+                }
                 self.status(format!(
                     "⏸ {why} – paused before “{}”.  F10 / Step runs it · F9 / Resume carries on · Esc stops",
                     node.label()
@@ -1046,9 +1159,17 @@ impl<'a> Runner<'a> {
                 Ok(Some(0))
             }
 
-            NodeKind::Scroll { amount, horizontal } => {
-                let axis = if *horizontal { Axis::Horizontal } else { Axis::Vertical };
-                self.enigo.scroll(*amount, axis).map_err(input_err)?;
+            NodeKind::Scroll { amount, horizontal, strength } => {
+                // One wheel click at a time, like a finger on the wheel (a single big
+                // scroll counts as just one click in many apps and games).
+                let clicks = amount.unsigned_abs();
+                for i in 0..clicks {
+                    if i > 0 {
+                        let gap = if self.doc.human_mouse { 30 + self.random(30) } else { 35 };
+                        self.sleep(gap)?;
+                    }
+                    scroll_click(&mut self.enigo, *amount < 0, *horizontal, *strength)?;
+                }
                 Ok(Some(0))
             }
 
@@ -1113,7 +1234,20 @@ impl<'a> Runner<'a> {
                     if self.stop.load(Ordering::Relaxed) {
                         return Err(STOPPED.into());
                     }
-                    let hit = vision::locate_in(&tpl, *threshold, area)?;
+                    let (hit, view) = vision::locate_in_seen(&tpl, *threshold, area)?;
+                    let gave_up = !hit.found && t0.elapsed().as_millis() as u64 >= *timeout_ms;
+                    if let (Some(view), true) = (view, hit.found || gave_up) {
+                        let caption = if hit.found {
+                            format!("Found at ({}, {}), {:.0}% match", hit.x, hit.y, hit.score * 100.0)
+                        } else {
+                            format!(
+                                "Not found: the closest was a {:.0}% match (needs {:.0}%)",
+                                hit.score.max(0.0) * 100.0,
+                                threshold * 100.0
+                            )
+                        };
+                        send_seen(self.tx, node.id, view, caption, hit.found);
+                    }
                     if hit.found {
                         self.found = Some((hit.x, hit.y));
                         self.vars.insert("found_x".into(), hit.x.to_string());
@@ -1234,11 +1368,15 @@ impl<'a> Runner<'a> {
                         return Err(STOPPED.into());
                     }
                     let stop = self.stop.clone();
-                    let read = vision::read_text_sure(*x, *y, *w, *h, mode, &move || {
+                    let (result, shot) = vision::read_text_seen(*x, *y, *w, *h, mode, &move || {
                         stop.load(Ordering::Relaxed)
-                    })?
-                    .text;
-                    let ok = text_matches(&read, *compare, value, *case_sensitive, baseline.as_deref())?;
+                    })?;
+                    let read = result.text.clone();
+                    // "Compare with" can use variables too, e.g. {gold_before}.
+                    let value = self.fill_text(value);
+                    let ok = text_matches(&read, *compare, &value, *case_sensitive, baseline.as_deref())?;
+                    let verdict = if ok { "match" } else { "no match" };
+                    send_seen(self.tx, node.id, shot, format!("{} – {verdict}", read_caption(&result)), ok);
                     if baseline.is_none() {
                         baseline = Some(read.clone());
                     }
@@ -1708,7 +1846,15 @@ pub fn snip(tx: Tx, stop: Arc<AtomicBool>, size: u32) {
 }
 
 /// Search the screen once and report the result (and point the mouse at it).
-pub fn test_find(tx: Tx, path: PathBuf, threshold: f32, area: Option<ScreenRect>, scale: f64, wait_ms: u64) {
+pub fn test_find(
+    tx: Tx,
+    step: u64,
+    path: PathBuf,
+    threshold: f32,
+    area: Option<ScreenRect>,
+    scale: f64,
+    wait_ms: u64,
+) {
     thread::spawn(move || {
         thread::sleep(Duration::from_millis(wait_ms));
         let result = (|| -> Result<String, String> {
@@ -1721,8 +1867,20 @@ pub fn test_find(tx: Tx, path: PathBuf, threshold: f32, area: Option<ScreenRect>
                 tpl
             };
             let t0 = Instant::now();
-            let hit = vision::locate_in(&tpl, threshold, area.map(|r| (r.x, r.y, r.w, r.h)))?;
+            let (hit, view) = vision::locate_in_seen(&tpl, threshold, area.map(|r| (r.x, r.y, r.w, r.h)))?;
             let ms = t0.elapsed().as_millis();
+            if let Some(view) = view {
+                let caption = if hit.found {
+                    format!("Test: found at ({}, {}), {:.0}% match", hit.x, hit.y, hit.score * 100.0)
+                } else {
+                    format!(
+                        "Test: not found, the closest was a {:.0}% match (needs {:.0}%)",
+                        hit.score.max(0.0) * 100.0,
+                        threshold * 100.0
+                    )
+                };
+                send_seen(&tx, step, view, caption, hit.found);
+            }
             if hit.found {
                 if let Ok(mut e) = Enigo::new(&Settings::default()) {
                     let _ = e.move_mouse(hit.x, hit.y, Coordinate::Abs);
@@ -1834,6 +1992,7 @@ pub fn crop_area(tx: Tx, shot: vision::Shot, sel: (u32, u32, u32, u32), purpose:
 #[allow(clippy::too_many_arguments)]
 pub fn test_read(
     tx: Tx,
+    step: u64,
     rect: (i32, i32, i32, i32),
     compare: TextCompare,
     value: String,
@@ -1849,9 +2008,12 @@ pub fn test_read(
             vision::OcrMode::Text
         };
         let t0 = Instant::now();
-        let msg = match vision::read_text_sure(rect.0, rect.1, rect.2, rect.3, mode, &|| false) {
+        let msg = match vision::read_text_seen(rect.0, rect.1, rect.2, rect.3, mode, &|| false) {
             Err(e) => e,
-            Ok(r) => {
+            Ok((r, shot)) => {
+                let ok = compare != TextCompare::Changed
+                    && text_matches(&r.text, compare, &value, case_sensitive, None).unwrap_or(false);
+                send_seen(&tx, step, shot, format!("Read now: {}", read_caption(&r)), ok);
                 let ms = t0.elapsed().as_millis();
                 let read = r.text.clone();
                 let shown = if read.is_empty() {

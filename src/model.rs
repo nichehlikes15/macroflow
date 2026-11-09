@@ -297,6 +297,18 @@ impl CmpOp {
     }
 }
 
+fn default_one() -> u32 {
+    1
+}
+
+fn is_one(v: &u32) -> bool {
+    *v == 1
+}
+
+fn is_true(v: &bool) -> bool {
+    *v
+}
+
 fn default_true() -> bool {
     true
 }
@@ -492,8 +504,13 @@ pub enum NodeKind {
         jitter_ms: u64,
     },
     Scroll {
+        /// Wheel clicks (positive = down / right).
         amount: i32,
         horizontal: bool,
+        /// How far each wheel click scrolls (1 = one notch, as before).
+        /// Optional, so older macros still open.
+        #[serde(default = "default_one", skip_serializing_if = "is_one")]
+        strength: u32,
     },
     Recording {
         events: Vec<RecEvent>,
@@ -682,6 +699,7 @@ impl NodeKind {
             NodeKind::Scroll {
                 amount: 3,
                 horizontal: false,
+                strength: 1,
             },
             NodeKind::FindImage {
                 template: None,
@@ -919,9 +937,17 @@ impl NodeKind {
                     format!("{ms} ms")
                 }
             }
-            NodeKind::Scroll { amount, horizontal } => {
-                let dir = if *horizontal { "sideways" } else { "vertically" };
-                format!("{amount} lines {dir}")
+            NodeKind::Scroll { amount, horizontal, strength } => {
+                let dir = match (*horizontal, *amount < 0) {
+                    (false, false) => "down",
+                    (false, true) => "up",
+                    (true, false) => "right",
+                    (true, true) => "left",
+                };
+                let n = amount.unsigned_abs();
+                let s = if n == 1 { "" } else { "s" };
+                let x = if *strength > 1 { format!(" · ×{strength}") } else { String::new() };
+                format!("{n} wheel click{s} {dir}{x}")
             }
             NodeKind::Recording { events, speed } => {
                 let total: u64 = events.iter().map(|e| e.delay_ms).sum();
@@ -1295,6 +1321,10 @@ pub struct Macro {
     pub mouse_speed: u32,
     /// Stop the macro if the mouse is pushed into a corner of the screen.
     pub failsafe: bool,
+    /// Show a green pop-up when the macro finishes (an End step, or every repeat done).
+    pub alert_on_finish: bool,
+    /// Show a pop-up when the macro pauses at a breakpoint.
+    pub alert_on_breakpoint: bool,
 }
 
 /// The macro exactly as it's written to disk. This is the same layout older
@@ -1325,6 +1355,10 @@ struct MacroFile {
     mouse_speed: u32,
     #[serde(default = "default_true")]
     failsafe: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    alert_on_finish: bool,
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    alert_on_breakpoint: bool,
 }
 
 impl From<MacroFile> for Macro {
@@ -1349,6 +1383,8 @@ impl From<MacroFile> for Macro {
             human_mouse: f.human_mouse,
             mouse_speed: f.mouse_speed,
             failsafe: f.failsafe,
+            alert_on_finish: f.alert_on_finish,
+            alert_on_breakpoint: f.alert_on_breakpoint,
         }
     }
 }
@@ -1370,6 +1406,8 @@ impl From<Macro> for MacroFile {
             human_mouse: m.human_mouse,
             mouse_speed: m.mouse_speed,
             failsafe: m.failsafe,
+            alert_on_finish: m.alert_on_finish,
+            alert_on_breakpoint: m.alert_on_breakpoint,
         }
     }
 }
@@ -1403,6 +1441,8 @@ impl Default for Macro {
             human_mouse: false,
             mouse_speed: default_mouse_speed(),
             failsafe: true,
+            alert_on_finish: false,
+            alert_on_breakpoint: true,
         };
         m.add_node(NodeKind::Start, 60.0, 180.0);
         m
@@ -2227,6 +2267,266 @@ pub fn eval_expr(src: &str, vars: &HashMap<String, String>) -> Result<Value, Str
     Ok(Value::Text(fill_vars(s, vars)))
 }
 
+// ---------------------------------------------------------------------------
+// Finding variables in text (so the editor can show them as chips)
+// ---------------------------------------------------------------------------
+
+/// Variables every run has without setting them.
+pub const BUILTIN_VARS: [&str; 4] = ["text", "run", "found_x", "found_y"];
+
+/// How a piece of text uses variables.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VarMode {
+    /// Ordinary text: only `{name}` is a variable.
+    Text,
+    /// A value / sum (Set variable, If): bare names in a sum are variables too.
+    Expr,
+    /// The whole thing is a variable's name.
+    Name,
+}
+
+/// Where a variable appears in some text, in characters.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VarRange {
+    pub start: usize,
+    pub end: usize,
+    pub name: String,
+    /// Written as `{name}` (rather than a bare name in a sum).
+    pub braced: bool,
+}
+
+/// A piece of text to show: plain, or a variable.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Span {
+    Text(String),
+    Var(String),
+}
+
+/// Is this a sum (like `gold + 1000`) rather than plain text?
+fn is_sum(s: &str) -> bool {
+    let Some(toks) = tokenize(s.trim()) else { return false };
+    if toks.len() < 2 {
+        return false;
+    }
+    // Give every name a value, so only the shape of the sum matters.
+    let ones: HashMap<String, String> = toks
+        .iter()
+        .filter_map(|t| match t {
+            Tok::Ident(n) => Some((n.clone(), "1".to_string())),
+            _ => None,
+        })
+        .collect();
+    let mut p = Parser { toks: &toks, pos: 0, vars: &ones };
+    match p.expr() {
+        Ok(_) => p.pos == toks.len(),
+        Err(EvalErr::Math(_)) => true,
+        Err(EvalErr::Syntax) => false,
+    }
+}
+
+fn braced_ranges(chars: &[char]) -> Vec<VarRange> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '{' {
+            if let Some(off) = chars[i + 1..].iter().position(|c| *c == '}' || *c == '{') {
+                let j = i + 1 + off;
+                if chars[j] == '}' {
+                    let name: String = chars[i + 1..j].iter().collect::<String>().trim().to_string();
+                    if is_ident(&name) {
+                        out.push(VarRange { start: i, end: j + 1, name, braced: true });
+                        i = j + 1;
+                        continue;
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+/// Find the variables in `src`. `known` says whether a name is a variable the macro
+/// sets (used to tell a lone word like `gold` from plain text like `Complete`).
+pub fn var_ranges(src: &str, mode: VarMode, known: &dyn Fn(&str) -> bool) -> Vec<VarRange> {
+    let chars: Vec<char> = src.chars().collect();
+    let trimmed_range = || {
+        let start = chars.iter().position(|c| !c.is_whitespace())?;
+        let end = chars.iter().rposition(|c| !c.is_whitespace())? + 1;
+        Some((start, end, chars[start..end].iter().collect::<String>()))
+    };
+    match mode {
+        VarMode::Text => braced_ranges(&chars),
+        VarMode::Name => match trimmed_range() {
+            Some((start, end, name)) if is_ident(&name) => vec![VarRange { start, end, name, braced: false }],
+            _ => vec![],
+        },
+        VarMode::Expr => {
+            if is_sum(src) {
+                let mut out = braced_ranges(&chars);
+                let mut i = 0;
+                while i < chars.len() {
+                    if let Some(r) = out.iter().find(|r| r.start == i) {
+                        i = r.end;
+                        continue;
+                    }
+                    let c = chars[i];
+                    let after_digit = i > 0 && (chars[i - 1].is_ascii_digit() || chars[i - 1] == '.');
+                    if (c.is_alphabetic() || c == '_') && !after_digit {
+                        let start = i;
+                        while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_') {
+                            i += 1;
+                        }
+                        let name: String = chars[start..i].iter().collect();
+                        out.push(VarRange { start, end: i, name, braced: false });
+                        continue;
+                    }
+                    i += 1;
+                }
+                out.sort_by_key(|r| r.start);
+                out
+            } else {
+                match trimmed_range() {
+                    Some((start, end, name)) if is_ident(&name) && known(&name) => {
+                        vec![VarRange { start, end, name, braced: false }]
+                    }
+                    _ => braced_ranges(&chars),
+                }
+            }
+        }
+    }
+}
+
+/// Split text into plain pieces and variables, for showing it.
+pub fn var_spans(src: &str, mode: VarMode, known: &dyn Fn(&str) -> bool) -> Vec<Span> {
+    let chars: Vec<char> = src.chars().collect();
+    let mut out = Vec::new();
+    let mut at = 0;
+    for r in var_ranges(src, mode, known) {
+        if r.start > at {
+            out.push(Span::Text(chars[at..r.start].iter().collect()));
+        }
+        out.push(Span::Var(r.name));
+        at = r.end;
+    }
+    if at < chars.len() {
+        out.push(Span::Text(chars[at..].iter().collect()));
+    }
+    out
+}
+
+impl NodeKind {
+    /// The step's summary split into text and variables, for steps that use them
+    /// (None = just show `summary()`).
+    pub fn summary_spans(&self, known: &dyn Fn(&str) -> bool) -> Option<Vec<Span>> {
+        let t = |s: &str| Span::Text(s.to_string());
+        let mut out = Vec::new();
+        match self {
+            NodeKind::SetVar { name, expr } => {
+                let n = name.trim();
+                if is_ident(n) {
+                    out.push(Span::Var(n.to_string()));
+                } else {
+                    out.push(t(if n.is_empty() { "?" } else { n }));
+                }
+                out.push(t(" = "));
+                out.extend(var_spans(expr.trim(), VarMode::Expr, known));
+            }
+            NodeKind::IfCompare { left, op, right } => {
+                out.extend(var_spans(left.trim(), VarMode::Expr, known));
+                out.push(t(&format!(" {} ", op.label())));
+                out.extend(var_spans(right.trim(), VarMode::Expr, known));
+            }
+            NodeKind::TypeText { text, press_enter } => {
+                if !text.contains('{') {
+                    return None;
+                }
+                out.push(t("“"));
+                out.extend(var_spans(text, VarMode::Text, known));
+                out.push(t(if *press_enter { "” ↩" } else { "”" }));
+            }
+            NodeKind::Notify { title, message, style, duration_ms, wait_for_click, .. } => {
+                let text = if !title.trim().is_empty() { title.trim() } else { message.trim() };
+                if !text.contains('{') {
+                    return None;
+                }
+                out.push(t(&format!("{} · “", style.label())));
+                out.extend(var_spans(text, VarMode::Text, known));
+                out.push(t(&if *wait_for_click {
+                    "” · waits for a click".to_string()
+                } else {
+                    format!("” · {:.1}s", *duration_ms as f32 / 1000.0)
+                }));
+            }
+            NodeKind::ReadText { save_to, value, .. } => {
+                let save = save_to.trim();
+                if !is_ident(save) && !value.contains('{') {
+                    return None;
+                }
+                let summary = self.summary();
+                if value.contains('{') {
+                    // Show {name} in "Compare with" as a chip too.
+                    out.extend(var_spans(&summary, VarMode::Text, known));
+                } else {
+                    out.push(Span::Text(summary));
+                }
+                if is_ident(save) {
+                    out.push(t(" → "));
+                    out.push(Span::Var(save.to_string()));
+                }
+            }
+            _ => return None,
+        }
+        Some(out)
+    }
+}
+
+impl Macro {
+    /// Every variable some step sets (Set variable, or Read text's "save into").
+    pub fn variables_set(&self) -> std::collections::BTreeSet<String> {
+        let mut out = std::collections::BTreeSet::new();
+        let mut copy = self.root.clone();
+        copy.for_each_mut(&mut |n: &mut Node| match &n.kind {
+            NodeKind::SetVar { name, .. } if is_ident(name.trim()) => {
+                out.insert(name.trim().to_string());
+            }
+            NodeKind::ReadText { save_to, .. } if is_ident(save_to.trim()) => {
+                out.insert(save_to.trim().to_string());
+            }
+            _ => {}
+        });
+        out
+    }
+
+    /// Every variable some step reads.
+    pub fn variables_used(&self) -> std::collections::BTreeSet<String> {
+        let set = self.variables_set();
+        let known = |n: &str| set.contains(n) || BUILTIN_VARS.contains(&n);
+        let mut out = std::collections::BTreeSet::new();
+        let mut copy = self.root.clone();
+        copy.for_each_mut(&mut |n: &mut Node| {
+            let texts: Vec<(&str, VarMode)> = match &n.kind {
+                NodeKind::SetVar { expr, .. } => vec![(expr.as_str(), VarMode::Expr)],
+                NodeKind::IfCompare { left, right, .. } => {
+                    vec![(left.as_str(), VarMode::Expr), (right.as_str(), VarMode::Expr)]
+                }
+                NodeKind::TypeText { text, .. } => vec![(text.as_str(), VarMode::Text)],
+                NodeKind::Notify { title, message, .. } => {
+                    vec![(title.as_str(), VarMode::Text), (message.as_str(), VarMode::Text)]
+                }
+                NodeKind::ReadText { value, .. } => vec![(value.as_str(), VarMode::Text)],
+                _ => vec![],
+            };
+            for (s, mode) in texts {
+                for r in var_ranges(s, mode, &known) {
+                    out.insert(r.name);
+                }
+            }
+        });
+        out
+    }
+}
+
 /// Compare two values. Numbers compare as numbers; otherwise as text (ignoring case).
 pub fn compare_values(left: &Value, op: CmpOp, right: &Value) -> bool {
     if let (Some(a), Some(b)) = (left.as_num(), right.as_num()) {
@@ -2699,6 +2999,42 @@ mod tests {
         assert!(compare_values(&Value::Text("1 500".into()), CmpOp::Ge, &Value::Num(1000.0)));
         assert!(compare_values(&Value::Text("Upload complete".into()), CmpOp::Contains, &Value::Text("COMPLETE".into())));
         assert_eq!(fill_vars("{gold} gold, {missing}!", &vars), "1500 gold, !");
+    }
+
+    #[test]
+    fn old_scroll_steps_and_alerts_still_load() {
+        let old = r#"{"id":1,"kind":{"type":"Scroll","amount":5,"horizontal":false},"x":0.0,"y":0.0,"delay_ms":0,"note":""}"#;
+        let n: Node = serde_json::from_str(old).unwrap();
+        assert!(matches!(n.kind, NodeKind::Scroll { amount: 5, strength: 1, .. }));
+        // Saved back the same way (no new keys for the defaults).
+        assert!(!serde_json::to_string(&n).unwrap().contains("strength"));
+        let m = Macro::default();
+        let json = serde_json::to_string(&MacroFile::from(m)).unwrap();
+        assert!(!json.contains("alert_on_finish") && !json.contains("alert_on_breakpoint"));
+        let back: Macro = MacroFile::from(Macro::default()).into();
+        assert!(back.alert_on_breakpoint && !back.alert_on_finish);
+    }
+
+    #[test]
+    fn finds_variables_in_text() {
+        let known = |n: &str| n == "gold" || n == "text";
+        let names = |s: &str, m: VarMode| -> Vec<String> {
+            var_ranges(s, m, &known).into_iter().map(|r| r.name).collect()
+        };
+        assert_eq!(names("Gold is {gold}!", VarMode::Text), vec!["gold"]);
+        assert_eq!(names("{ gold } and {not a var} {x", VarMode::Text), vec!["gold"]);
+        assert_eq!(names("gold + bonus * 2", VarMode::Expr), vec!["gold", "bonus"]);
+        assert_eq!(names("gold", VarMode::Expr), vec!["gold"]); // a known variable
+        assert!(names("Complete", VarMode::Expr).is_empty()); // just a word
+        assert!(names("Level Complete", VarMode::Expr).is_empty()); // words, not a sum
+        assert_eq!(names("Hello {text}", VarMode::Expr), vec!["text"]);
+        assert_eq!(names(" gold_now ", VarMode::Name), vec!["gold_now"]);
+        assert_eq!(
+            var_spans("Gold: {gold}", VarMode::Text, &known),
+            vec![Span::Text("Gold: ".into()), Span::Var("gold".into())]
+        );
+        let r = &var_ranges("a{gold}b", VarMode::Text, &known)[0];
+        assert_eq!((r.start, r.end, r.braced), (1, 7, true));
     }
 
     #[test]

@@ -23,12 +23,18 @@ pub struct Hit {
     pub y: i32,
     /// Match quality from -1 to 1 (1 = identical).
     pub score: f32,
+    /// Size of the best match, in points.
+    pub w: u32,
+    pub h: u32,
 }
 
 struct Screen {
     ox: i32,
     oy: i32,
+    /// In the coordinates the mouse uses.
     gray: GrayImage,
+    /// The capture itself (on a Retina display, twice the size of `gray`).
+    color: RgbaImage,
 }
 
 pub fn load_template(path: &Path) -> Result<GrayImage, String> {
@@ -58,7 +64,7 @@ fn capture_all() -> Result<Vec<Screen>, String> {
         if w > 0 && h > 0 && (gray.width() != w || gray.height() != h) {
             gray = imageops::resize(&gray, w, h, FilterType::Triangle);
         }
-        out.push(Screen { ox, oy, gray });
+        out.push(Screen { ox, oy, gray, color: shot });
     }
     if out.is_empty() {
         return Err(SCREEN_PERMISSION.into());
@@ -76,7 +82,7 @@ fn capture_search_area(x: i32, y: i32, w: i32, h: i32) -> Result<Vec<Screen>, St
     if w > 0 && h > 0 && (gray.width() != w as u32 || gray.height() != h as u32) {
         gray = imageops::resize(&gray, w as u32, h as u32, FilterType::Triangle);
     }
-    Ok(vec![Screen { ox: x, oy: y, gray }])
+    Ok(vec![Screen { ox: x, oy: y, gray, color: img }])
 }
 
 /// Search for the template, either on every display or only inside `area`
@@ -87,22 +93,111 @@ pub fn locate_in(template: &GrayImage, threshold: f32, area: Option<(i32, i32, i
             if (w as u32) < template.width() / 2 || (h as u32) < template.height() / 2 {
                 return Err("The search area is smaller than the image to find. Select a bigger search area.".into());
             }
-            locate_on(capture_search_area(x, y, w, h)?, template, threshold)
+            locate_on(&capture_search_area(x, y, w, h)?, template, threshold)
         }
         None => locate(template, threshold),
     }
 }
 
-pub fn locate(template: &GrayImage, threshold: f32) -> Result<Hit, String> {
-    locate_on(capture_all()?, template, threshold)
+/// Like `locate_in`, and also returns what the search saw: the search area (or, without
+/// one, the part of the screen round the best match) with a box round the best match,
+/// green if it was good enough and amber if not.
+pub fn locate_in_seen(
+    template: &GrayImage,
+    threshold: f32,
+    area: Option<(i32, i32, i32, i32)>,
+) -> Result<(Hit, Option<RgbaImage>), String> {
+    let screens = match area {
+        Some((x, y, w, h)) => {
+            if (w as u32) < template.width() / 2 || (h as u32) < template.height() / 2 {
+                return Err("The search area is smaller than the image to find. Select a bigger search area.".into());
+            }
+            capture_search_area(x, y, w, h)?
+        }
+        None => capture_all()?,
+    };
+    let hit = locate_on(&screens, template, threshold)?;
+    let view = seen_view(&screens, &hit, area.is_some());
+    Ok((hit, view))
 }
 
-fn locate_on(screens: Vec<Screen>, template: &GrayImage, threshold: f32) -> Result<Hit, String> {
+fn seen_view(screens: &[Screen], hit: &Hit, whole: bool) -> Option<RgbaImage> {
+    let s = screens.iter().find(|s| {
+        hit.x >= s.ox && hit.y >= s.oy && hit.x < s.ox + s.gray.width() as i32 && hit.y < s.oy + s.gray.height() as i32
+    })?;
+    let (gw, gh) = (s.gray.width() as i32, s.gray.height() as i32);
+    let scale = s.color.width() as f32 / gw.max(1) as f32;
+    let (hx, hy) = (hit.x - s.ox, hit.y - s.oy);
+    let (tw, th) = (hit.w.max(4) as i32, hit.h.max(4) as i32);
+    // The part to show, in points relative to this screen.
+    let (x0, y0, x1, y1) = if whole {
+        (0, 0, gw, gh)
+    } else {
+        let (pw, ph) = ((tw * 3 / 2).max(80), (th * 3 / 2).max(50));
+        ((hx - pw).max(0), (hy - ph).max(0), (hx + pw).min(gw), (hy + ph).min(gh))
+    };
+    if x1 - x0 < 2 || y1 - y0 < 2 {
+        return None;
+    }
+    let px = |v: i32| (v as f32 * scale).round().max(0.0) as u32;
+    let mut out = imageops::crop_imm(&s.color, px(x0), px(y0), px(x1 - x0), px(y1 - y0)).to_image();
+    if hit.score > -1.0 {
+        let color = if hit.found { [52, 199, 123, 255] } else { [240, 180, 41, 255] };
+        let (mx, my) = (hx - tw / 2 - x0, hy - th / 2 - y0);
+        draw_box(&mut out, px(mx.max(0)), px(my.max(0)), px(tw), px(th), (2.0 * scale).round().max(2.0) as u32, color);
+    }
+    Some(shrink_for_display(out))
+}
+
+/// Draw a hollow rectangle (clipped to the image).
+fn draw_box(img: &mut RgbaImage, x: u32, y: u32, w: u32, h: u32, t: u32, color: [u8; 4]) {
+    let (iw, ih) = img.dimensions();
+    let mut put = |px: u32, py: u32| {
+        if px < iw && py < ih {
+            img.put_pixel(px, py, image::Rgba(color));
+        }
+    };
+    for k in 0..t {
+        for xx in x..x.saturating_add(w) {
+            put(xx, y.saturating_add(k));
+            put(xx, (y + h).saturating_sub(1 + k));
+        }
+        for yy in y..y.saturating_add(h) {
+            put(x.saturating_add(k), yy);
+            put((x + w).saturating_sub(1 + k), yy);
+        }
+    }
+}
+
+/// Keep pictures shown in the editor a sensible size (a big search area on a 5K
+/// screen would be slow to save every time).
+pub fn shrink_for_display(img: RgbaImage) -> RgbaImage {
+    let max = 1400;
+    let (w, h) = img.dimensions();
+    if w <= max && h <= max {
+        return img;
+    }
+    let f = max as f32 / w.max(h) as f32;
+    imageops::resize(
+        &img,
+        ((w as f32 * f).round() as u32).max(1),
+        ((h as f32 * f).round() as u32).max(1),
+        FilterType::Triangle,
+    )
+}
+
+pub fn locate(template: &GrayImage, threshold: f32) -> Result<Hit, String> {
+    locate_on(&capture_all()?, template, threshold)
+}
+
+fn locate_on(screens: &[Screen], template: &GrayImage, threshold: f32) -> Result<Hit, String> {
     let mut best = Hit {
         found: false,
         x: 0,
         y: 0,
         score: -1.0,
+        w: template.width(),
+        h: template.height(),
     };
     let half = {
         let w = template.width() / 2;
@@ -113,7 +208,7 @@ fn locate_on(screens: Vec<Screen>, template: &GrayImage, threshold: f32) -> Resu
             None
         }
     };
-    for s in &screens {
+    for s in screens {
         let mut variants: Vec<&GrayImage> = vec![template];
         if let Some(h) = &half {
             variants.push(h);
@@ -126,6 +221,8 @@ fn locate_on(screens: Vec<Screen>, template: &GrayImage, threshold: f32) -> Resu
                         x: s.ox + x as i32 + (t.width() / 2) as i32,
                         y: s.oy + y as i32 + (t.height() / 2) as i32,
                         score,
+                        w: t.width(),
+                        h: t.height(),
                     };
                 }
             }
@@ -919,14 +1016,28 @@ pub fn read_text_sure(
     mode: OcrMode,
     stop: &dyn Fn() -> bool,
 ) -> Result<OcrRead, String> {
+    read_text_seen(x, y, w, h, mode, stop).map(|(r, _)| r)
+}
+
+/// Like `read_text_sure`, and also returns the capture of the area that was read
+/// (the last one, if it read more than once).
+pub fn read_text_seen(
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+    mode: OcrMode,
+    stop: &dyn Fn() -> bool,
+) -> Result<(OcrRead, RgbaImage), String> {
     let mut pooled: Vec<String> = Vec::new();
     let mut result = None;
     for _ in 0..3 {
-        let r = read_text(x, y, w, h, mode)?;
+        let shot = capture_area(x, y, w, h)?;
+        let r = ocr_image(&shot, mode)?;
         pooled.extend(r.raw);
         let v = vote(pooled.clone(), mode);
         let sure = v.agreed >= 2;
-        result = Some(v);
+        result = Some((v, shot));
         if sure || stop() {
             break;
         }
