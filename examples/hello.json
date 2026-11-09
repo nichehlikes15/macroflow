@@ -1,0 +1,24 @@
+{
+  "name": "Hello example",
+  "nodes": [
+    { "id": 1, "kind": { "type": "Start" }, "x": 60.0, "y": 180.0, "delay_ms": 0, "note": "" },
+    { "id": 2, "kind": { "type": "Wait", "ms": 500, "jitter_ms": 0 }, "x": 344.0, "y": 180.0, "delay_ms": 0, "note": "Give the target app a moment" },
+    { "id": 3, "kind": { "type": "TypeText", "text": "Hello from MacroFlow!", "press_enter": false }, "x": 628.0, "y": 180.0, "delay_ms": 0, "note": "Open a text editor first" },
+    { "id": 4, "kind": { "type": "Loop", "count": 3 }, "x": 912.0, "y": 180.0, "delay_ms": 0, "note": "" },
+    { "id": 5, "kind": { "type": "KeyPress", "key": "enter", "mods": { "cmd": false, "shift": false, "alt": false, "ctrl": false } }, "x": 912.0, "y": 340.0, "delay_ms": 0, "note": "New line" },
+    { "id": 6, "kind": { "type": "End" }, "x": 1196.0, "y": 180.0, "delay_ms": 0, "note": "" }
+  ],
+  "edges": [
+    { "from": 1, "port": 0, "to": 2 },
+    { "from": 2, "port": 0, "to": 3 },
+    { "from": 3, "port": 0, "to": 4 },
+    { "from": 4, "port": 0, "to": 5 },
+    { "from": 5, "port": 0, "to": 4 },
+    { "from": 4, "port": 1, "to": 6 }
+  ],
+  "next_id": 7,
+  "start_delay_ms": 2000,
+  "step_delay_ms": 40,
+  "speed_pct": 100,
+  "repeat": 1
+}

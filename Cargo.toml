@@ -1,0 +1,32 @@
+[package]
+name = "macroflow"
+version = "0.1.0"
+edition = "2021"
+description = "A flowchart-style smart macro builder for macOS and Windows, built with GPUI"
+publish = false
+
+[dependencies]
+# UI framework from Zed. On macOS, `runtime_shaders` means you don't need the full Xcode app
+# (the Xcode Command Line Tools are enough). It has no effect on Windows.
+gpui = { version = "=0.2.2", features = ["runtime_shaders"] }
+# Sends mouse and keyboard input during playback.
+enigo = "0.6.1"
+# Reads mouse and keyboard state while recording.
+device_query = "4.0.1"
+# Takes screenshots so "Find image" steps work.
+xcap = "0.9.10"
+image = { version = "0.25", default-features = false, features = ["png"] }
+# Lets Read text steps compare against a regular expression.
+regex = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Image search is CPU-heavy. This keeps `cargo run` responsive while still compiling quickly.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+opt-level = 3
