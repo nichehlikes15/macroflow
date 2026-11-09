@@ -14,6 +14,14 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+/// How a run of steps finished.
+enum Exit {
+    /// Reached an End step: this run of the macro is over.
+    Ended,
+    /// Reached the end of a group (or a step with nothing connected).
+    LeftGroup,
+}
+
 pub enum WorkerMsg {
     Status(String),
     Active(Option<u64>),
@@ -23,12 +31,10 @@ pub enum WorkerMsg {
     Position { x: i32, y: i32 },
     Snipped(PathBuf),
     TestResult(String),
-    /// A frozen screenshot is ready for the user to drag a box on.
-    AreaShot(vision::Shot),
     /// A box cut out of a screenshot was saved.
     Cropped { purpose: AreaPurpose, path: PathBuf },
     Windows(Vec<vision::WinInfo>),
-    /// The user finished (or cancelled) dragging a box on the full-screen overlay.
+    /// The user finished (or cancelled) dragging a box on the screen.
     /// `sel` is (x0, y0, x1, y1) in the screenshot's display coordinates.
     AreaPicked {
         purpose: AreaPurpose,
@@ -45,6 +51,8 @@ pub enum AreaPurpose {
     ReadText(u64),
     /// The picture a Find image step looks for.
     Template(u64),
+    /// The only part of the screen a Find image step searches.
+    SearchArea(u64),
 }
 
 pub type Tx = Sender<WorkerMsg>;
@@ -224,7 +232,8 @@ impl<'a> Runner<'a> {
         loop {
             iteration += 1;
             self.loops.clear();
-            self.run_once(start, iteration, total)?;
+            let mut first = true;
+            self.walk(start, iteration, total, &mut first)?;
             if total != 0 && iteration >= total {
                 break;
             }
@@ -235,9 +244,10 @@ impl<'a> Runner<'a> {
         ))
     }
 
-    fn run_once(&mut self, start: u64, iteration: u32, total: u32) -> Result<(), String> {
+    /// Run steps from `start` until the path ends. Group steps run their own
+    /// steps (recursively) and then carry on from the group's output.
+    fn walk(&mut self, start: u64, iteration: u32, total: u32, first: &mut bool) -> Result<Exit, String> {
         let mut cur = Some(start);
-        let mut first = true;
         while let Some(id) = cur {
             if self.stop.load(Ordering::Relaxed) {
                 return Err(STOPPED.into());
@@ -247,6 +257,15 @@ impl<'a> Runner<'a> {
                 .node(id)
                 .cloned()
                 .ok_or_else(|| "A connection points to a step that no longer exists.".to_string())?;
+            match &node.kind {
+                // Markers inside a group: nothing to do or wait for.
+                NodeKind::GroupIn => {
+                    cur = self.doc.next(id, 0);
+                    continue;
+                }
+                NodeKind::GroupOut => return Ok(Exit::LeftGroup),
+                _ => {}
+            }
             send(self.tx, WorkerMsg::Active(Some(id)));
             let of = if total == 0 {
                 String::new()
@@ -258,17 +277,37 @@ impl<'a> Runner<'a> {
             } else {
                 format!(" – {}", node.note)
             };
-            self.status(format!(
-                "▶ Run {iteration}{of}: {}{note}   (Esc to stop)",
-                node.kind.title()
-            ));
-            let step_gap = if first { 0 } else { self.doc.step_delay_ms };
+            let title = match &node.kind {
+                NodeKind::Group { name, .. } if !name.trim().is_empty() => name.trim().to_string(),
+                k => k.title().to_string(),
+            };
+            self.status(format!("▶ Run {iteration}{of}: {title}{note}   (Esc to stop)"));
+            let step_gap = if *first { 0 } else { self.doc.step_delay_ms };
             self.sleep(self.scaled(node.delay_ms + step_gap))?;
+            *first = false;
+
+            if let NodeKind::Group { graph, .. } = &node.kind {
+                let inner_start = graph
+                    .nodes
+                    .iter()
+                    .find(|n| matches!(n.kind, NodeKind::GroupIn))
+                    .map(|n| n.id);
+                if let Some(s) = inner_start {
+                    if let Exit::Ended = self.walk(s, iteration, total, first)? {
+                        return Ok(Exit::Ended);
+                    }
+                }
+                cur = self.doc.next(id, 0);
+                continue;
+            }
+            if matches!(node.kind, NodeKind::End) {
+                return Ok(Exit::Ended);
+            }
             let port = self.exec(&node)?;
-            first = false;
             cur = port.and_then(|p| self.doc.next(id, p));
         }
-        Ok(())
+        // Ran out of connections: inside a group that means "carry on after the group".
+        Ok(Exit::LeftGroup)
     }
 
     fn resolve(&self, target: Target, x: i32, y: i32, ox: i32, oy: i32) -> Result<Option<(i32, i32)>, String> {
@@ -312,8 +351,8 @@ impl<'a> Runner<'a> {
     /// Run one step. Returns which output to follow (None = stop here).
     fn exec(&mut self, node: &Node) -> Result<Option<usize>, String> {
         match &node.kind {
-            NodeKind::Start => Ok(Some(0)),
-            NodeKind::End => Ok(None),
+            NodeKind::Start | NodeKind::GroupIn | NodeKind::Group { .. } => Ok(Some(0)),
+            NodeKind::End | NodeKind::GroupOut => Ok(None),
 
             NodeKind::Click {
                 target,
@@ -434,7 +473,9 @@ impl<'a> Runner<'a> {
                 timeout_ms,
                 interval_ms,
                 click_when_found,
+                search_area,
             } => {
+                let area = search_area.map(|r| (r.x, r.y, r.w, r.h));
                 let path = template
                     .as_ref()
                     .ok_or_else(|| "A Find image step has no image yet – snip or choose one.".to_string())?;
@@ -444,7 +485,7 @@ impl<'a> Runner<'a> {
                     if self.stop.load(Ordering::Relaxed) {
                         return Err(STOPPED.into());
                     }
-                    let hit = vision::locate(&tpl, *threshold)?;
+                    let hit = vision::locate_in(&tpl, *threshold, area)?;
                     if hit.found {
                         self.found = Some((hit.x, hit.y));
                         self.status(format!(
@@ -535,15 +576,25 @@ impl<'a> Runner<'a> {
                 case_sensitive,
                 timeout_ms,
                 interval_ms,
+                numbers_only,
                 ..
             } => {
+                let mode = if compare.is_number() || *numbers_only {
+                    vision::OcrMode::Number
+                } else {
+                    vision::OcrMode::Text
+                };
                 let t0 = Instant::now();
                 let mut baseline = self.prev_reads.get(&node.id).cloned();
                 loop {
                     if self.stop.load(Ordering::Relaxed) {
                         return Err(STOPPED.into());
                     }
-                    let read = vision::read_text(*x, *y, *w, *h)?;
+                    let stop = self.stop.clone();
+                    let read = vision::read_text_sure(*x, *y, *w, *h, mode, &move || {
+                        stop.load(Ordering::Relaxed)
+                    })?
+                    .text;
                     let ok = text_matches(&read, *compare, value, *case_sensitive, baseline.as_deref())?;
                     if baseline.is_none() {
                         baseline = Some(read.clone());
@@ -835,12 +886,13 @@ pub fn snip(tx: Tx, stop: Arc<AtomicBool>, size: u32) {
 }
 
 /// Search the screen once and report the result (and point the mouse at it).
-pub fn test_find(tx: Tx, path: PathBuf, threshold: f32) {
+pub fn test_find(tx: Tx, path: PathBuf, threshold: f32, area: Option<ScreenRect>, wait_ms: u64) {
     thread::spawn(move || {
+        thread::sleep(Duration::from_millis(wait_ms));
         let result = (|| -> Result<String, String> {
             let tpl = vision::load_template(&path)?;
             let t0 = Instant::now();
-            let hit = vision::locate(&tpl, threshold)?;
+            let hit = vision::locate_in(&tpl, threshold, area.map(|r| (r.x, r.y, r.w, r.h)))?;
             let ms = t0.elapsed().as_millis();
             if hit.found {
                 if let Ok(mut e) = Enigo::new(&Settings::default()) {
@@ -876,11 +928,12 @@ pub fn test_find(tx: Tx, path: PathBuf, threshold: f32) {
 // Drag-a-box selection, reading text and listing windows
 // ---------------------------------------------------------------------------
 
-/// Take the screenshot the user will drag a box on, once MacroFlow has minimised.
-/// With `countdown`, wait 3 seconds first so the user can switch to another window.
-pub fn capture_for_area(tx: Tx, stop: Arc<AtomicBool>, countdown_first: bool) {
+/// Once MacroFlow has minimised: freeze the display under the mouse and let the user
+/// drag a box on it, Snipping Tool style. With `countdown_first`, wait 3 seconds first
+/// so they can switch to another window.
+pub fn capture_for_area(tx: Tx, stop: Arc<AtomicBool>, countdown_first: bool, purpose: AreaPurpose) {
     thread::spawn(move || {
-        let result = (|| -> Result<vision::Shot, String> {
+        let result = (|| -> Result<(vision::Shot, Option<(f32, f32, f32, f32)>), String> {
             let ds = device()?;
             // Let the minimise animation finish.
             sleep_checked(700, &stop)?;
@@ -888,10 +941,38 @@ pub fn capture_for_area(tx: Tx, stop: Arc<AtomicBool>, countdown_first: bool) {
                 countdown(&tx, &stop, "Switch to the window you want – capturing the screen", 3)?;
             }
             let (x, y) = ds.get_mouse().coords;
-            vision::screenshot_display_at(x, y)
+            let shot = vision::screenshot_display_at(x, y)?;
+            send(
+                &tx,
+                WorkerMsg::Status(
+                    "Drag a box on the screen. Esc, Stop, or clicking MacroFlow cancels.".into(),
+                ),
+            );
+            let hint = match purpose {
+                AreaPurpose::ReadText(_) => "Drag a box around the text or number to read",
+                AreaPurpose::Template(_) => "Drag a box around what to look for",
+                AreaPurpose::SearchArea(_) => "Drag a box around where the image can appear",
+            };
+            // Esc cancels even if the selector never got keyboard focus.
+            let esc_was_down = ds.get_keys().contains(&Keycode::Escape);
+            let cancel = || {
+                stop.load(Ordering::Relaxed)
+                    || (!esc_was_down && ds.get_keys().contains(&Keycode::Escape))
+            };
+            let picked = match vision::select_area(&shot, hint, &cancel) {
+                Ok(p) => p,
+                Err(e) => {
+                    let _ = std::fs::remove_file(&shot.path);
+                    return Err(e);
+                }
+            };
+            // Fractions of the display -> (x0, y0, x1, y1) on the screenshot.
+            let (sw, sh) = (shot.w as f32, shot.h as f32);
+            let sel = picked.map(|(x0, y0, x1, y1)| (x0 * sw, y0 * sh, x1 * sw, y1 * sh));
+            Ok((shot, sel))
         })();
         match result {
-            Ok(shot) => send(&tx, WorkerMsg::AreaShot(shot)),
+            Ok((shot, sel)) => send(&tx, WorkerMsg::AreaPicked { purpose, shot, sel }),
             Err(e) => send(&tx, WorkerMsg::Failed(e)),
         }
     });
@@ -918,25 +999,38 @@ pub fn crop_area(tx: Tx, shot: vision::Shot, sel: (u32, u32, u32, u32), purpose:
     });
 }
 
-/// Read a Read text step's area once and say whether it matches.
+/// Read a Read text step's area and say whether it matches.
+/// `wait_ms` gives MacroFlow time to minimise first, so it reads what's really there.
 #[allow(clippy::too_many_arguments)]
-pub fn test_read(tx: Tx, rect: (i32, i32, i32, i32), compare: TextCompare, value: String, case_sensitive: bool) {
+pub fn test_read(
+    tx: Tx,
+    rect: (i32, i32, i32, i32),
+    compare: TextCompare,
+    value: String,
+    case_sensitive: bool,
+    numbers_only: bool,
+    wait_ms: u64,
+) {
     thread::spawn(move || {
+        thread::sleep(Duration::from_millis(wait_ms));
+        let mode = if compare.is_number() || numbers_only {
+            vision::OcrMode::Number
+        } else {
+            vision::OcrMode::Text
+        };
         let t0 = Instant::now();
-        let msg = match vision::read_text(rect.0, rect.1, rect.2, rect.3) {
+        let msg = match vision::read_text_sure(rect.0, rect.1, rect.2, rect.3, mode, &|| false) {
             Err(e) => e,
-            Ok(read) => {
+            Ok(r) => {
                 let ms = t0.elapsed().as_millis();
+                let read = r.text.clone();
                 let shown = if read.is_empty() {
-                    "(nothing)".to_string()
+                    "nothing".to_string()
                 } else {
                     format!("“{}”", read.replace('\n', " ⏎ "))
                 };
-                let number = if compare.is_number() {
-                    match parse_number(&read) {
-                        Some(n) => format!(" · number {n}"),
-                        None => " · no number found".into(),
-                    }
+                let confidence = if r.tries > 0 {
+                    format!(" ({}/{} reads agreed)", r.agreed, r.tries)
                 } else {
                     String::new()
                 };
@@ -949,7 +1043,18 @@ pub fn test_read(tx: Tx, rect: (i32, i32, i32, i32), compare: TextCompare, value
                         Err(e) => format!(" → {e}"),
                     }
                 };
-                format!("Read {shown}{number} in {ms} ms{verdict}")
+                // If the reads disagreed, show what they saw, to help pick a better box.
+                let detail = if r.agreed < r.tries {
+                    let seen: Vec<String> = r
+                        .raw
+                        .iter()
+                        .map(|s| if s.is_empty() { "–".to_string() } else { format!("“{s}”") })
+                        .collect();
+                    format!(" · saw {}", seen.join(", "))
+                } else {
+                    String::new()
+                };
+                format!("Read {shown}{confidence} in {ms} ms{verdict}{detail}")
             }
         };
         send(&tx, WorkerMsg::TestResult(msg));

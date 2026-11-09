@@ -1,42 +1,54 @@
-//! Compiles the small Swift OCR helper (helpers/ocr.swift) that "Read text" steps use.
-//! If it can't be built, MacroFlow still builds; only Read text steps will report an error.
+//! Builds the small native helpers MacroFlow uses on macOS:
+//!   helpers/ocr.swift    -> macroflow-ocr     (Read text steps)
+//!   helpers/select.swift -> macroflow-select  (the drag-a-box area selector)
+//! If one can't be built, MacroFlow still builds; only that feature reports an error.
+//! (On Windows the helpers are PowerShell scripts embedded into the app instead.)
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
-fn main() {
-    println!("cargo:rerun-if-changed=helpers/ocr.swift");
-    println!("cargo:rerun-if-changed=build.rs");
+fn build_swift(src: &str, out_dir: &Path, name: &str, env_var: &str, what: &str) {
+    println!("cargo:rerun-if-changed={src}");
+    let out = out_dir.join(name);
+    let result = Command::new("xcrun")
+        .args(["swiftc", "-O", src, "-o"])
+        .arg(&out)
+        .output();
+    match result {
+        Ok(o) if o.status.success() && out.exists() => {
+            println!("cargo:rustc-env={env_var}={}", out.display());
+        }
+        Ok(o) => {
+            let err = String::from_utf8_lossy(&o.stderr);
+            for line in err.lines().filter(|l| l.contains("error")).take(8) {
+                println!("cargo:warning={name}: {line}");
+            }
+            println!("cargo:warning=Couldn't build {name}, so {what} won't work. Run `xcode-select --install` and rebuild.");
+            println!("cargo:rustc-env={env_var}=");
+        }
+        Err(e) => {
+            println!("cargo:warning=Couldn't run swiftc ({e}), so {what} won't work. Run `xcode-select --install` and rebuild.");
+            println!("cargo:rustc-env={env_var}=");
+        }
+    }
+}
 
+fn main() {
+    println!("cargo:rerun-if-changed=build.rs");
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR not set"));
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
-    let helper = out_dir.join("macroflow-ocr");
 
     if target_os != "macos" {
         println!("cargo:rustc-env=MACROFLOW_OCR_HELPER=");
+        println!("cargo:rustc-env=MACROFLOW_SELECT_HELPER=");
         return;
     }
-
-    let result = Command::new("xcrun")
-        .args(["swiftc", "-O", "helpers/ocr.swift", "-o"])
-        .arg(&helper)
-        .output();
-
-    match result {
-        Ok(out) if out.status.success() && helper.exists() => {
-            println!("cargo:rustc-env=MACROFLOW_OCR_HELPER={}", helper.display());
-        }
-        Ok(out) => {
-            let err = String::from_utf8_lossy(&out.stderr);
-            for line in err.lines().take(6) {
-                println!("cargo:warning=OCR helper: {line}");
-            }
-            println!("cargo:warning=Couldn't build the OCR helper, so Read text steps won't work. Run `xcode-select --install` and rebuild.");
-            println!("cargo:rustc-env=MACROFLOW_OCR_HELPER=");
-        }
-        Err(e) => {
-            println!("cargo:warning=Couldn't run swiftc ({e}). Read text steps won't work. Run `xcode-select --install` and rebuild.");
-            println!("cargo:rustc-env=MACROFLOW_OCR_HELPER=");
-        }
-    }
+    build_swift("helpers/ocr.swift", &out_dir, "macroflow-ocr", "MACROFLOW_OCR_HELPER", "Read text steps");
+    build_swift(
+        "helpers/select.swift",
+        &out_dir,
+        "macroflow-select",
+        "MACROFLOW_SELECT_HELPER",
+        "selecting an area on screen",
+    );
 }

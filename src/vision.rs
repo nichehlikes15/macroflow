@@ -6,7 +6,7 @@
 
 use image::{imageops, imageops::FilterType, GrayImage, RgbaImage};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 use xcap::Monitor;
 
@@ -68,8 +68,36 @@ fn capture_all() -> Result<Vec<Screen>, String> {
 
 /// Search every display for the template. Also tries the template at half size,
 /// so screenshots taken on a Retina display (2×) still match.
+/// Capture just one area of the screen, scaled to the coordinates the mouse uses.
+fn capture_search_area(x: i32, y: i32, w: i32, h: i32) -> Result<Vec<Screen>, String> {
+    let img = capture_area(x, y, w, h)?;
+    let mut gray = imageops::grayscale(&img);
+    // macOS returns Retina pixels; bring them back to points.
+    if w > 0 && h > 0 && (gray.width() != w as u32 || gray.height() != h as u32) {
+        gray = imageops::resize(&gray, w as u32, h as u32, FilterType::Triangle);
+    }
+    Ok(vec![Screen { ox: x, oy: y, gray }])
+}
+
+/// Search for the template, either on every display or only inside `area`
+/// (x, y, w, h). Searching a small area is much faster and avoids false matches elsewhere.
+pub fn locate_in(template: &GrayImage, threshold: f32, area: Option<(i32, i32, i32, i32)>) -> Result<Hit, String> {
+    match area {
+        Some((x, y, w, h)) => {
+            if (w as u32) < template.width() / 2 || (h as u32) < template.height() / 2 {
+                return Err("The search area is smaller than the image to find. Select a bigger search area.".into());
+            }
+            locate_on(capture_search_area(x, y, w, h)?, template, threshold)
+        }
+        None => locate(template, threshold),
+    }
+}
+
 pub fn locate(template: &GrayImage, threshold: f32) -> Result<Hit, String> {
-    let screens = capture_all()?;
+    locate_on(capture_all()?, template, threshold)
+}
+
+fn locate_on(screens: Vec<Screen>, template: &GrayImage, threshold: f32) -> Result<Hit, String> {
     let mut best = Hit {
         found: false,
         x: 0,
@@ -154,10 +182,9 @@ fn unique_temp(prefix: &str) -> PathBuf {
 #[derive(Clone, Debug)]
 pub struct Shot {
     pub path: PathBuf,
-    /// Which display it is: the system display id (macOS) and its position
-    /// in the display list (Windows), so the selection window opens on the same one.
-    pub monitor_id: u32,
-    pub monitor_index: usize,
+    /// The display's system name (e.g. \\.\DISPLAY1 on Windows), so the selector
+    /// covers the same display the screenshot came from.
+    pub device: String,
     /// Display origin and size, in global points.
     pub ox: i32,
     pub oy: i32,
@@ -186,15 +213,9 @@ pub fn screenshot_display_at(x: i32, y: i32) -> Result<Shot, String> {
     }
     let path = unique_temp("shot");
     img.save(&path).map_err(|e| format!("Couldn't save the screenshot: {e}"))?;
-    let monitor_id = m.id().unwrap_or(0);
-    let monitor_index = Monitor::all()
-        .ok()
-        .and_then(|all| all.iter().position(|o| o.id().ok() == Some(monitor_id)))
-        .unwrap_or(0);
     Ok(Shot {
         path,
-        monitor_id,
-        monitor_index,
+        device: m.name().unwrap_or_default(),
         ox,
         oy,
         w,
@@ -223,6 +244,149 @@ pub fn crop_shot(shot: &Shot, x: u32, y: u32, w: u32, h: u32, to_points: bool) -
     }
 }
 
+/// Exit codes shared by the selector helpers.
+const SELECT_CANCELLED: i32 = 3;
+
+/// Let the user drag a box on a frozen copy of the display in `shot`, Snipping Tool style.
+/// Returns the box as fractions of the display (x0, y0, x1, y1, each 0–1), or None if
+/// they cancelled. `cancel` is polled while the selector is open; when it returns true
+/// the selector is closed (Stop button, Esc, or clicking back on MacroFlow).
+pub fn select_area(
+    shot: &Shot,
+    hint: &str,
+    cancel: &dyn Fn() -> bool,
+) -> Result<Option<(f32, f32, f32, f32)>, String> {
+    let mut child = selector_command(shot, hint)?
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("Couldn't open the area selector: {e}"))?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(180);
+    let status = loop {
+        if cancel() || std::time::Instant::now() > deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Ok(None);
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(30)),
+            Err(e) => {
+                let _ = child.kill();
+                return Err(format!("The area selector stopped responding: {e}"));
+            }
+        }
+    };
+    let out = child
+        .wait_with_output()
+        .map_err(|e| format!("Couldn't read the area selector's answer: {e}"))?;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    if status.code() == Some(SELECT_CANCELLED) {
+        return Ok(None);
+    }
+    if !status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        let detail = err
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .last()
+            .unwrap_or("unknown error")
+            .to_string();
+        return Err(format!("The area selector failed: {detail}"));
+    }
+    // Expected: "OK x0 y0 x1 y1" with fractions of the display.
+    let nums: Vec<f32> = stdout
+        .split_whitespace()
+        .filter_map(|t| t.parse::<f32>().ok())
+        .collect();
+    match nums.as_slice() {
+        [x0, y0, x1, y1, ..] if x1 > x0 && y1 > y0 => Ok(Some((
+            x0.clamp(0.0, 1.0),
+            y0.clamp(0.0, 1.0),
+            x1.clamp(0.0, 1.0),
+            y1.clamp(0.0, 1.0),
+        ))),
+        _ => Ok(None),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn selector_command(shot: &Shot, hint: &str) -> Result<Command, String> {
+    let helper = mac_helper(
+        option_env!("MACROFLOW_SELECT_HELPER"),
+        "macroflow-select",
+        "area selector",
+    )?;
+    let mut cmd = Command::new(helper);
+    cmd.arg(&shot.path).args([
+        shot.ox.to_string(),
+        shot.oy.to_string(),
+        shot.w.to_string(),
+        shot.h.to_string(),
+        hint.to_string(),
+    ]);
+    Ok(cmd)
+}
+
+#[cfg(target_os = "windows")]
+const WINDOWS_SELECT_SCRIPT: &str = include_str!("../helpers/select.ps1");
+
+#[cfg(target_os = "windows")]
+fn write_select_script() -> Result<PathBuf, String> {
+    let script = std::env::temp_dir().join("macroflow-select.ps1");
+    std::fs::write(&script, WINDOWS_SELECT_SCRIPT)
+        .map_err(|e| format!("Couldn't write the area selector script: {e}"))?;
+    Ok(script)
+}
+
+#[cfg(target_os = "windows")]
+fn selector_command(shot: &Shot, hint: &str) -> Result<Command, String> {
+    let script = write_select_script()?;
+    let mut cmd = hidden_powershell();
+    cmd.arg("-File")
+        .arg(&script)
+        .arg("-ImagePath")
+        .arg(&shot.path)
+        .arg("-Device")
+        .arg(if shot.device.is_empty() { "-" } else { shot.device.as_str() })
+        .arg("-X")
+        .arg(shot.ox.to_string())
+        .arg("-Y")
+        .arg(shot.oy.to_string())
+        .arg("-W")
+        .arg(shot.w.to_string())
+        .arg("-H")
+        .arg(shot.h.to_string())
+        .arg("-Hint")
+        .arg(hint);
+    Ok(cmd)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn selector_command(_shot: &Shot, _hint: &str) -> Result<Command, String> {
+    Err("Selecting an area is only supported on macOS and Windows.".into())
+}
+
+/// Windows: compile the selector once in the background when MacroFlow starts, so
+/// the first "Select area" opens straight away instead of after a few seconds.
+pub fn warm_up_selector() {
+    #[cfg(target_os = "windows")]
+    std::thread::spawn(|| {
+        if let Ok(script) = write_select_script() {
+            let _ = hidden_powershell()
+                .arg("-File")
+                .arg(&script)
+                .arg("-Warmup")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+    });
+}
+
 /// Capture a live area of the screen (global points) at full resolution.
 pub fn capture_area(x: i32, y: i32, w: i32, h: i32) -> Result<RgbaImage, String> {
     if w < 2 || h < 2 {
@@ -245,29 +409,49 @@ pub fn capture_area(x: i32, y: i32, w: i32, h: i32) -> Result<RgbaImage, String>
 // Reading text (OCR)
 // ---------------------------------------------------------------------------
 
+/// Find a helper built by build.rs (or a copy next to the executable, for a packaged app).
 #[cfg(target_os = "macos")]
-fn ocr_helper() -> Result<PathBuf, String> {
-    let built = option_env!("MACROFLOW_OCR_HELPER").unwrap_or("");
+fn mac_helper(built: Option<&'static str>, name: &str, what: &str) -> Result<PathBuf, String> {
+    let built = built.unwrap_or("");
     if !built.is_empty() && Path::new(built).exists() {
         return Ok(PathBuf::from(built));
     }
-    // Fall back to a copy next to the executable (for a packaged app).
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
-            let p = dir.join("macroflow-ocr");
+            let p = dir.join(name);
             if p.exists() {
                 return Ok(p);
             }
         }
     }
-    Err("The text reader isn't built. Run `xcode-select --install`, then `cargo build --release` again.".into())
+    Err(format!(
+        "The {what} isn't built. Run `xcode-select --install`, then `cargo build --release` again."
+    ))
+}
+
+#[cfg(target_os = "macos")]
+fn ocr_helper() -> Result<PathBuf, String> {
+    mac_helper(option_env!("MACROFLOW_OCR_HELPER"), "macroflow-ocr", "text reader")
+}
+
+/// Printed by the OCR helpers between the results for each image.
+const OCR_SEPARATOR: &str = "<<<MACROFLOW-NEXT>>>";
+
+fn split_ocr_output(stdout: &str, count: usize) -> Vec<String> {
+    let mut parts: Vec<String> = stdout
+        .split(OCR_SEPARATOR)
+        .map(|p| p.trim().to_string())
+        .collect();
+    parts.resize(count, String::new());
+    parts.truncate(count);
+    parts
 }
 
 /// macOS: Apple Vision, through the small Swift helper built by build.rs.
 #[cfg(target_os = "macos")]
-fn run_ocr(path: &Path) -> Result<String, String> {
+fn run_ocr_batch(paths: &[PathBuf]) -> Result<Vec<String>, String> {
     let out = Command::new(ocr_helper()?)
-        .arg(path)
+        .args(paths)
         .output()
         .map_err(|e| format!("Couldn't run the text reader: {e}"))?;
     if !out.status.success() {
@@ -276,7 +460,7 @@ fn run_ocr(path: &Path) -> Result<String, String> {
             String::from_utf8_lossy(&out.stderr).trim()
         ));
     }
-    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    Ok(split_ocr_output(&String::from_utf8_lossy(&out.stdout), paths.len()))
 }
 
 /// Windows: the built-in Windows OCR engine (Windows.Media.Ocr), through PowerShell.
@@ -294,14 +478,14 @@ fn hidden_powershell() -> Command {
 }
 
 #[cfg(target_os = "windows")]
-fn run_ocr(path: &Path) -> Result<String, String> {
+fn run_ocr_batch(paths: &[PathBuf]) -> Result<Vec<String>, String> {
     let script = std::env::temp_dir().join("macroflow-ocr.ps1");
     // Rewrite every time so an updated script is always used.
     std::fs::write(&script, WINDOWS_OCR_SCRIPT).map_err(|e| format!("Couldn't write the OCR script: {e}"))?;
     let out = hidden_powershell()
         .arg("-File")
         .arg(&script)
-        .arg(path)
+        .args(paths)
         .output()
         .map_err(|e| format!("Couldn't run PowerShell for text reading: {e}"))?;
     if !out.status.success() {
@@ -311,35 +495,265 @@ fn run_ocr(path: &Path) -> Result<String, String> {
             err.trim().lines().next().unwrap_or("unknown error")
         ));
     }
-    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    Ok(split_ocr_output(&String::from_utf8_lossy(&out.stdout), paths.len()))
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-fn run_ocr(_path: &Path) -> Result<String, String> {
+fn run_ocr_batch(_paths: &[PathBuf]) -> Result<Vec<String>, String> {
     Err("Reading text is only supported on macOS and Windows.".into())
 }
 
-/// Read the text inside an image.
-pub fn ocr_image(img: &RgbaImage) -> Result<String, String> {
-    // OCR reads small text much better when it's bigger.
-    // (Windows OCR rejects images larger than 4096 px, so stay under that.)
-    let max_f = (4000 / img.width().max(img.height()).max(1)).max(1);
-    let img = if img.height() < 80 && max_f >= 2 {
-        let f = (80 / img.height().max(1)).clamp(2, 6).min(max_f);
-        imageops::resize(img, img.width() * f, img.height() * f, FilterType::CatmullRom)
-    } else {
-        img.clone()
-    };
-    let path = unique_temp("ocr");
-    img.save(&path).map_err(|e| format!("Couldn't save the image to read: {e}"))?;
-    let result = run_ocr(&path);
-    let _ = std::fs::remove_file(&path);
-    result
+/// What to read the area as.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OcrMode {
+    Text,
+    /// Clean the result up into a single number ("1O0" → "100", "12 345" → "12345").
+    Number,
 }
 
-/// Read the text in an area of the screen (global points).
-pub fn read_text(x: i32, y: i32, w: i32, h: i32) -> Result<String, String> {
-    ocr_image(&capture_area(x, y, w, h)?)
+/// The result of reading an area.
+#[derive(Clone, Debug)]
+pub struct OcrRead {
+    /// What was read (for numbers, the cleaned-up number, e.g. "-12345.5").
+    pub text: String,
+    /// How many of the reads agreed on it, out of `tries`.
+    pub agreed: usize,
+    pub tries: usize,
+    /// Everything each read came back with, for "Read now" feedback.
+    pub raw: Vec<String>,
+}
+
+// --- image clean-up --------------------------------------------------------
+
+fn histogram(g: &GrayImage) -> [u32; 256] {
+    let mut h = [0u32; 256];
+    for p in g.as_raw() {
+        h[*p as usize] += 1;
+    }
+    h
+}
+
+/// Stretch the brightness range so faint text on a similar background stands out.
+fn stretch_contrast(g: &GrayImage) -> GrayImage {
+    let h = histogram(g);
+    let total: u32 = h.iter().sum();
+    let cut = total / 50; // ignore the darkest / brightest 2%
+    let (mut lo, mut hi) = (0usize, 255usize);
+    let mut acc = 0;
+    for (i, c) in h.iter().enumerate() {
+        acc += c;
+        if acc > cut {
+            lo = i;
+            break;
+        }
+    }
+    acc = 0;
+    for (i, c) in h.iter().enumerate().rev() {
+        acc += c;
+        if acc > cut {
+            hi = i;
+            break;
+        }
+    }
+    if hi <= lo + 10 {
+        return g.clone();
+    }
+    let (lo, span) = (lo as f32, (hi - lo) as f32);
+    let mut out = g.clone();
+    for p in out.pixels_mut() {
+        p.0[0] = (((p.0[0] as f32 - lo) / span) * 255.0).clamp(0.0, 255.0) as u8;
+    }
+    out
+}
+
+/// Average brightness of the outer edge: in a box drawn round some text, that's the background.
+fn border_mean(g: &GrayImage) -> f32 {
+    let (w, h) = g.dimensions();
+    if w < 3 || h < 3 {
+        return 255.0;
+    }
+    let (mut sum, mut n) = (0f64, 0f64);
+    for x in 0..w {
+        for y in [0, 1, h - 2, h - 1] {
+            sum += g.get_pixel(x, y).0[0] as f64;
+            n += 1.0;
+        }
+    }
+    for y in 0..h {
+        for x in [0, 1, w - 2, w - 1] {
+            sum += g.get_pixel(x, y).0[0] as f64;
+            n += 1.0;
+        }
+    }
+    (sum / n) as f32
+}
+
+/// Black-and-white version using Otsu's threshold.
+fn binarize(g: &GrayImage) -> GrayImage {
+    let h = histogram(g);
+    let total: f64 = h.iter().map(|c| *c as f64).sum();
+    let sum_all: f64 = h.iter().enumerate().map(|(i, c)| i as f64 * *c as f64).sum();
+    let (mut sum_b, mut w_b, mut best, mut threshold) = (0f64, 0f64, 0f64, 128u8);
+    for (t, c) in h.iter().enumerate() {
+        w_b += *c as f64;
+        if w_b == 0.0 {
+            continue;
+        }
+        let w_f = total - w_b;
+        if w_f == 0.0 {
+            break;
+        }
+        sum_b += t as f64 * *c as f64;
+        let (m_b, m_f) = (sum_b / w_b, (sum_all - sum_b) / w_f);
+        let between = w_b * w_f * (m_b - m_f) * (m_b - m_f);
+        if between > best {
+            best = between;
+            threshold = t as u8;
+        }
+    }
+    let mut out = g.clone();
+    for p in out.pixels_mut() {
+        p.0[0] = if p.0[0] > threshold { 255 } else { 0 };
+    }
+    out
+}
+
+/// Surround with a white margin: OCR often drops characters that touch the image edge.
+fn pad_white(g: &GrayImage, pad: u32) -> GrayImage {
+    let (w, h) = g.dimensions();
+    let mut out = GrayImage::from_pixel(w + pad * 2, h + pad * 2, image::Luma([255]));
+    imageops::overlay(&mut out, g, pad as i64, pad as i64);
+    out
+}
+
+fn scaled(g: &GrayImage, f: f32) -> GrayImage {
+    if (f - 1.0).abs() < 0.05 {
+        return g.clone();
+    }
+    let (w, h) = g.dimensions();
+    let nw = ((w as f32 * f).round() as u32).max(1);
+    let nh = ((h as f32 * f).round() as u32).max(1);
+    imageops::resize(g, nw, nh, FilterType::CatmullRom)
+}
+
+/// A few cleaned-up versions of the area to read: dark text on a light background,
+/// enlarged, with a margin. Reading several versions and voting is far more reliable
+/// than one read of the raw capture.
+fn ocr_variants(img: &RgbaImage, mode: OcrMode) -> Vec<GrayImage> {
+    let gray = imageops::grayscale(img);
+    let (w, h) = gray.dimensions();
+    // OCR works best when text is roughly 40-80 px tall. A box drawn round a line of
+    // text is a bit taller than the text, so aim the box at ~120-150 px.
+    let target = if mode == OcrMode::Number { 150.0 } else { 120.0 };
+    let max_side = 2200.0; // stays well inside both OCR engines' limits
+    let mut f = (target / h.max(1) as f32).clamp(1.0, 8.0);
+    f = f.min(max_side / w.max(h).max(1) as f32).max(0.25);
+
+    let base = stretch_contrast(&scaled(&gray, f));
+    // Light text on a dark background (common in games and dark themes): flip it.
+    let base = if border_mean(&base) < 128.0 {
+        let mut inv = base;
+        imageops::invert(&mut inv);
+        inv
+    } else {
+        base
+    };
+    let pad = (base.height() / 3).clamp(16, 120);
+    let mut out = vec![pad_white(&base, pad), pad_white(&binarize(&base), pad)];
+    // The same thing a bit smaller: engines sometimes split or merge characters at one
+    // size but not another.
+    let smaller = scaled(&base, 0.6);
+    if smaller.height() >= 32 {
+        out.push(pad_white(&smaller, (smaller.height() / 3).clamp(16, 120)));
+    }
+    out
+}
+
+fn normalise_text(t: &str) -> String {
+    t.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Read the text inside an image.
+pub fn ocr_image(img: &RgbaImage, mode: OcrMode) -> Result<OcrRead, String> {
+    let variants = ocr_variants(img, mode);
+    let mut paths = Vec::new();
+    for (i, v) in variants.iter().enumerate() {
+        let path = unique_temp(&format!("ocr{i}"));
+        // Save as RGB: every OCR engine accepts that.
+        image::DynamicImage::ImageLuma8(v.clone())
+            .to_rgb8()
+            .save(&path)
+            .map_err(|e| format!("Couldn't save the image to read: {e}"))?;
+        paths.push(path);
+    }
+    let result = run_ocr_batch(&paths);
+    for p in &paths {
+        let _ = std::fs::remove_file(p);
+    }
+    let raw: Vec<String> = result?.iter().map(|r| normalise_text(r)).collect();
+    Ok(vote(raw, mode))
+}
+
+/// Pick the answer most of the reads agree on.
+fn vote(raw: Vec<String>, mode: OcrMode) -> OcrRead {
+    let answers: Vec<String> = raw
+        .iter()
+        .map(|r| match mode {
+            OcrMode::Text => r.clone(),
+            OcrMode::Number => crate::model::clean_number(r).unwrap_or_default(),
+        })
+        .collect();
+    // Most common non-empty answer wins; ties go to the longest (OCR more often
+    // drops characters than invents them), then to the earlier, cleaner version.
+    let mut best: Option<(usize, usize, usize, String)> = None; // (votes, len, -order, text)
+    for (order, a) in answers.iter().enumerate() {
+        if a.is_empty() {
+            continue;
+        }
+        let votes = answers.iter().filter(|b| *b == a).count();
+        let len = a.chars().count();
+        let key = (votes, len, usize::MAX - order);
+        if best.as_ref().map_or(true, |(v, l, o, _)| key > (*v, *l, *o)) {
+            best = Some((votes, len, usize::MAX - order, a.clone()));
+        }
+    }
+    let (agreed, text) = best.map(|(v, _, _, t)| (v, t)).unwrap_or((0, String::new()));
+    OcrRead {
+        text,
+        agreed,
+        tries: answers.len(),
+        raw,
+    }
+}
+
+/// Read the text in an area of the screen (global points), once.
+pub fn read_text(x: i32, y: i32, w: i32, h: i32, mode: OcrMode) -> Result<OcrRead, String> {
+    ocr_image(&capture_area(x, y, w, h)?, mode)
+}
+
+/// Read an area until at least two reads agree (up to 3 rounds), so one bad read
+/// can't decide a branch. `stop` is checked between rounds.
+pub fn read_text_sure(
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+    mode: OcrMode,
+    stop: &dyn Fn() -> bool,
+) -> Result<OcrRead, String> {
+    let mut pooled: Vec<String> = Vec::new();
+    let mut result = None;
+    for _ in 0..3 {
+        let r = read_text(x, y, w, h, mode)?;
+        pooled.extend(r.raw);
+        let v = vote(pooled.clone(), mode);
+        let sure = v.agreed >= 2;
+        result = Some(v);
+        if sure || stop() {
+            break;
+        }
+    }
+    Ok(result.expect("at least one read"))
 }
 
 // ---------------------------------------------------------------------------

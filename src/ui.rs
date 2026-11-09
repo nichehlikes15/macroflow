@@ -8,8 +8,8 @@ use gpui::{
     canvas, div, fill, img, point, prelude::*, px, rgb, rgba, AnyElement, Bounds, ClickEvent,
     Context, Div, ElementId, FocusHandle, FontWeight, Hsla, KeyDownEvent, MouseButton,
     MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit, PathBuilder, PathPromptOptions,
-    Pixels, Point, PromptLevel, ScrollDelta, ScrollWheelEvent, SharedString, Stateful, Task,
-    Window, WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowKind, WindowOptions,
+    Pixels, Point, PromptLevel, ScrollDelta, ScrollWheelEvent, SharedString, Stateful, Subscription,
+    Task, Window, WindowControlArea,
 };
 use std::cell::Cell;
 use std::path::PathBuf;
@@ -17,7 +17,7 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 // ---------------------------------------------------------------------------
 // Theme
@@ -76,6 +76,8 @@ enum Drag {
     Node { id: u64, dx: f32, dy: f32 },
     Pan { x: f32, y: f32 },
     Connect { from: u64, port: usize },
+    /// Shift-drag on empty canvas: draw a box to select the steps inside it.
+    Select { x: f32, y: f32 },
 }
 
 /// Which page the left sidebar shows.
@@ -116,13 +118,19 @@ enum Field {
     H,
     CompareValue,
     WinText,
+    GroupName,
 }
 
 impl Field {
     fn is_text(self) -> bool {
         matches!(
             self,
-            Field::MacroName | Field::Note | Field::Text | Field::CompareValue | Field::WinText
+            Field::MacroName
+                | Field::Note
+                | Field::Text
+                | Field::CompareValue
+                | Field::WinText
+                | Field::GroupName
         )
     }
     fn is_decimal(self) -> bool {
@@ -154,11 +162,21 @@ pub struct MacroApp {
     close_prompt_open: bool,
     side_tab: SideTab,
     sidebar_open: bool,
+    /// The groups you've opened, outermost first. Empty = the top level of the macro.
+    view: Vec<u64>,
+    /// Extra steps selected with Shift-click (on top of `selected`).
+    extra: Vec<u64>,
     windows: Vec<vision::WinInfo>,
     tx: Sender<WorkerMsg>,
     rx: Receiver<WorkerMsg>,
     stop: Arc<AtomicBool>,
     _poll: Task<()>,
+    /// Watches for MacroFlow becoming the active window again (cancels a selection).
+    _activation: Subscription,
+    /// When MacroFlow minimised itself to let you select an area.
+    capture_started: Option<Instant>,
+    /// MacroFlow minimised itself for "Read now" / "Test now": bring it back afterwards.
+    restore_after_test: bool,
 }
 
 impl MacroApp {
@@ -173,6 +191,18 @@ impl MacroApp {
                 .unwrap_or(true)
         });
         // Pick up results from the worker threads ~30 times a second.
+        // Clicking back on MacroFlow while the area selector is open cancels it.
+        let activation = cx.observe_window_activation(window, |this, window, cx| {
+            let recently_started = this
+                .capture_started
+                .map_or(true, |t| t.elapsed() < Duration::from_millis(1500));
+            if window.is_window_active() && this.mode == Mode::Capturing && !recently_started {
+                this.stop.store(true, Ordering::Relaxed);
+                this.status = "Selection cancelled.".into();
+                cx.notify();
+            }
+        });
+        vision::warm_up_selector();
         let poll = cx.spawn_in(window, async move |this, cx| loop {
             cx.background_executor()
                 .timer(Duration::from_millis(33))
@@ -207,11 +237,16 @@ impl MacroApp {
             close_prompt_open: false,
             side_tab: SideTab::Steps,
             sidebar_open: true,
+            view: Vec::new(),
+            extra: Vec::new(),
             windows: Vec::new(),
             tx,
             rx,
             stop: Arc::new(AtomicBool::new(false)),
             _poll: poll,
+            _activation: activation,
+            capture_started: None,
+            restore_after_test: false,
         }
     }
 
@@ -280,25 +315,14 @@ impl MacroApp {
                 WorkerMsg::TestResult(s) => {
                     self.mode = Mode::Idle;
                     self.status = s;
-                }
-                WorkerMsg::AreaShot(shot) => match self.pending_area.take() {
-                    Some(purpose) => {
-                        if let Err(e) = open_area_overlay(shot, purpose, self.tx.clone(), cx) {
-                            self.mode = Mode::Idle;
-                            self.status = e;
-                            show_again(window, cx);
-                        } else {
-                            self.status = "Drag a box anywhere on your screen…".into();
-                        }
-                    }
-                    None => {
-                        self.mode = Mode::Idle;
-                        let _ = std::fs::remove_file(&shot.path);
+                    if std::mem::take(&mut self.restore_after_test) {
                         show_again(window, cx);
                     }
-                },
+                }
                 WorkerMsg::AreaPicked { purpose, shot, sel } => {
                     self.mode = Mode::Idle;
+                    self.pending_area = None;
+                    self.capture_started = None;
                     show_again(window, cx);
                     match sel {
                         Some(sel) => self.apply_area(purpose, shot, sel),
@@ -326,6 +350,7 @@ impl MacroApp {
                             });
                             self.status = format!("Saved {}. Use “Test now” to check it.", path.display());
                         }
+                        AreaPurpose::SearchArea(_) => {}
                     }
                 }
                 WorkerMsg::Windows(list) => {
@@ -337,7 +362,8 @@ impl MacroApp {
                     self.mode = Mode::Idle;
                     self.active_node = None;
                     self.status = e;
-                    if self.pending_area.take().is_some() {
+                    let was_selecting = self.pending_area.take().is_some();
+                    if was_selecting || std::mem::take(&mut self.restore_after_test) {
                         show_again(window, cx);
                     }
                 }
@@ -400,8 +426,8 @@ impl MacroApp {
         }
     }
 
-    fn start_test(&mut self, id: u64) {
-        let Some(NodeKind::FindImage { template, threshold, .. }) =
+    fn start_test(&mut self, id: u64, window: &mut Window) {
+        let Some(NodeKind::FindImage { template, threshold, search_area, .. }) =
             self.doc.node(id).map(|n| n.kind.clone())
         else {
             return;
@@ -411,8 +437,15 @@ impl MacroApp {
             return;
         };
         if self.begin_worker(Mode::Testing) {
-            self.status = "Searching the screen…".into();
-            engine::test_find(self.tx.clone(), path, threshold);
+            self.status = if search_area.is_some() {
+                "Searching the search area…".into()
+            } else {
+                "Searching the screen…".into()
+            };
+            // Get out of the way so MacroFlow (and its preview of the image) isn't searched.
+            self.restore_after_test = true;
+            window.minimize_window();
+            engine::test_find(self.tx.clone(), path, threshold, search_area, 600);
         }
     }
 
@@ -430,8 +463,9 @@ impl MacroApp {
             "Capturing the screen…".into()
         };
         // Get MacroFlow out of the way so you can select anything on screen.
+        self.capture_started = Some(Instant::now());
         window.minimize_window();
-        engine::capture_for_area(self.tx.clone(), self.stop.clone(), countdown);
+        engine::capture_for_area(self.tx.clone(), self.stop.clone(), countdown, purpose);
     }
 
     /// Use a box the user dragged on screen. `sel` is (x0, y0, x1, y1) in the
@@ -461,6 +495,24 @@ impl MacroApp {
                 self.status = format!("Area set to {w}×{h} at ({gx}, {gy}). Press “Read now” to test it.");
             }
             AreaPurpose::Template(_) => self.status = "Saving the picture…".into(),
+            AreaPurpose::SearchArea(id) => {
+                let _ = std::fs::remove_file(&shot.path);
+                let rect = ScreenRect {
+                    x: gx,
+                    y: gy,
+                    w: w as i32,
+                    h: h as i32,
+                };
+                self.update_node(id, |k| {
+                    if let NodeKind::FindImage { search_area, .. } = k {
+                        *search_area = Some(rect);
+                    }
+                });
+                self.status = format!(
+                    "Find image will only look inside {w}×{h} at ({gx}, {gy}). Press “Test now” to check it."
+                );
+                return;
+            }
         }
         self.mode = Mode::Working;
         engine::crop_area(self.tx.clone(), shot, (x0, y0, w, h), purpose);
@@ -547,7 +599,7 @@ impl MacroApp {
         }
     }
 
-    fn start_read_test(&mut self, id: u64) {
+    fn start_read_test(&mut self, id: u64, window: &mut Window) {
         self.commit_edit();
         let Some(NodeKind::ReadText {
             x,
@@ -557,6 +609,7 @@ impl MacroApp {
             compare,
             value,
             case_sensitive,
+            numbers_only,
             ..
         }) = self.doc.node(id).map(|n| n.kind.clone())
         else {
@@ -568,7 +621,18 @@ impl MacroApp {
         }
         if self.begin_worker(Mode::Working) {
             self.status = "Reading the screen…".into();
-            engine::test_read(self.tx.clone(), (x, y, w, h), compare, value, case_sensitive);
+            // Get out of the way so MacroFlow can't cover the area it's reading.
+            self.restore_after_test = true;
+            window.minimize_window();
+            engine::test_read(
+                self.tx.clone(),
+                (x, y, w, h),
+                compare,
+                value,
+                case_sensitive,
+                numbers_only,
+                600,
+            );
         }
     }
 
@@ -584,55 +648,205 @@ impl MacroApp {
         self.status = "Stopping…".into();
     }
 
+    /// The steps you're looking at: the top level, or the inside of the open group.
+    fn view(&self) -> &Graph {
+        self.doc.root.at(&self.view).unwrap_or(&self.doc.root)
+    }
+
+    fn view_mut(&mut self) -> &mut Graph {
+        if self.doc.root.at(&self.view).is_none() {
+            self.view.clear();
+        }
+        let path = self.view.clone();
+        self.doc.root.at_mut(&path).expect("the top level always exists")
+    }
+
+    /// Every selected step (the clicked one plus any Shift-clicked ones).
+    fn selection(&self) -> Vec<u64> {
+        let mut v: Vec<u64> = self.selected.into_iter().collect();
+        for id in &self.extra {
+            if !v.contains(id) {
+                v.push(*id);
+            }
+        }
+        v
+    }
+
+    fn clear_selection(&mut self) {
+        self.selected = None;
+        self.extra.clear();
+    }
+
+    fn enter_group(&mut self, id: u64) {
+        if !matches!(self.doc.node(id).map(|n| &n.kind), Some(NodeKind::Group { .. })) {
+            return;
+        }
+        self.commit_edit();
+        let Some(mut path) = self.doc.root.path_to(id) else { return };
+        path.push(id);
+        self.view = path;
+        self.clear_selection();
+        self.pan = (0.0, 0.0);
+        self.side_tab = SideTab::Steps;
+        self.status = format!("Inside “{}”. Esc or the path at the top takes you back out.", self.group_name(id));
+    }
+
+    /// Go back out to level `depth` (0 = the top level of the macro).
+    fn leave_group_to(&mut self, depth: usize) {
+        if depth >= self.view.len() {
+            return;
+        }
+        self.commit_edit();
+        let came_from = self.view[depth];
+        self.view.truncate(depth);
+        self.clear_selection();
+        // Select the group you just left, so it's easy to see where you were.
+        self.selected = Some(came_from);
+        self.pan = (0.0, 0.0);
+        self.status = if depth == 0 {
+            "Back at the top level of the macro.".into()
+        } else {
+            format!("Back in “{}”.", self.group_name(self.view[depth - 1]))
+        };
+    }
+
+    fn group_name(&self, id: u64) -> String {
+        match self.doc.node(id).map(|n| &n.kind) {
+            Some(NodeKind::Group { name, .. }) if !name.trim().is_empty() => name.trim().to_string(),
+            _ => "Group".into(),
+        }
+    }
+
+    /// Group the selected steps, or (with one step selected) the straight line starting at it.
+    fn group_selection(&mut self) {
+        if !self.idle() {
+            return;
+        }
+        self.commit_edit();
+        // Start / group start / group end can't go in a group: just leave them out.
+        let mut ids: Vec<u64> = self
+            .selection()
+            .into_iter()
+            .filter(|id| self.doc.node(*id).map_or(false, |n| !n.kind.is_fixed()))
+            .collect();
+        if ids.is_empty() {
+            self.status = "Select the steps to group first (click one, then Shift-click or Shift-drag for more).".into();
+            return;
+        }
+        if ids.len() == 1 {
+            ids = self.doc.straight_run(ids[0]);
+            if ids.len() < 2 {
+                self.status = "There's no straight line of steps after this one to group. Shift-click the steps you want instead.".into();
+                return;
+            }
+        }
+        match self.doc.group_steps(&ids) {
+            Ok(group_id) => {
+                self.clear_selection();
+                self.selected = Some(group_id);
+                self.side_tab = SideTab::Edit;
+                self.sidebar_open = true;
+                self.dirty = true;
+                self.status = format!("Grouped {} steps. Double-click the group to open it.", ids.len());
+            }
+            Err(e) => self.status = e,
+        }
+    }
+
+    fn ungroup_selected(&mut self) {
+        if !self.idle() {
+            return;
+        }
+        let Some(id) = self.selected else { return };
+        if !matches!(self.doc.node(id).map(|n| &n.kind), Some(NodeKind::Group { .. })) {
+            self.status = "Select a group to ungroup it.".into();
+            return;
+        }
+        match self.doc.ungroup(id) {
+            Ok(ids) => {
+                self.clear_selection();
+                self.selected = ids.first().copied();
+                self.extra = ids.into_iter().skip(1).collect();
+                self.dirty = true;
+                self.status = "Ungrouped – the steps are back in place.".into();
+            }
+            Err(e) => self.status = e,
+        }
+    }
+
     /// Add a step. If a step is selected and its main output is free,
     /// the new step is placed after it and connected automatically.
     fn add_step(&mut self, kind: NodeKind) {
         self.commit_edit();
+        let kind = match kind {
+            NodeKind::Group { graph, .. } if graph.nodes.is_empty() => self.doc.new_group_kind(),
+            k => k,
+        };
         let link = self
             .selected
+            .filter(|id| self.view().nodes.iter().any(|n| n.id == *id))
             .and_then(|id| self.doc.node(id))
             .filter(|n| !n.kind.outputs().is_empty())
             .map(|n| (n.id, n.x + NODE_W + 70.0, n.y));
         let (x, y, from) = match link {
             Some((id, x, y)) => (x, y, Some(id)),
             None => {
-                let k = (self.doc.nodes.len() % 6) as f32;
+                let k = (self.view().nodes.len() % 6) as f32;
                 (260.0 - self.pan.0 + k * 26.0, 120.0 - self.pan.1 + k * 26.0, None)
             }
         };
-        let new_id = self.doc.add_node(kind, x, y);
+        let path = self.view.clone();
+        let new_id = self.doc.add_node_in(&path, kind, x, y);
         if let Some(from) = from {
             if self.doc.next(from, 0).is_none() {
                 self.doc.connect(from, 0, new_id);
             }
         }
+        self.clear_selection();
         self.selected = Some(new_id);
         self.dirty = true;
     }
 
     fn delete_selected(&mut self) {
-        let Some(id) = self.selected else { return };
-        if matches!(self.doc.node(id).map(|n| &n.kind), Some(NodeKind::Start)) {
-            self.status = "The Start step can't be deleted.".into();
+        let ids = self.selection();
+        if ids.is_empty() {
             return;
         }
-        self.doc.remove_node(id);
-        self.selected = None;
-        self.dirty = true;
+        let mut removed = 0;
+        for id in ids {
+            match self.doc.node(id).map(|n| n.kind.clone()) {
+                Some(k) if k.is_fixed() => {
+                    self.status = format!("The {} step can't be deleted.", k.title());
+                }
+                Some(_) => {
+                    self.doc.remove_node(id);
+                    removed += 1;
+                }
+                None => {}
+            }
+        }
+        if removed > 0 {
+            self.clear_selection();
+            self.dirty = true;
+        }
     }
 
     fn duplicate_selected(&mut self) {
         let Some(n) = self.selected.and_then(|id| self.doc.node(id)).cloned() else {
             return;
         };
-        if matches!(n.kind, NodeKind::Start) {
+        if n.kind.is_fixed() {
             return;
         }
-        let id = self.doc.add_node(n.kind, n.x + 30.0, n.y + 30.0);
+        let mut kind = n.kind.clone();
+        self.doc.refresh_ids(&mut kind);
+        let path = self.view.clone();
+        let id = self.doc.add_node_in(&path, kind, n.x + 30.0, n.y + 30.0);
         if let Some(copy) = self.doc.node_mut(id) {
             copy.delay_ms = n.delay_ms;
             copy.note = n.note;
         }
+        self.clear_selection();
         self.selected = Some(id);
         self.dirty = true;
     }
@@ -652,6 +866,8 @@ impl MacroApp {
         self.path = None;
         self.dirty = false;
         self.selected = None;
+        self.extra.clear();
+        self.view.clear();
         self.editing = None;
         self.pan = (0.0, 0.0);
         self.status = "New macro.".into();
@@ -690,6 +906,8 @@ impl MacroApp {
                 self.path = Some(path.clone());
                 self.dirty = false;
                 self.selected = None;
+                self.extra.clear();
+                self.view.clear();
                 self.editing = None;
                 self.pan = (0.0, 0.0);
                 self.status = format!("Opened {}", path.display());
@@ -807,6 +1025,7 @@ impl MacroApp {
             (Field::H, NodeKind::ReadText { h, .. }) => h.to_string(),
             (Field::CompareValue, NodeKind::ReadText { value, .. }) => value.clone(),
             (Field::WinText, NodeKind::WindowCheck { text, .. }) => text.clone(),
+            (Field::GroupName, NodeKind::Group { name, .. }) => name.clone(),
             (
                 Field::OffX,
                 NodeKind::Click { offset_x, .. } | NodeKind::MoveMouse { offset_x, .. },
@@ -901,6 +1120,7 @@ impl MacroApp {
             (Field::H, NodeKind::ReadText { h, .. }) => *h = int()?.clamp(0, 10_000) as i32,
             (Field::CompareValue, NodeKind::ReadText { value, .. }) => *value = raw.to_string(),
             (Field::WinText, NodeKind::WindowCheck { text, .. }) => *text = raw.to_string(),
+            (Field::GroupName, NodeKind::Group { name, .. }) => *name = raw.trim().to_string(),
             (
                 Field::OffX,
                 NodeKind::Click { offset_x, .. } | NodeKind::MoveMouse { offset_x, .. },
@@ -1060,6 +1280,8 @@ impl MacroApp {
                 "d" => self.duplicate_selected(),
                 "r" => self.start_run(),
                 "b" => self.sidebar_open = !self.sidebar_open,
+                "g" if m.shift => self.ungroup_selected(),
+                "g" => self.group_selection(),
                 _ => return,
             }
             cx.stop_propagation();
@@ -1069,8 +1291,18 @@ impl MacroApp {
         match key {
             "backspace" | "delete" => self.delete_selected(),
             "escape" => {
-                self.selected = None;
                 self.drag = Drag::None;
+                if self.selected.is_some() || !self.extra.is_empty() {
+                    self.clear_selection();
+                } else if !self.view.is_empty() {
+                    let depth = self.view.len() - 1;
+                    self.leave_group_to(depth);
+                }
+            }
+            "enter" => {
+                if let Some(id) = self.selected {
+                    self.enter_group(id);
+                }
             }
             _ => return,
         }
@@ -1090,9 +1322,16 @@ impl MacroApp {
         match self.drag {
             Drag::Node { id, dx, dy } => {
                 let (lx, ly) = self.to_local(ev.position);
-                if let Some(n) = self.doc.node_mut(id) {
-                    n.x = (lx - dx).round();
-                    n.y = (ly - dy).round();
+                if let Some(n) = self.doc.node(id) {
+                    let (mx, my) = ((lx - dx).round() - n.x, (ly - dy).round() - n.y);
+                    let sel = self.selection();
+                    let moving = if sel.contains(&id) { sel } else { vec![id] };
+                    for m in moving {
+                        if let Some(n) = self.doc.node_mut(m) {
+                            n.x += mx;
+                            n.y += my;
+                        }
+                    }
                     self.dirty = true;
                 }
                 cx.notify();
@@ -1103,7 +1342,7 @@ impl MacroApp {
                 self.drag = Drag::Pan { x: wx, y: wy };
                 cx.notify();
             }
-            Drag::Connect { .. } => cx.notify(),
+            Drag::Connect { .. } | Drag::Select { .. } => cx.notify(),
             Drag::None => {}
         }
     }
@@ -1112,12 +1351,41 @@ impl MacroApp {
         cx.stop_propagation();
         self.commit_edit();
         self.capturing_key = false;
+        // Double-click a group to open it.
+        if ev.click_count >= 2 && matches!(self.doc.node(id).map(|n| &n.kind), Some(NodeKind::Group { .. })) {
+            self.enter_group(id);
+            self.drag = Drag::None;
+            cx.notify();
+            return;
+        }
+        // Shift-click adds or removes a step from the selection (for grouping).
+        if ev.modifiers.shift {
+            if self.selected == Some(id) {
+                self.selected = self.extra.pop();
+            } else if self.extra.contains(&id) {
+                self.extra.retain(|e| *e != id);
+            } else if self.selected.is_none() {
+                self.selected = Some(id);
+            } else {
+                self.extra.push(id);
+            }
+            self.side_tab = SideTab::Edit;
+            self.sidebar_open = true;
+            self.focus.focus(window);
+            cx.notify();
+            return;
+        }
+        if !self.selection().contains(&id) {
+            self.extra.clear();
+        }
         if self.selected != Some(id) {
             // Show the clicked step's settings.
             self.side_tab = SideTab::Edit;
             self.sidebar_open = true;
         }
-        self.selected = Some(id);
+        if !self.extra.contains(&id) {
+            self.selected = Some(id);
+        }
         let (lx, ly) = self.to_local(ev.position);
         if let Some(n) = self.doc.node(id) {
             self.drag = Drag::Node {
@@ -1127,12 +1395,46 @@ impl MacroApp {
             };
         }
         // Bring the step to the front.
-        if let Some(i) = self.doc.nodes.iter().position(|n| n.id == id) {
-            let n = self.doc.nodes.remove(i);
-            self.doc.nodes.push(n);
+        let nodes = &mut self.view_mut().nodes;
+        if let Some(i) = nodes.iter().position(|n| n.id == id) {
+            let n = nodes.remove(i);
+            nodes.push(n);
         }
         self.focus.focus(window);
         cx.notify();
+    }
+
+    /// Mouse released anywhere in the window.
+    fn finish_drag(&mut self, pos: Point<Pixels>, cx: &mut Context<Self>) {
+        if let Drag::Select { x, y } = self.drag {
+            let (ox, oy) = self.canvas_origin.get();
+            let (px0, py0) = (x - ox - self.pan.0, y - oy - self.pan.1);
+            let (px1, py1) = self.to_local(pos);
+            let (x0, x1) = (px0.min(px1), px0.max(px1));
+            let (y0, y1) = (py0.min(py1), py0.max(py1));
+            let hits: Vec<u64> = self
+                .view()
+                .nodes
+                .iter()
+                .filter(|n| n.x < x1 && n.x + NODE_W > x0 && n.y < y1 && n.y + NODE_H > y0)
+                .map(|n| n.id)
+                .collect();
+            for id in hits {
+                if self.selected.is_none() {
+                    self.selected = Some(id);
+                } else if self.selected != Some(id) && !self.extra.contains(&id) {
+                    self.extra.push(id);
+                }
+            }
+            if self.selected.is_some() {
+                self.side_tab = SideTab::Edit;
+                self.sidebar_open = true;
+            }
+        }
+        if self.drag != Drag::None {
+            self.drag = Drag::None;
+            cx.notify();
+        }
     }
 
     fn node_mouse_up(&mut self, id: u64, cx: &mut Context<Self>) {
@@ -1309,12 +1611,106 @@ impl MacroApp {
             })
             .child(div().w(px(if IS_MACOS { 12. } else { 8. })))
             // Windows draws no title bar for us, so add minimise / maximise / close.
-            .when(!IS_MACOS, |d| d.child(window_controls(is_max)))
+            .when(!IS_MACOS, |d| d.child(self.render_window_controls(is_max, cx)))
+    }
+
+    /// Minimise / maximise / close for Windows (macOS has its traffic lights).
+    /// These are ordinary buttons that MacroFlow handles itself. The system title-bar
+    /// button areas didn't respond reliably on Windows.
+    fn render_window_controls(&self, is_maximized: bool, cx: &mut Context<Self>) -> Div {
+        let cell = |id: &'static str| {
+            div()
+                .id(id)
+                .w(px(46.))
+                .h(px(TITLEBAR_H))
+                .flex()
+                .items_center()
+                .justify_center()
+                .cursor_default()
+        };
+        let max_icon = if is_maximized {
+            // "Restore": two overlapping squares.
+            div()
+                .relative()
+                .size(px(11.))
+                .child(
+                    div()
+                        .absolute()
+                        .left(px(2.))
+                        .top_0()
+                        .size(px(8.))
+                        .border_1()
+                        .border_color(rgb(TEXT)),
+                )
+                .child(
+                    div()
+                        .absolute()
+                        .left_0()
+                        .top(px(2.))
+                        .size(px(8.))
+                        .bg(rgb(TITLEBAR))
+                        .border_1()
+                        .border_color(rgb(TEXT)),
+                )
+        } else {
+            div().size(px(10.)).border_1().border_color(rgb(TEXT))
+        };
+        let close_icon = canvas(
+            |_, _, _| {},
+            |bounds, _, window, _| {
+                let x0 = f32::from(bounds.origin.x);
+                let y0 = f32::from(bounds.origin.y);
+                let w = f32::from(bounds.size.width);
+                let h = f32::from(bounds.size.height);
+                let color = hsla(TEXT);
+                for (a, b) in [((x0, y0), (x0 + w, y0 + h)), ((x0 + w, y0), (x0, y0 + h))] {
+                    let mut p = PathBuilder::stroke(px(1.));
+                    p.move_to(point(px(a.0), px(a.1)));
+                    p.line_to(point(px(b.0), px(b.1)));
+                    if let Ok(path) = p.build() {
+                        window.paint_path(path, color);
+                    }
+                }
+            },
+        )
+        .size(px(10.));
+        div()
+            .flex()
+            .flex_none()
+            .h_full()
+            .child(
+                cell("win-min")
+                    .hover(|s| s.bg(rgb(BTN_HOVER)))
+                    .child(div().w(px(10.)).h(px(1.)).bg(rgb(TEXT)))
+                    .on_click(cx.listener(|_, _: &ClickEvent, window, _| window.minimize_window())),
+            )
+            .child(
+                cell("win-max")
+                    .hover(|s| s.bg(rgb(BTN_HOVER)))
+                    .child(max_icon)
+                    .on_click(cx.listener(|_, _: &ClickEvent, window, _| toggle_maximize(window))),
+            )
+            .child(
+                cell("win-close")
+                    .hover(|s| s.bg(rgb(0xc42b1c)))
+                    .child(close_icon)
+                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                        this.request_close(window, cx)
+                    })),
+            )
+    }
+
+    /// The close button: asks to save first if there are unsaved changes.
+    fn request_close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.confirm_close(AfterSave::CloseWindow, window, cx) {
+            self.finish_close(AfterSave::CloseWindow, window, cx);
+        }
     }
 
     fn render_sidebar(&self, cx: &mut Context<Self>) -> Div {
         let items: Vec<AnyElement> = match self.side_tab {
             SideTab::Steps => self.steps_tab(cx),
+            SideTab::Edit if !self.extra.is_empty() => self.multi_settings(cx),
             SideTab::Edit => match self.selected.and_then(|id| self.doc.node(id)).cloned() {
                 Some(n) => self.node_settings(&n, cx),
                 None => self.edit_empty(cx),
@@ -1511,6 +1907,7 @@ impl MacroApp {
             "Right-click a dot, or click the × on a line, to remove a connection.",
             "Drag the empty grid (or scroll) to move around.",
             "Esc stops a recording or a running macro from anywhere.",
+            "Groups: select a step and click ▤ Group at the bottom of the canvas. Shift-click or Shift-drag to pick several steps. Double-click a group to open it; Esc goes back out.",
             "“Select area” minimises MacroFlow so you can drag a box anywhere on your screen. Shift-click it for a 3 s countdown first.",
             SHORTCUT_TIP,
         ] {
@@ -1584,7 +1981,15 @@ impl MacroApp {
             .child(
                 div()
                     .text_color(rgb(MUTED))
-                    .child(format!("{} steps · {} links", self.doc.nodes.len(), self.doc.edges.len())),
+                    .child({
+                        let g = self.view();
+                        let place = if self.view.is_empty() {
+                            String::new()
+                        } else {
+                            format!("in “{}” · ", self.group_name(*self.view.last().unwrap()))
+                        };
+                        format!("{place}{} steps · {} links", g.step_count(), g.edges.len())
+                    }),
             )
     }
 
@@ -1600,14 +2005,16 @@ impl MacroApp {
         // Connection geometry, in canvas-local coordinates.
         let mut lines: Vec<(f32, f32, f32, f32, Hsla, bool)> = Vec::new();
         let mut handles: Vec<(f32, f32, u64, usize)> = Vec::new();
-        for e in &self.doc.edges {
+        let view = self.view();
+        let inside = !self.view.is_empty();
+        for e in &view.edges {
             let (Some(a), Some(b)) = (self.doc.node(e.from), self.doc.node(e.to)) else {
                 continue;
             };
             let (x0, y0) = out_port_pos(a, e.port);
             let (x1, y1) = in_port_pos(b);
             let (x0, y0, x1, y1) = (x0 + pan_x, y0 + pan_y, x1 + pan_x, y1 + pan_y);
-            let active = self.active_node == Some(e.from);
+            let active = self.is_active(a);
             lines.push((x0, y0, x1, y1, hsla(a.kind.color()), active));
             let (mx, my) = bezier_mid(x0, y0, x1, y1);
             handles.push((mx, my, e.from, e.port));
@@ -1678,11 +2085,15 @@ impl MacroApp {
                 cx.listener(|this, ev: &MouseDownEvent, window, cx| {
                     this.commit_edit();
                     this.capturing_key = false;
-                    this.selected = None;
-                    this.drag = Drag::Pan {
-                        x: f32::from(ev.position.x),
-                        y: f32::from(ev.position.y),
-                    };
+                    let (x, y) = (f32::from(ev.position.x), f32::from(ev.position.y));
+                    this.mouse = (x, y);
+                    if ev.modifiers.shift {
+                        // Shift-drag draws a selection box (adds to what's selected).
+                        this.drag = Drag::Select { x, y };
+                    } else {
+                        this.clear_selection();
+                        this.drag = Drag::Pan { x, y };
+                    }
                     this.focus.focus(window);
                     cx.notify();
                 }),
@@ -1698,7 +2109,39 @@ impl MacroApp {
             }))
             .child(painter);
 
-        for n in &self.doc.nodes {
+        // Inside a group: tint the canvas and frame it in the group colour, so it's
+        // obvious you're not at the top level. (The grid itself is unchanged.)
+        if inside {
+            graph = graph.child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .size_full()
+                    .bg(rgba((GROUP_COLOR << 8) | 0x0b))
+                    .border_2()
+                    .border_color(rgba((GROUP_COLOR << 8) | 0x99)),
+            );
+        }
+
+        for n in &view.nodes {
+            // Groups look like a little stack of cards.
+            if n.kind.is_group() {
+                for off in [8.0, 4.0] {
+                    graph = graph.child(
+                        div()
+                            .absolute()
+                            .left(px(n.x + pan_x + off))
+                            .top(px(n.y + pan_y + off))
+                            .w(px(NODE_W))
+                            .h(px(NODE_H))
+                            .rounded_lg()
+                            .bg(rgb(NODE_BG))
+                            .border_1()
+                            .border_color(rgba((GROUP_COLOR << 8) | 0x66)),
+                    );
+                }
+            }
             graph = graph.child(self.render_node(n, pan_x, pan_y, cx));
         }
 
@@ -1733,7 +2176,31 @@ impl MacroApp {
             );
         }
 
-        if self.doc.nodes.len() <= 1 {
+        if let Drag::Select { x, y } = self.drag {
+            let (x0, y0) = (x - ox, y - oy);
+            let (x1, y1) = (self.mouse.0 - ox, self.mouse.1 - oy);
+            graph = graph.child(
+                div()
+                    .absolute()
+                    .left(px(x0.min(x1)))
+                    .top(px(y0.min(y1)))
+                    .w(px((x1 - x0).abs()))
+                    .h(px((y1 - y0).abs()))
+                    .rounded_sm()
+                    .border_1()
+                    .border_color(rgb(ACCENT))
+                    .bg(rgba((ACCENT << 8) | 0x1f)),
+            );
+        }
+
+        if inside {
+            graph = graph.child(self.render_breadcrumb(cx));
+        }
+        if let Some(bar) = self.render_selection_bar(cx) {
+            graph = graph.child(bar);
+        }
+
+        if !inside && view.nodes.len() <= 1 {
             graph = graph.child(
                 div()
                     .absolute()
@@ -1752,10 +2219,185 @@ impl MacroApp {
         graph
     }
 
+    /// A small floating bar at the bottom of the canvas with Group / Ungroup for
+    /// whatever is selected, so grouping existing steps is always one click away.
+    fn render_selection_bar(&self, cx: &mut Context<Self>) -> Option<Div> {
+        if !self.idle() {
+            return None;
+        }
+        let ids = self.selection();
+        let first = *ids.first()?;
+        let mut actions: Vec<Stateful<Div>> = Vec::new();
+        let label;
+        if ids.len() > 1 {
+            label = format!("{} steps selected", ids.len());
+            actions.push(bar_btn("sel-group", "▤ Group", true).on_click(cx.listener(
+                |this, _: &ClickEvent, _, cx| {
+                    this.group_selection();
+                    cx.notify();
+                },
+            )));
+            actions.push(bar_btn("sel-delete", "Delete", false).on_click(cx.listener(
+                |this, _: &ClickEvent, _, cx| {
+                    this.delete_selected();
+                    cx.notify();
+                },
+            )));
+        } else {
+            let node = self.doc.node(first)?;
+            if node.kind.is_group() {
+                label = self.group_name(first);
+                actions.push(bar_btn("sel-open", "Open", true).on_click(cx.listener(
+                    move |this, _: &ClickEvent, _, cx| {
+                        this.enter_group(first);
+                        cx.notify();
+                    },
+                )));
+                actions.push(bar_btn("sel-ungroup", "Ungroup", false).on_click(cx.listener(
+                    |this, _: &ClickEvent, _, cx| {
+                        this.ungroup_selected();
+                        cx.notify();
+                    },
+                )));
+            } else {
+                let run = if node.kind.is_fixed() { 0 } else { self.doc.straight_run(first).len() };
+                if run < 2 {
+                    return None;
+                }
+                label = format!("{} + next {} step{}", node.kind.title(), run - 1, if run == 2 { "" } else { "s" });
+                actions.push(bar_btn("sel-group", "▤ Group these", true).on_click(cx.listener(
+                    |this, _: &ClickEvent, _, cx| {
+                        this.group_selection();
+                        cx.notify();
+                    },
+                )));
+            }
+        }
+        actions.push(bar_btn("sel-clear", "✕", false).on_click(cx.listener(
+            |this, _: &ClickEvent, _, cx| {
+                this.clear_selection();
+                cx.notify();
+            },
+        )));
+        let mut bar = div()
+            .id("selection-bar")
+            .occlude()
+            .flex()
+            .items_center()
+            .gap_1()
+            .pl_3()
+            .pr_1()
+            .py_1()
+            .rounded_lg()
+            .bg(rgba(0x161922f2))
+            .border_1()
+            .border_color(rgb(BORDER))
+            .shadow_lg()
+            .child(div().pr_2().text_xs().text_color(rgb(MUTED)).child(label));
+        for a in actions {
+            bar = bar.child(a);
+        }
+        Some(
+            div()
+                .absolute()
+                .bottom(px(16.))
+                .left_0()
+                .w_full()
+                .flex()
+                .justify_center()
+                .child(bar),
+        )
+    }
+
+    /// Is this step running right now (for a group: is one of its steps running)?
+    fn is_active(&self, n: &Node) -> bool {
+        match (self.active_node, &n.kind) {
+            (Some(a), _) if a == n.id => true,
+            (Some(a), NodeKind::Group { graph, .. }) => graph.contains(a),
+            _ => false,
+        }
+    }
+
+    /// "Macro › Group 1 › Group 2" across the top of the canvas when you're inside a group.
+    fn render_breadcrumb(&self, cx: &mut Context<Self>) -> Stateful<Div> {
+        let mut crumbs: Vec<(usize, String)> = vec![(0, self.doc.name.clone())];
+        for (i, gid) in self.view.iter().enumerate() {
+            crumbs.push((i + 1, self.group_name(*gid)));
+        }
+        let last = crumbs.len() - 1;
+        let mut bar = div()
+            .id("breadcrumb")
+            .occlude()
+            .absolute()
+            .top(px(12.))
+            .left(px(12.))
+            .flex()
+            .items_center()
+            .gap_1()
+            .pl_1()
+            .pr_2()
+            .py_1()
+            .rounded_lg()
+            .bg(rgba(0x161922f0))
+            .border_1()
+            .border_color(rgba((GROUP_COLOR << 8) | 0xaa))
+            .shadow_md()
+            .child(
+                small_btn("crumb-back", "← Back")
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                            cx.stop_propagation();
+                            let depth = this.view.len().saturating_sub(1);
+                            this.leave_group_to(depth);
+                            cx.notify();
+                        }),
+                    ),
+            )
+            .child(
+                div()
+                    .px_1()
+                    .text_xs()
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(rgb(GROUP_COLOR))
+                    .child("INSIDE GROUP"),
+            );
+        for (depth, label) in crumbs {
+            if depth > 0 {
+                bar = bar.child(div().text_color(rgb(MUTED)).child("›"));
+            }
+            let is_last = depth == last;
+            bar = bar.child(
+                div()
+                    .id(("crumb", depth))
+                    .px_1p5()
+                    .rounded_md()
+                    .max_w(px(180.))
+                    .truncate()
+                    .when(is_last, |d| d.text_color(rgb(TEXT)).font_weight(FontWeight::SEMIBOLD))
+                    .when(!is_last, |d| {
+                        d.text_color(rgb(MUTED))
+                            .cursor_pointer()
+                            .hover(|s| s.bg(rgb(BTN_HOVER)).text_color(rgb(TEXT)))
+                    })
+                    .child(label)
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _: &MouseDownEvent, _, cx| {
+                            cx.stop_propagation();
+                            this.leave_group_to(depth);
+                            cx.notify();
+                        }),
+                    ),
+            );
+        }
+        bar
+    }
+
     fn render_node(&self, n: &Node, pan_x: f32, pan_y: f32, cx: &mut Context<Self>) -> Div {
         let id = n.id;
-        let selected = self.selected == Some(id);
-        let active = self.active_node == Some(id);
+        let selected = self.selected == Some(id) || self.extra.contains(&id);
+        let active = self.is_active(n);
         let color = n.kind.color();
         let border = if active {
             rgb(YELLOW)
@@ -1989,7 +2631,7 @@ impl MacroApp {
                         .child(n.kind.title()),
                 )
                 .child(div().flex_1())
-                .when(!matches!(n.kind, NodeKind::Start), |d| {
+                .when(!n.kind.is_fixed(), |d| {
                     d.child(small_btn("n-dup", "Duplicate").on_click(cx.listener(
                         |this, _: &ClickEvent, _, cx| {
                             this.duplicate_selected();
@@ -2007,8 +2649,29 @@ impl MacroApp {
                 })
                 .into_any_element(),
         );
-        out.push(self.text_field("Note", Field::Note, cx).into_any_element());
-        out.push(self.num_field("Delay before (ms)", Field::Delay, 50.0, cx).into_any_element());
+        let groupable = !n.kind.is_fixed() && !matches!(n.kind, NodeKind::End) && self.doc.straight_run(id).len() >= 2;
+        if groupable {
+            let run = self.doc.straight_run(id).len();
+            out.push(
+                small_btn("n-group-run", "Group the straight line from here")
+                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                        this.group_selection();
+                        cx.notify();
+                    }))
+                    .into_any_element(),
+            );
+            out.push(
+                help(&format!(
+                    "Turns this step and the {} after it into one Group step. Shift-click steps to pick exactly which ones.",
+                    run - 1
+                ))
+                .into_any_element(),
+            );
+        }
+        if !matches!(n.kind, NodeKind::GroupIn | NodeKind::GroupOut) {
+            out.push(self.text_field("Note", Field::Note, cx).into_any_element());
+            out.push(self.num_field("Delay before (ms)", Field::Delay, 50.0, cx).into_any_element());
+        }
         out.push(div().h(px(6.)).into_any_element());
 
         match &n.kind {
@@ -2016,7 +2679,16 @@ impl MacroApp {
                 out.push(help("Every run begins here. Connect its dot to your first step.").into_any_element());
             }
             NodeKind::End => {
-                out.push(help("The macro stops when it reaches this step (or any step with nothing connected).").into_any_element());
+                out.push(help("The macro stops when it reaches this step (or any step with nothing connected). Inside a group, an End step stops the whole macro too.").into_any_element());
+            }
+            NodeKind::GroupIn => {
+                out.push(help("The group starts here. Connect it to the group's first step.").into_any_element());
+            }
+            NodeKind::GroupOut => {
+                out.push(help("When the macro reaches this step it leaves the group and carries on from the Group step's output. A step inside the group with nothing connected does the same.").into_any_element());
+            }
+            NodeKind::Group { graph, .. } => {
+                out.extend(self.group_settings(id, graph, cx));
             }
             NodeKind::Click { target, button, .. } => {
                 out.push(self.target_row(id, *target, cx).into_any_element());
@@ -2190,9 +2862,19 @@ impl MacroApp {
                 preview,
                 w,
                 h,
+                numbers_only,
                 ..
             } => {
-                out.extend(self.read_text_settings(id, *compare, *case_sensitive, preview.clone(), *w, *h, cx));
+                out.extend(self.read_text_settings(
+                    id,
+                    *compare,
+                    *case_sensitive,
+                    *numbers_only,
+                    preview.clone(),
+                    *w,
+                    *h,
+                    cx,
+                ));
             }
             NodeKind::Loop { .. } => {
                 out.push(self.num_field("Times (0 = forever)", Field::LoopCount, 1.0, cx).into_any_element());
@@ -2457,14 +3139,71 @@ impl MacroApp {
                     move |this, _: &ClickEvent, _, cx| this.choose_template(id, cx),
                 )))
                 .child(small_btn("test", "Test now").on_click(cx.listener(
-                    move |this, _: &ClickEvent, _, cx| {
-                        this.start_test(id);
+                    move |this, _: &ClickEvent, window, cx| {
+                        this.start_test(id, window);
                         cx.notify();
                     },
                 )))
                 .into_any_element(),
         );
         out.push(self.num_field("Snip size (pt)", Field::SnipSize, 8.0, cx).into_any_element());
+
+        // Where to look.
+        let area = match self.doc.node(id).map(|n| &n.kind) {
+            Some(NodeKind::FindImage { search_area, .. }) => *search_area,
+            _ => None,
+        };
+        out.push(div().h(px(4.)).into_any_element());
+        out.push(
+            labeled(
+                "Look in",
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .gap_1()
+                    .child(chip("area-whole", "Whole screen", area.is_none()).on_click(cx.listener(
+                        move |this, _: &ClickEvent, _, cx| {
+                            this.update_node(id, |k| {
+                                if let NodeKind::FindImage { search_area, .. } = k {
+                                    *search_area = None;
+                                }
+                            });
+                            cx.notify();
+                        },
+                    )))
+                    .child(chip("area-part", "One area", area.is_some()).on_click(cx.listener(
+                        move |this, ev: &ClickEvent, window, cx| {
+                            this.start_area(AreaPurpose::SearchArea(id), ev.modifiers().shift, window, cx);
+                            cx.notify();
+                        },
+                    ))),
+            )
+            .into_any_element(),
+        );
+        match area {
+            Some(r) => {
+                out.push(
+                    help(&format!(
+                        "Only looking inside {} × {} at ({}, {}). Much faster than the whole screen.",
+                        r.w, r.h, r.x, r.y
+                    ))
+                    .into_any_element(),
+                );
+                out.push(
+                    small_btn("area-reselect", "Select search area again")
+                        .on_click(cx.listener(move |this, ev: &ClickEvent, window, cx| {
+                            this.start_area(AreaPurpose::SearchArea(id), ev.modifiers().shift, window, cx);
+                            cx.notify();
+                        }))
+                        .into_any_element(),
+                );
+            }
+            None => out.push(
+                help("Tip: if the image always appears in the same part of the screen, choose “One area” and drag a box around that part. Searching is much faster and won't match things elsewhere.")
+                    .into_any_element(),
+            ),
+        }
+        out.push(div().h(px(4.)).into_any_element());
         out.push(self.num_field("Match threshold", Field::Threshold, 0.01, cx).into_any_element());
         out.push(self.num_field("Keep looking for (ms)", Field::Timeout, 500.0, cx).into_any_element());
         out.push(self.num_field("Check every (ms)", Field::Interval, 50.0, cx).into_any_element());
@@ -2481,6 +3220,140 @@ impl MacroApp {
                 .into_any_element(),
         );
         out.push(help("Follows “found” as soon as the image appears, or “not found” after the time runs out. Later Click / Move steps can aim at the found image (set Where → Found image). Threshold 0.85 is a good start; lower it if it misses, raise it if it finds the wrong thing.").into_any_element());
+        out
+    }
+
+    fn group_settings(&self, id: u64, graph: &Graph, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let mut out: Vec<AnyElement> = Vec::new();
+        out.push(self.text_field("Group name", Field::GroupName, cx).into_any_element());
+        out.push(
+            div()
+                .flex()
+                .flex_wrap()
+                .gap_1()
+                .child(small_btn("grp-open", "Open group").on_click(cx.listener(
+                    move |this, _: &ClickEvent, _, cx| {
+                        this.enter_group(id);
+                        cx.notify();
+                    },
+                )))
+                .child(small_btn("grp-ungroup", "Ungroup").on_click(cx.listener(
+                    |this, _: &ClickEvent, _, cx| {
+                        this.ungroup_selected();
+                        cx.notify();
+                    },
+                )))
+                .into_any_element(),
+        );
+        out.push(help("Double-click the group (or press Enter) to open it. Ungroup puts the steps back where the group is.").into_any_element());
+        out.push(div().h(px(4.)).into_any_element());
+        out.push(section_title("Steps inside").into_any_element());
+        let start = graph
+            .nodes
+            .iter()
+            .find(|n| matches!(n.kind, NodeKind::GroupIn))
+            .map(|n| n.id);
+        let mut listed: Vec<u64> = Vec::new();
+        if let Some(s) = start {
+            for sid in graph.chain_from(s) {
+                if let Some(n) = graph.nodes.iter().find(|n| n.id == sid) {
+                    if !matches!(n.kind, NodeKind::GroupIn | NodeKind::GroupOut) {
+                        listed.push(sid);
+                    }
+                }
+            }
+        }
+        // Anything not on the main line (e.g. branches) goes at the end.
+        for n in &graph.nodes {
+            if !listed.contains(&n.id) && !matches!(n.kind, NodeKind::GroupIn | NodeKind::GroupOut) {
+                listed.push(n.id);
+            }
+        }
+        if listed.is_empty() {
+            out.push(help("This group is empty. Open it and add steps.").into_any_element());
+        }
+        for (i, sid) in listed.iter().enumerate() {
+            let Some(n) = graph.nodes.iter().find(|n| n.id == *sid) else { continue };
+            out.push(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .py_0p5()
+                    .child(
+                        div()
+                            .w(px(18.))
+                            .text_xs()
+                            .text_color(rgb(MUTED))
+                            .child(format!("{}", i + 1)),
+                    )
+                    .child(div().size(px(8.)).flex_none().rounded_full().bg(rgb(n.kind.color())))
+                    .child(div().flex_none().text_xs().child(n.kind.title()))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .text_xs()
+                            .text_color(rgb(MUTED))
+                            .truncate()
+                            .child(n.kind.summary()),
+                    )
+                    .into_any_element(),
+            );
+        }
+        out
+    }
+
+    fn multi_settings(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let ids = self.selection();
+        let mut out: Vec<AnyElement> = vec![
+            div()
+                .text_base()
+                .font_weight(FontWeight::BOLD)
+                .child(format!("{} steps selected", ids.len()))
+                .into_any_element(),
+            small_btn("multi-group", "Group these steps")
+                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                    this.group_selection();
+                    cx.notify();
+                }))
+                .into_any_element(),
+            small_btn("multi-delete", "Delete these steps")
+                .text_color(rgb(RED))
+                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                    this.delete_selected();
+                    cx.notify();
+                }))
+                .into_any_element(),
+            help(&format!(
+                "Grouping needs the steps to be one straight line, each connected to the next. Shift-click or Shift-drag to add steps · {}G groups · Shift+{}G ungroups.",
+                SHORTCUT_KEY, SHORTCUT_KEY
+            ))
+            .into_any_element(),
+            div().h(px(4.)).into_any_element(),
+        ];
+        for id in ids {
+            if let Some(n) = self.doc.node(id) {
+                out.push(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(div().size(px(8.)).flex_none().rounded_full().bg(rgb(n.kind.color())))
+                        .child(div().text_xs().child(n.kind.title()))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.))
+                                .text_xs()
+                                .text_color(rgb(MUTED))
+                                .truncate()
+                                .child(n.kind.summary()),
+                        )
+                        .into_any_element(),
+                );
+            }
+        }
         out
     }
 
@@ -2644,6 +3517,7 @@ impl MacroApp {
         id: u64,
         compare: TextCompare,
         case_sensitive: bool,
+        numbers_only: bool,
         preview: Option<PathBuf>,
         w: i32,
         h: i32,
@@ -2688,8 +3562,8 @@ impl MacroApp {
                     },
                 )))
                 .child(small_btn("area-read", "Read now").on_click(cx.listener(
-                    move |this, _: &ClickEvent, _, cx| {
-                        this.start_read_test(id);
+                    move |this, _: &ClickEvent, window, cx| {
+                        this.start_read_test(id, window);
                         cx.notify();
                     },
                 )))
@@ -2726,6 +3600,25 @@ impl MacroApp {
             let label = if compare.is_number() { "Compare with (number)" } else { "Compare with" };
             out.push(self.text_field(label, Field::CompareValue, cx).into_any_element());
         }
+        if compare.is_number() {
+            out.push(
+                help("Reading as a number: misread digits like O→0 and l→1 are fixed, and split digits are joined.")
+                    .into_any_element(),
+            );
+        } else {
+            out.push(
+                chip("rt-numbers", "Only read a number", numbers_only)
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        this.update_node(id, |k| {
+                            if let NodeKind::ReadText { numbers_only, .. } = k {
+                                *numbers_only = !*numbers_only;
+                            }
+                        });
+                        cx.notify();
+                    }))
+                    .into_any_element(),
+            );
+        }
         if !compare.is_number() && compare.needs_value() {
             out.push(
                 chip("rt-case", "Match case", case_sensitive)
@@ -2750,6 +3643,7 @@ impl MacroApp {
             "“match” if the text passes, otherwise “no match”. Keep reading 0 = read once; set it higher to wait for the text to appear."
         };
         out.push(help(explain).into_any_element());
+        out.push(help("For the best results, draw the box tightly around just the text or number, with a little space round it. Leave out icons and labels. If “Read now” says the reads disagreed, try a slightly bigger or tighter box.").into_any_element());
         out.push(help("Type text steps can type what was read with {text}. Make sure MacroFlow isn't covering the area when the macro runs.").into_any_element());
         out
     }
@@ -2828,18 +3722,12 @@ impl Render for MacroApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .relative()
-            .track_focus(&self.focus)
             .on_action(cx.listener(Self::on_quit))
             .on_key_down(cx.listener(Self::on_key))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
             .on_mouse_up(
                 MouseButton::Left,
-                cx.listener(|this, _: &MouseUpEvent, _, cx| {
-                    if this.drag != Drag::None {
-                        this.drag = Drag::None;
-                        cx.notify();
-                    }
-                }),
+                cx.listener(|this, ev: &MouseUpEvent, _, cx| this.finish_drag(ev.position, cx)),
             )
             .size_full()
             .flex()
@@ -2849,7 +3737,11 @@ impl Render for MacroApp {
             .text_sm()
             .child(self.render_titlebar(window, cx))
             .child(
+                // Keyboard focus lives here, not on the whole window: an element that
+                // takes focus claims every mouse press inside it, and on Windows that
+                // stopped the title bar from dragging the window.
                 div()
+                    .track_focus(&self.focus)
                     .flex_1()
                     .min_h_0()
                     .flex()
@@ -3006,9 +3898,14 @@ fn divider() -> Div {
 }
 
 #[cfg(target_os = "macos")]
-const SHORTCUT_TIP: &str = "⌘S save · ⌘O open · ⌘D duplicate · ⌫ delete step · ⌘R run · ⌘B show/hide panel";
+const SHORTCUT_KEY: &str = "⌘";
 #[cfg(not(target_os = "macos"))]
-const SHORTCUT_TIP: &str = "Ctrl+S save · Ctrl+O open · Ctrl+D duplicate · Delete removes a step · Ctrl+R run · Ctrl+B show/hide panel";
+const SHORTCUT_KEY: &str = "Ctrl+";
+
+#[cfg(target_os = "macos")]
+const SHORTCUT_TIP: &str = "⌘S save · ⌘O open · ⌘D duplicate · ⌫ delete step · ⌘R run · ⌘B show/hide panel · ⌘G group · ⇧⌘G ungroup";
+#[cfg(not(target_os = "macos"))]
+const SHORTCUT_TIP: &str = "Ctrl+S save · Ctrl+O open · Ctrl+D duplicate · Delete removes a step · Ctrl+R run · Ctrl+B show/hide panel · Ctrl+G group · Ctrl+Shift+G ungroup";
 
 /// Bring MacroFlow back (un-minimise it) after selecting an area.
 fn show_again(window: &mut Window, cx: &mut Context<MacroApp>) {
@@ -3051,6 +3948,9 @@ fn step_blurb(k: &NodeKind) -> &'static str {
         NodeKind::Wait { .. } => "Pause, with optional randomness",
         NodeKind::Loop { .. } => "Repeat a branch N times",
         NodeKind::End => "Stop the macro",
+        NodeKind::Group { .. } => "An empty group to fill with steps",
+        NodeKind::GroupIn => "Where a group starts",
+        NodeKind::GroupOut => "Leave the group and carry on",
         NodeKind::Recording { .. } => "Empty recording to fill or edit",
     }
 }
@@ -3122,6 +4022,30 @@ fn sidebar_icon(open: bool) -> Div {
         )
 }
 
+/// A button for the floating selection bar.
+fn bar_btn(id: &'static str, label: &'static str, primary: bool) -> Stateful<Div> {
+    let (bg, hover, fg) = if primary {
+        (GROUP_COLOR, 0x8aa3ff, 0x0b1020)
+    } else {
+        (BTN, BTN_HOVER, TEXT)
+    };
+    div()
+        .id(id)
+        .flex()
+        .flex_none()
+        .items_center()
+        .px_2p5()
+        .h(px(26.))
+        .rounded_md()
+        .bg(rgb(bg))
+        .text_xs()
+        .font_weight(FontWeight::SEMIBOLD)
+        .text_color(rgb(fg))
+        .cursor_pointer()
+        .hover(move |s| s.bg(rgb(hover)))
+        .child(label)
+}
+
 /// A quiet, borderless title bar button.
 fn ghost_btn(id: impl Into<ElementId>, label: &'static str, enabled: bool) -> Stateful<Div> {
     div()
@@ -3138,85 +4062,6 @@ fn ghost_btn(id: impl Into<ElementId>, label: &'static str, enabled: bool) -> St
         .child(label)
 }
 
-/// Minimise / maximise / close buttons for Windows (macOS has traffic lights).
-fn window_controls(is_maximized: bool) -> Div {
-    let cell = |id: &'static str, area: WindowControlArea| {
-        div()
-            .id(id)
-            .w(px(46.))
-            .h(px(TITLEBAR_H))
-            .flex()
-            .items_center()
-            .justify_center()
-            .window_control_area(area)
-    };
-    let max_icon = if is_maximized {
-        // "Restore": two overlapping squares.
-        div()
-            .relative()
-            .size(px(11.))
-            .child(
-                div()
-                    .absolute()
-                    .left(px(2.))
-                    .top_0()
-                    .size(px(8.))
-                    .border_1()
-                    .border_color(rgb(TEXT)),
-            )
-            .child(
-                div()
-                    .absolute()
-                    .left_0()
-                    .top(px(2.))
-                    .size(px(8.))
-                    .bg(rgb(TITLEBAR))
-                    .border_1()
-                    .border_color(rgb(TEXT)),
-            )
-    } else {
-        div().size(px(10.)).border_1().border_color(rgb(TEXT))
-    };
-    div()
-        .flex()
-        .flex_none()
-        .h_full()
-        .child(
-            cell("win-min", WindowControlArea::Min)
-                .hover(|s| s.bg(rgb(BTN_HOVER)))
-                .child(div().w(px(10.)).h(px(1.)).bg(rgb(TEXT))),
-        )
-        .child(
-            cell("win-max", WindowControlArea::Max)
-                .hover(|s| s.bg(rgb(BTN_HOVER)))
-                .child(max_icon),
-        )
-        .child(
-            cell("win-close", WindowControlArea::Close)
-                .hover(|s| s.bg(rgb(0xc42b1c)))
-                .child(
-                    canvas(
-                        |_, _, _| {},
-                        |bounds, _, window, _| {
-                            let x0 = f32::from(bounds.origin.x);
-                            let y0 = f32::from(bounds.origin.y);
-                            let w = f32::from(bounds.size.width);
-                            let h = f32::from(bounds.size.height);
-                            let color = hsla(TEXT);
-                            for (a, b) in [((x0, y0), (x0 + w, y0 + h)), ((x0 + w, y0), (x0, y0 + h))] {
-                                let mut p = PathBuilder::stroke(px(1.));
-                                p.move_to(point(px(a.0), px(a.1)));
-                                p.line_to(point(px(b.0), px(b.1)));
-                                if let Ok(path) = p.build() {
-                                    window.paint_path(path, color);
-                                }
-                            }
-                        },
-                    )
-                    .size(px(10.)),
-                ),
-        )
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AfterSave {
@@ -3237,293 +4082,24 @@ fn safe_file_name(name: &str) -> String {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Full-screen area selection
-// ---------------------------------------------------------------------------
-
-/// Open a borderless window covering the whole display, showing a frozen screenshot
-/// of it, so the user can drag a box anywhere on their screen.
-fn open_area_overlay(
-    shot: vision::Shot,
-    purpose: AreaPurpose,
-    tx: Sender<WorkerMsg>,
-    cx: &mut Context<MacroApp>,
-) -> Result<(), String> {
-    let displays = cx.displays();
-    let display = if IS_MACOS {
-        displays.iter().find(|d| u32::from(d.id()) == shot.monitor_id).cloned()
-    } else {
-        displays.get(shot.monitor_index).cloned()
-    }
-    .or_else(|| cx.primary_display())
-    .ok_or_else(|| "Couldn't find the display to select on.".to_string())?;
-
-    let options = WindowOptions {
-        window_bounds: Some(WindowBounds::Windowed(display.bounds())),
-        titlebar: None,
-        focus: true,
-        show: true,
-        kind: WindowKind::PopUp,
-        is_movable: false,
-        is_resizable: false,
-        is_minimizable: false,
-        display_id: Some(display.id()),
-        window_background: WindowBackgroundAppearance::Opaque,
-        ..Default::default()
+/// Maximise the window, or restore it if it's already maximised.
+#[cfg(target_os = "windows")]
+fn toggle_maximize(_window: &mut Window) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GetForegroundWindow, IsZoomed, ShowWindow, SW_MAXIMIZE, SW_RESTORE,
     };
-    cx.open_window(options, move |window, cx| {
-        cx.new(|cx| AreaOverlay::new(shot, purpose, tx, window, cx))
-    })
-    .map_err(|e| format!("Couldn't open the selection screen: {e}"))?;
-    cx.activate(true);
-    Ok(())
-}
-
-pub struct AreaOverlay {
-    focus: FocusHandle,
-    shot: vision::Shot,
-    purpose: AreaPurpose,
-    /// Corners of the box, in this window's coordinates.
-    start: Option<(f32, f32)>,
-    end: Option<(f32, f32)>,
-    dragging: bool,
-    done: bool,
-    tx: Sender<WorkerMsg>,
-}
-
-impl AreaOverlay {
-    fn new(
-        shot: vision::Shot,
-        purpose: AreaPurpose,
-        tx: Sender<WorkerMsg>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Self {
-        let focus = cx.focus_handle();
-        focus.focus(window);
-        // Closing this window any other way counts as cancelling.
-        let this = cx.weak_entity();
-        window.on_window_should_close(cx, move |_, cx| {
-            let _ = this.update(cx, |o, _| o.report(None));
-            true
-        });
-        AreaOverlay {
-            focus,
-            shot,
-            purpose,
-            start: None,
-            end: None,
-            dragging: false,
-            done: false,
-            tx,
-        }
-    }
-
-    fn rect(&self) -> Option<(f32, f32, f32, f32)> {
-        let (s, e) = (self.start?, self.end?);
-        Some((s.0.min(e.0), s.1.min(e.1), s.0.max(e.0), s.1.max(e.1)))
-    }
-
-    /// Tell MacroFlow what was picked (in screenshot coordinates), once.
-    fn report(&mut self, sel: Option<(f32, f32, f32, f32)>) {
-        if self.done {
+    // The button was just clicked, so MacroFlow is the foreground window.
+    unsafe {
+        let hwnd = GetForegroundWindow();
+        if hwnd.is_null() {
             return;
         }
-        self.done = true;
-        let _ = self.tx.send(WorkerMsg::AreaPicked {
-            purpose: self.purpose,
-            shot: self.shot.clone(),
-            sel,
-        });
-    }
-
-    fn finish(&mut self, confirm: bool, window: &mut Window) {
-        let sel = if confirm {
-            let vp = window.viewport_size();
-            let sx = self.shot.w as f32 / f32::from(vp.width).max(1.0);
-            let sy = self.shot.h as f32 / f32::from(vp.height).max(1.0);
-            self.rect()
-                .map(|(x0, y0, x1, y1)| (x0 * sx, y0 * sy, x1 * sx, y1 * sy))
-        } else {
-            None
-        };
-        self.report(sel);
-        window.remove_window();
+        let cmd = if IsZoomed(hwnd) != 0 { SW_RESTORE } else { SW_MAXIMIZE };
+        ShowWindow(hwnd, cmd);
     }
 }
 
-impl Render for AreaOverlay {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let vp = window.viewport_size();
-        let (vw, vh) = (f32::from(vp.width), f32::from(vp.height));
-        let what = match self.purpose {
-            AreaPurpose::ReadText(_) => "Drag a box around the text or number to read",
-            AreaPurpose::Template(_) => "Drag a box around the thing to find",
-        };
-        let pos = |p: Point<Pixels>| (f32::from(p.x), f32::from(p.y));
-        let dim = rgba(0x0000_0066);
-
-        let mut root = div()
-            .track_focus(&self.focus)
-            .relative()
-            .size_full()
-            .bg(rgb(BG))
-            .cursor_crosshair()
-            .on_key_down(cx.listener(|this, ev: &KeyDownEvent, window, _| {
-                if ev.keystroke.key == "escape" {
-                    this.finish(false, window);
-                }
-            }))
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
-                    let p = pos(ev.position);
-                    this.start = Some(p);
-                    this.end = Some(p);
-                    this.dragging = true;
-                    cx.notify();
-                }),
-            )
-            .on_mouse_down(
-                MouseButton::Right,
-                cx.listener(|this, _: &MouseDownEvent, window, _| this.finish(false, window)),
-            )
-            .on_mouse_move(cx.listener(move |this, ev: &MouseMoveEvent, _, cx| {
-                if this.dragging && ev.pressed_button == Some(MouseButton::Left) {
-                    this.end = Some(pos(ev.position));
-                    cx.notify();
-                }
-            }))
-            .on_mouse_up(
-                MouseButton::Left,
-                cx.listener(move |this, ev: &MouseUpEvent, window, cx| {
-                    if !this.dragging {
-                        return;
-                    }
-                    this.end = Some(pos(ev.position));
-                    this.dragging = false;
-                    match this.rect() {
-                        Some((x0, y0, x1, y1)) if x1 - x0 >= 4.0 && y1 - y0 >= 4.0 => {
-                            this.finish(true, window)
-                        }
-                        _ => {
-                            // A click rather than a drag – let them try again.
-                            this.start = None;
-                            this.end = None;
-                            cx.notify();
-                        }
-                    }
-                }),
-            )
-            // The frozen screen, at its real size, so it looks like your actual desktop.
-            .child(
-                img(self.shot.path.clone())
-                    .absolute()
-                    .top_0()
-                    .left_0()
-                    .size_full()
-                    .object_fit(ObjectFit::Fill),
-            );
-
-        match self.rect() {
-            None => {
-                root = root.child(div().absolute().top_0().left_0().size_full().bg(dim));
-            }
-            Some((x0, y0, x1, y1)) => {
-                // Dim everything except the box.
-                let shade = |l: f32, t: f32, w: f32, h: f32| {
-                    div()
-                        .absolute()
-                        .left(px(l))
-                        .top(px(t))
-                        .w(px(w.max(0.0)))
-                        .h(px(h.max(0.0)))
-                        .bg(dim)
-                };
-                let vp_sx = self.shot.w as f32 / vw.max(1.0);
-                let vp_sy = self.shot.h as f32 / vh.max(1.0);
-                root = root
-                    .child(shade(0.0, 0.0, vw, y0))
-                    .child(shade(0.0, y1, vw, vh - y1))
-                    .child(shade(0.0, y0, x0, y1 - y0))
-                    .child(shade(x1, y0, vw - x1, y1 - y0))
-                    .child(
-                        div()
-                            .absolute()
-                            .left(px(x0))
-                            .top(px(y0))
-                            .w(px(x1 - x0))
-                            .h(px(y1 - y0))
-                            .border_2()
-                            .border_color(rgb(ACCENT)),
-                    )
-                    .child(
-                        div()
-                            .absolute()
-                            .left(px(x0))
-                            .top(px(if y0 > 28.0 { y0 - 24.0 } else { y1 + 4.0 }))
-                            .px_1p5()
-                            .py_0p5()
-                            .rounded_sm()
-                            .bg(rgb(ACCENT))
-                            .text_xs()
-                            .text_color(rgb(0xffffff))
-                            .child(format!(
-                                "{:.0} × {:.0}",
-                                (x1 - x0) * vp_sx,
-                                (y1 - y0) * vp_sy
-                            )),
-                    );
-            }
-        }
-
-        // Instructions, top centre.
-        root.child(
-            div()
-                .absolute()
-                .top(px(if IS_MACOS { 46.0 } else { 24.0 }))
-                .left_0()
-                .w_full()
-                .flex()
-                .justify_center()
-                .child(
-                    div()
-                        .occlude()
-                        .flex()
-                        .items_center()
-                        .gap_3()
-                        .pl_4()
-                        .pr_1p5()
-                        .py_1p5()
-                        .rounded_lg()
-                        .bg(rgba(0x161922f2))
-                        .border_1()
-                        .border_color(rgb(BORDER))
-                        .shadow_lg()
-                        .text_sm()
-                        .text_color(rgb(TEXT))
-                        .cursor_default()
-                        .child(what)
-                        .child(div().text_color(rgb(MUTED)).child("Let go to confirm · Esc or right-click to cancel"))
-                        .child(
-                            div()
-                                .id("overlay-cancel")
-                                .px_3()
-                                .py_1()
-                                .rounded_md()
-                                .bg(rgb(BTN))
-                                .hover(|s| s.bg(rgb(BTN_HOVER)))
-                                .cursor_pointer()
-                                .child("Cancel")
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(|this, _: &MouseDownEvent, window, cx| {
-                                        cx.stop_propagation();
-                                        this.finish(false, window);
-                                    }),
-                                ),
-                        ),
-                ),
-        )
-    }
+#[cfg(not(target_os = "windows"))]
+fn toggle_maximize(window: &mut Window) {
+    window.zoom_window();
 }

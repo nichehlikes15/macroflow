@@ -30,3 +30,7 @@ opt-level = 3
 
 [profile.release]
 opt-level = 3
+
+# Windows only: maximise / restore from MacroFlow's own title bar buttons.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging"] }
