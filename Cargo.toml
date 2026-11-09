@@ -34,3 +34,5 @@ opt-level = 3
 # Windows only: maximise / restore from MacroFlow's own title bar buttons.
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging"] }
+# The same version GPUI uses, to get MacroFlow's own window handle.
+raw-window-handle = "0.6"

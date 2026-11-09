@@ -34,6 +34,12 @@ pub enum WorkerMsg {
     /// A box cut out of a screenshot was saved.
     Cropped { purpose: AreaPurpose, path: PathBuf },
     Windows(Vec<vision::WinInfo>),
+    /// F8 / F9 pressed anywhere.
+    Hotkey(Hotkey),
+    /// One line for the run log.
+    Log(LogEntry),
+    /// A position and the colour under it (for Pixel colour steps).
+    Pixel { x: i32, y: i32, color: u32 },
     /// The user finished (or cancelled) dragging a box on the screen.
     /// `sel` is (x0, y0, x1, y1) in the screenshot's display coordinates.
     AreaPicked {
@@ -134,6 +140,35 @@ fn countdown(tx: &Tx, stop: &AtomicBool, what: &str, secs: u32) -> Result<(), St
 // Playback
 // ---------------------------------------------------------------------------
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Hotkey {
+    /// F8: start the macro, or stop it if it's running.
+    StartStop,
+    /// F9: pause or resume a running macro.
+    Pause,
+    /// F10: run just the next step (or start the macro one step at a time).
+    Step,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LogLevel {
+    Step,
+    Info,
+    Good,
+    Warn,
+    Bad,
+}
+
+/// One line of the run log.
+#[derive(Clone, Debug)]
+pub struct LogEntry {
+    /// Milliseconds since the run started.
+    pub ms: u64,
+    pub step: Option<u64>,
+    pub text: String,
+    pub level: LogLevel,
+}
+
 /// Why a run of the macro ended, so the editor can highlight the step responsible.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RunEnd {
@@ -143,6 +178,16 @@ pub struct RunEnd {
     /// When it ended because this output of `step` isn't connected to anything.
     pub port: Option<usize>,
     pub kind: EndKind,
+    /// A screenshot taken when a step went wrong.
+    pub screenshot: Option<PathBuf>,
+}
+
+impl RunEnd {
+    /// Ended in a way you probably didn't intend: an error, or a path with nothing
+    /// connected (rather than an End step, or you pressing Stop).
+    pub fn unexpected(&self) -> bool {
+        self.kind == EndKind::Error || (self.kind == EndKind::Finished && self.port.is_some())
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -163,22 +208,151 @@ enum EndAt {
     Dangling(u64, usize),
 }
 
-pub fn run_macro(doc: Macro, tx: Tx, stop: Arc<AtomicBool>) {
-    thread::spawn(move || {
-        let end = match Runner::new(&doc, &tx, stop.clone()) {
-            Ok(mut r) => {
-                let result = r.run();
-                r.describe_end(result)
+/// The name of the thread that plays macros (the crash handler knows panics there are
+/// already reported).
+pub const RUN_THREAD: &str = "macroflow-run";
+
+/// Play the macro. With `from`, start at that step instead of Start and run once.
+/// `paused` pauses playback while it's set (F9). While `step_mode` is set, it pauses
+/// before every step (F10 runs one).
+pub fn run_macro(
+    doc: Macro,
+    tx: Tx,
+    stop: Arc<AtomicBool>,
+    paused: Arc<AtomicBool>,
+    step_mode: Arc<AtomicBool>,
+    from: Option<u64>,
+) {
+    // The playback thread gets its own copy of `tx`, so the one here can still report
+    // a failure to start it.
+    let thread_tx = tx.clone();
+    let spawned = thread::Builder::new().name(RUN_THREAD.into()).spawn(move || {
+        let tx = thread_tx;
+        let t0 = Instant::now();
+        let last_step = Arc::new(AtomicU64::new(0));
+        let tracked = last_step.clone();
+        // Catch crashes inside playback, so they're reported instead of killing MacroFlow.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            match Runner::new(&doc, &tx, stop.clone(), paused.clone(), step_mode.clone(), tracked) {
+                Ok(mut r) => {
+                    let result = r.run(from);
+                    r.describe_end(result)
+                }
+                Err(e) => RunEnd {
+                    message: e,
+                    step: None,
+                    port: None,
+                    kind: EndKind::Error,
+                    screenshot: None,
+                },
             }
-            Err(e) => RunEnd {
-                message: e,
-                step: None,
+        }));
+        let mut end = result.unwrap_or_else(|panic| {
+            let why = panic
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| panic.downcast_ref::<&str>().map(|s| s.to_string()))
+                .unwrap_or_else(|| "unknown error".into());
+            let step = match last_step.load(Ordering::Relaxed) {
+                0 => None,
+                id => Some(id),
+            };
+            RunEnd {
+                message: format!("MacroFlow hit an internal error while running ({why}). Please report this."),
+                step,
                 port: None,
                 kind: EndKind::Error,
-            },
-        };
+                screenshot: None,
+            }
+        });
+        if end.kind == EndKind::Error {
+            end.screenshot = failure_screenshot();
+        }
+        let ms = t0.elapsed().as_millis() as u64;
+        send(
+            &tx,
+            WorkerMsg::Log(LogEntry {
+                ms,
+                step: end.step,
+                text: end.message.clone(),
+                level: match end.kind {
+                    EndKind::Error => LogLevel::Bad,
+                    EndKind::Stopped => LogLevel::Warn,
+                    EndKind::Finished if end.unexpected() => LogLevel::Warn,
+                    EndKind::Finished => LogLevel::Good,
+                },
+            }),
+        );
+        if doc.alert_on_stop && end.unexpected() {
+            alert(&end);
+        }
         send(&tx, WorkerMsg::Active(None));
         send(&tx, WorkerMsg::RunFinished(end));
+    });
+    if let Err(e) = spawned {
+        send(&tx, WorkerMsg::Failed(format!("Couldn't start the macro: {e}")));
+    }
+}
+
+/// Show a red pop-up saying why the macro stopped.
+fn alert(end: &RunEnd) {
+    let title = if end.kind == EndKind::Error {
+        "Macro stopped – something went wrong"
+    } else {
+        "Macro stopped unexpectedly"
+    };
+    let toast = vision::Toast {
+        title: title.into(),
+        message: end.message.clone(),
+        style: "error",
+        position: "top-center",
+        duration_ms: 9000,
+        wait: false,
+        sound: true,
+    };
+    // The pop-up is its own little program, so it's fine to let it run on its own.
+    let _ = vision::show_notification(&toast);
+}
+
+/// Save a screenshot of the screen the mouse is on, for the run log.
+fn failure_screenshot() -> Option<PathBuf> {
+    let (x, y) = device().ok().map(|d| d.get_mouse().coords).unwrap_or((0, 0));
+    let shot = vision::screenshot_display_at(x, y).ok()?;
+    let dir = images_dir();
+    std::fs::create_dir_all(&dir).ok()?;
+    let path = dir.join(format!("failed-{}.png", now_ms()));
+    if std::fs::copy(&shot.path, &path).is_err() {
+        let _ = std::fs::remove_file(&shot.path);
+        return None;
+    }
+    let _ = std::fs::remove_file(&shot.path);
+    Some(path)
+}
+
+/// Watch for F8 (start / stop) and F9 (pause / resume) in any app.
+pub fn spawn_hotkeys(tx: Tx) {
+    let _ = thread::Builder::new().name("macroflow-hotkeys".into()).spawn(move || {
+        let Ok(ds) = device() else {
+            return;
+        };
+        let (mut f8, mut f9, mut f10) = (false, false, false);
+        loop {
+            let keys = ds.get_keys();
+            let now8 = keys.contains(&Keycode::F8);
+            let now9 = keys.contains(&Keycode::F9);
+            let now10 = keys.contains(&Keycode::F10);
+            for (now, before, key) in [
+                (now8, f8, Hotkey::StartStop),
+                (now9, f9, Hotkey::Pause),
+                (now10, f10, Hotkey::Step),
+            ] {
+                if now && !before && tx.send(WorkerMsg::Hotkey(key)).is_err() {
+                    return;
+                }
+            }
+            (f8, f9, f10) = (now8, now9, now10);
+            thread::sleep(Duration::from_millis(40));
+        }
     });
 }
 
@@ -200,6 +374,23 @@ struct Runner<'a> {
     ended_at: Option<EndAt>,
     /// Where each mouse step last went, so a random spot is never repeated.
     last_points: HashMap<u64, (i32, i32)>,
+    /// Variables set by Set variable / Read text steps (also `text`, `run`, `found_x`, `found_y`).
+    vars: HashMap<String, String>,
+    /// Pause playback while this is set (F9).
+    paused: Arc<AtomicBool>,
+    /// When the run started (for the log).
+    started: Instant,
+    /// The step running now, shared with the crash handler.
+    last_step: Arc<AtomicU64>,
+    /// How much bigger things are on this screen than when the macro was made
+    /// (Find image resizes its picture to match).
+    scale: f64,
+    /// Pause before every step (step-by-step mode).
+    step_mode: Arc<AtomicBool>,
+    /// Set by the watcher when the mouse is pushed into a screen corner.
+    failsafe_hit: Arc<AtomicBool>,
+    /// Where the macro itself last put the mouse (so it doesn't trip the failsafe).
+    last_auto: Arc<AtomicU64>,
     loops: HashMap<u64, u32>,
     held_keys: Vec<Key>,
     held_buttons: Vec<Button>,
@@ -209,11 +400,25 @@ struct Runner<'a> {
 }
 
 impl<'a> Runner<'a> {
-    fn new(doc: &'a Macro, tx: &'a Tx, stop: Arc<AtomicBool>) -> Result<Self, String> {
+    fn new(
+        doc: &'a Macro,
+        tx: &'a Tx,
+        stop: Arc<AtomicBool>,
+        paused: Arc<AtomicBool>,
+        step_mode: Arc<AtomicBool>,
+        last_step: Arc<AtomicU64>,
+    ) -> Result<Self, String> {
         let enigo = Enigo::new(&Settings::default()).map_err(input_err)?;
         let suppress_esc_until = Arc::new(AtomicU64::new(0));
         let watch_done = Arc::new(AtomicBool::new(false));
-        spawn_esc_watch(stop.clone(), watch_done.clone(), suppress_esc_until.clone());
+        let failsafe_hit = Arc::new(AtomicBool::new(false));
+        let last_auto = Arc::new(AtomicU64::new(NO_POINT));
+        spawn_esc_watch(
+            stop.clone(),
+            watch_done.clone(),
+            suppress_esc_until.clone(),
+            doc.failsafe.then(|| (failsafe_hit.clone(), last_auto.clone())),
+        );
         Ok(Runner {
             doc,
             tx,
@@ -226,6 +431,14 @@ impl<'a> Runner<'a> {
             current: None,
             ended_at: None,
             last_points: HashMap::new(),
+            vars: HashMap::new(),
+            paused,
+            started: Instant::now(),
+            last_step,
+            scale: 1.0,
+            step_mode,
+            failsafe_hit,
+            last_auto,
             loops: HashMap::new(),
             held_keys: Vec::new(),
             held_buttons: Vec::new(),
@@ -235,8 +448,46 @@ impl<'a> Runner<'a> {
         })
     }
 
+    /// Wait `ms` (not counting time spent paused). Returns early if the macro is stopped.
     fn sleep(&self, ms: u64) -> Result<(), String> {
-        sleep_checked(ms, &self.stop)
+        let mut left = Duration::from_millis(ms);
+        let mut announced = false;
+        loop {
+            if self.stop.load(Ordering::Relaxed) {
+                return Err(STOPPED.into());
+            }
+            if self.paused.load(Ordering::Relaxed) {
+                if !announced {
+                    self.status("❚❚ Paused – press F9 (or Resume) to carry on, Esc or F8 to stop".into());
+                    announced = true;
+                }
+                thread::sleep(Duration::from_millis(20));
+                continue;
+            }
+            if left.is_zero() {
+                return Ok(());
+            }
+            let chunk = left.min(Duration::from_millis(10));
+            thread::sleep(chunk);
+            left -= chunk;
+        }
+    }
+
+    fn log(&self, level: LogLevel, text: String) {
+        send(
+            self.tx,
+            WorkerMsg::Log(LogEntry {
+                ms: self.started.elapsed().as_millis() as u64,
+                step: self.current,
+                text,
+                level,
+            }),
+        );
+    }
+
+    /// How to turn saved positions into positions on this screen right now.
+    fn mapping(&self) -> Result<Option<Mapping>, String> {
+        vision::current_mapping(self.doc.reference, self.doc.anchor.as_ref())
     }
 
     /// Apply the macro's global speed to a delay.
@@ -259,14 +510,22 @@ impl<'a> Runner<'a> {
         send(self.tx, WorkerMsg::Status(s));
     }
 
-    /// Run the macro. Returns how many times it ran.
-    fn run(&mut self) -> Result<u32, String> {
-        let start = self
-            .doc
-            .start_id()
-            .ok_or_else(|| "Add a Start step first.".to_string())?;
+    /// Run the macro (or, with `from`, once from that step). Returns how many times it ran.
+    fn run(&mut self, from: Option<u64>) -> Result<u32, String> {
+        let start = match from {
+            Some(f) => {
+                self.doc
+                    .node(f)
+                    .ok_or_else(|| "That step no longer exists.".to_string())?;
+                f
+            }
+            None => self
+                .doc
+                .start_id()
+                .ok_or_else(|| "Add a Start step first.".to_string())?,
+        };
         self.current = Some(start);
-        if self.doc.next(start, 0).is_none() {
+        if from.is_none() && self.doc.next(start, 0).is_none() {
             return Err("Connect the Start step to your first step (drag from its right-hand dot).".into());
         }
         let wait = self.doc.start_delay_ms;
@@ -277,10 +536,32 @@ impl<'a> Runner<'a> {
             ));
             self.sleep(wait)?;
         }
+        if from.is_some() {
+            // Run from this step; when it's inside a group, carry on after the group
+            // (and after any groups around that) like a normal run would.
+            let mut first = true;
+            let path = self.doc.root.path_to(start).unwrap_or_default();
+            let mut exit = self.walk(start, 1, 1, &mut first)?;
+            for gid in path.iter().rev() {
+                if let Exit::Ended = exit {
+                    break;
+                }
+                self.current = Some(*gid);
+                match self.doc.next(*gid, 0) {
+                    Some(next) => exit = self.walk(next, 1, 1, &mut first)?,
+                    None => {
+                        self.ended_at = Some(EndAt::Dangling(*gid, 0));
+                        break;
+                    }
+                }
+            }
+            return Ok(1);
+        }
         let total = self.doc.repeat;
         let mut iteration = 0u32;
         loop {
             iteration += 1;
+            self.vars.insert("run".into(), iteration.to_string());
             self.loops.clear();
             let mut first = true;
             self.walk(start, iteration, total, &mut first)?;
@@ -296,10 +577,7 @@ impl<'a> Runner<'a> {
         let Some(n) = self.doc.node(id) else {
             return "a step".into();
         };
-        let title = match &n.kind {
-            NodeKind::Group { name, .. } if !name.trim().is_empty() => name.trim().to_string(),
-            k => k.title().to_string(),
-        };
+        let title = n.label();
         if n.note.trim().is_empty() {
             format!("“{title}”")
         } else {
@@ -322,6 +600,7 @@ impl<'a> Runner<'a> {
                         step: Some(id),
                         port: None,
                         kind: EndKind::Finished,
+                        screenshot: None,
                     },
                     Some(EndAt::Dangling(id, port)) => {
                         let outputs = self.doc.node(id).map(|n| n.kind.outputs()).unwrap_or(&[]);
@@ -337,6 +616,7 @@ impl<'a> Runner<'a> {
                             step: Some(id),
                             port: Some(port),
                             kind: EndKind::Finished,
+                            screenshot: None,
                         }
                     }
                     None => RunEnd {
@@ -344,17 +624,24 @@ impl<'a> Runner<'a> {
                         step: None,
                         port: None,
                         kind: EndKind::Finished,
+                        screenshot: None,
                     },
                 }
             }
             Err(e) if e == STOPPED => RunEnd {
-                message: match self.current {
-                    Some(id) => format!("Stopped by you during {}.", self.step_label(id)),
-                    None => "Stopped by you.".into(),
+                message: match (self.failsafe_hit.load(Ordering::Relaxed), self.current) {
+                    (true, Some(id)) => format!(
+                        "Stopped by the failsafe during {}: the mouse was pushed into a corner of the screen.",
+                        self.step_label(id)
+                    ),
+                    (true, None) => "Stopped by the failsafe: the mouse was pushed into a corner of the screen.".into(),
+                    (false, Some(id)) => format!("Stopped by you during {}.", self.step_label(id)),
+                    (false, None) => "Stopped by you.".into(),
                 },
                 step: self.current,
                 port: None,
                 kind: EndKind::Stopped,
+                screenshot: None,
             },
             Err(e) => RunEnd {
                 message: match self.current {
@@ -364,6 +651,7 @@ impl<'a> Runner<'a> {
                 step: self.current,
                 port: None,
                 kind: EndKind::Error,
+                screenshot: None,
             },
         }
     }
@@ -393,8 +681,29 @@ impl<'a> Runner<'a> {
                 NodeKind::GroupOut => return Ok(Exit::LeftGroup),
                 _ => {}
             }
+            // Hold here while paused.
+            self.sleep(0)?;
             send(self.tx, WorkerMsg::Active(Some(id)));
             self.current = Some(id);
+            self.last_step.store(id, Ordering::Relaxed);
+            // Breakpoints and step-by-step mode pause *before* the step runs.
+            let stepping = self.step_mode.load(Ordering::Relaxed);
+            if node.breakpoint || stepping {
+                let why = if node.breakpoint { "Breakpoint" } else { "Step by step" };
+                self.paused.store(true, Ordering::Relaxed);
+                self.log(LogLevel::Warn, format!("⏸ {why} – paused before “{}”", node.label()));
+                self.status(format!(
+                    "⏸ {why} – paused before “{}”.  F10 / Step runs it · F9 / Resume carries on · Esc stops",
+                    node.label()
+                ));
+                while self.paused.load(Ordering::Relaxed) {
+                    if self.stop.load(Ordering::Relaxed) {
+                        return Err(STOPPED.into());
+                    }
+                    thread::sleep(Duration::from_millis(20));
+                }
+            }
+            self.log(LogLevel::Step, node.label());
             let of = if total == 0 {
                 String::new()
             } else {
@@ -405,10 +714,7 @@ impl<'a> Runner<'a> {
             } else {
                 format!(" – {}", node.note)
             };
-            let title = match &node.kind {
-                NodeKind::Group { name, .. } if !name.trim().is_empty() => name.trim().to_string(),
-                k => k.title().to_string(),
-            };
+            let title = node.label();
             self.status(format!("▶ Run {iteration}{of}: {title}{note}   (Esc to stop)"));
             let step_gap = if *first { 0 } else { self.doc.step_delay_ms };
             self.sleep(self.scaled(node.delay_ms + step_gap))?;
@@ -436,8 +742,24 @@ impl<'a> Runner<'a> {
                 self.ended_at = Some(EndAt::EndStep(id));
                 return Ok(Exit::Ended);
             }
+            // Positions saved for another screen size, or relative to a window, are
+            // converted to this screen right now.
+            let mut node = node;
+            self.scale = 1.0;
+            let needs_mapping = uses_screen_positions(&node.kind) || matches!(node.kind, NodeKind::FindImage { .. });
+            if (self.doc.anchor.is_some() || self.doc.reference.is_some()) && needs_mapping {
+                if let Some(m) = self.mapping()? {
+                    map_kind(&mut node.kind, &m);
+                    self.scale = m.scale();
+                }
+            }
             match self.exec(&node)? {
                 Some(p) => {
+                    let outputs = node.kind.outputs();
+                    if outputs.len() > 1 {
+                        let level = if p == 0 { LogLevel::Good } else { LogLevel::Warn };
+                        self.log(level, format!("→ {}", outputs.get(p).copied().unwrap_or("?")));
+                    }
                     cur = self.doc.next(id, p);
                     if cur.is_none() {
                         self.ended_at = Some(EndAt::Dangling(id, p));
@@ -453,9 +775,14 @@ impl<'a> Runner<'a> {
         Ok(Exit::LeftGroup)
     }
 
-    /// Put what the last Read text step read wherever `{text}` appears.
+    /// Put variables (and what the last Read text step read, as `{text}`) into text.
     fn fill_text(&self, s: &str) -> String {
-        s.replace("{text}", self.last_text.as_deref().unwrap_or(""))
+        fill_vars(s, &self.vars)
+    }
+
+    fn set_last_text(&mut self, t: String) {
+        self.vars.insert("text".into(), t.clone());
+        self.last_text = Some(t);
     }
 
     /// A random number from 0 to 1.
@@ -520,8 +847,73 @@ impl<'a> Runner<'a> {
         unreachable!("the loop always returns")
     }
 
+    /// Move the mouse to (x, y): along a curved, human-like path if that's turned
+    /// on, otherwise straight there.
     fn move_to(&mut self, x: i32, y: i32) -> Result<(), String> {
+        if self.doc.human_mouse {
+            if let Ok(from) = self.enigo.location() {
+                let (dx, dy) = ((x - from.0) as f64, (y - from.1) as f64);
+                let dist = (dx * dx + dy * dy).sqrt();
+                if dist >= 3.0 {
+                    // Longer moves take longer, like a real hand, with some variation.
+                    let speed = self.doc.mouse_speed.clamp(10, 1000) as f64 / 100.0;
+                    let ms = (120.0 + dist * 0.35).min(1200.0) * (0.8 + 0.4 * self.unit()) / speed;
+                    self.glide(from, (x, y), ms, true)?;
+                }
+            }
+        }
+        self.jump_to(x, y)
+    }
+
+    /// Put the mouse straight at (x, y).
+    fn jump_to(&mut self, x: i32, y: i32) -> Result<(), String> {
+        self.last_auto.store(pack_point(x, y), Ordering::Relaxed);
         self.enigo.move_mouse(x, y, Coordinate::Abs).map_err(input_err)
+    }
+
+    /// Move the mouse from `from` to `to` over `ms`, easing in and out. With `curved`,
+    /// along a gently bent path (a different bend every time); otherwise in a line.
+    fn glide(&mut self, from: (i32, i32), to: (i32, i32), ms: f64, curved: bool) -> Result<(), String> {
+        let (sx, sy) = (from.0 as f64, from.1 as f64);
+        let (ex, ey) = (to.0 as f64, to.1 as f64);
+        let (dx, dy) = (ex - sx, ey - sy);
+        let dist = (dx * dx + dy * dy).sqrt().max(1.0);
+        let (c1, c2) = if curved {
+            // Bend sideways by 5–17% of the distance, to a random side.
+            let (nx, ny) = (-dy / dist, dx / dist);
+            let side = if self.unit() < 0.5 { -1.0 } else { 1.0 };
+            let bend = dist * (0.05 + 0.12 * self.unit()) * side;
+            let bend2 = bend * (0.3 + 0.7 * self.unit());
+            (
+                (sx + dx * 0.3 + nx * bend, sy + dy * 0.3 + ny * bend),
+                (sx + dx * 0.7 + nx * bend2, sy + dy * 0.7 + ny * bend2),
+            )
+        } else {
+            ((sx + dx / 3.0, sy + dy / 3.0), (sx + dx * 2.0 / 3.0, sy + dy * 2.0 / 3.0))
+        };
+        let ms = ms.clamp(0.0, 10_000.0);
+        let steps = ((ms / 8.0).round() as usize).clamp(4, 400);
+        let pause = Duration::from_micros((ms * 1000.0 / steps as f64) as u64);
+        let mut last = from;
+        for i in 1..=steps {
+            let t = i as f64 / steps as f64;
+            let e = t * t * (3.0 - 2.0 * t); // slow start, fast middle, slow end
+            let u = 1.0 - e;
+            let px = u * u * u * sx + 3.0 * u * u * e * c1.0 + 3.0 * u * e * e * c2.0 + e * e * e * ex;
+            let py = u * u * u * sy + 3.0 * u * u * e * c1.1 + 3.0 * u * e * e * c2.1 + e * e * e * ey;
+            let p = (px.round() as i32, py.round() as i32);
+            if p != last {
+                self.jump_to(p.0, p.1)?;
+                last = p;
+            }
+            // Honour Stop / Pause during the move.
+            self.sleep(0)?;
+            thread::sleep(pause);
+        }
+        if last != to {
+            self.jump_to(to.0, to.1)?;
+        }
+        Ok(())
     }
 
     fn send_key(&mut self, key: Key, dir: Direction) -> Result<(), String> {
@@ -597,6 +989,30 @@ impl<'a> Runner<'a> {
                 Ok(Some(0))
             }
 
+            NodeKind::Drag {
+                from_x,
+                from_y,
+                to_x,
+                to_y,
+                button,
+                duration_ms,
+            } => {
+                let b = to_button(*button);
+                self.move_to(*from_x, *from_y)?;
+                self.sleep(40)?;
+                self.enigo.button(b, Direction::Press).map_err(input_err)?;
+                self.held_buttons.push(b);
+                // A short hold so apps notice the press before the move starts.
+                self.sleep(80)?;
+                let ms = self.scaled(*duration_ms) as f64;
+                let human = self.doc.human_mouse;
+                self.glide((*from_x, *from_y), (*to_x, *to_y), ms, human)?;
+                self.sleep(80)?;
+                self.enigo.button(b, Direction::Release).map_err(input_err)?;
+                self.held_buttons.retain(|h| *h != b);
+                Ok(Some(0))
+            }
+
             NodeKind::KeyPress { key, mods } => {
                 let k = keys::to_enigo(key).ok_or_else(|| format!("This computer can't send the “{key}” key."))?;
                 let mod_keys = keys::modifier_keys(mods);
@@ -642,15 +1058,15 @@ impl<'a> Runner<'a> {
                     let d = (self.scaled(ev.delay_ms) as f32 / sp).round() as u64;
                     self.sleep(d)?;
                     match &ev.action {
-                        RecAction::Move { x, y } => self.move_to(*x, *y)?,
+                        RecAction::Move { x, y } => self.jump_to(*x, *y)?,
                         RecAction::Down { button, x, y } => {
-                            self.move_to(*x, *y)?;
+                            self.jump_to(*x, *y)?;
                             let b = to_button(*button);
                             self.enigo.button(b, Direction::Press).map_err(input_err)?;
                             self.held_buttons.push(b);
                         }
                         RecAction::Up { button, x, y } => {
-                            self.move_to(*x, *y)?;
+                            self.jump_to(*x, *y)?;
                             let b = to_button(*button);
                             self.enigo.button(b, Direction::Release).map_err(input_err)?;
                             self.held_buttons.retain(|h| *h != b);
@@ -684,6 +1100,14 @@ impl<'a> Runner<'a> {
                     .as_ref()
                     .ok_or_else(|| "A Find image step has no image yet – snip or choose one.".to_string())?;
                 let tpl = vision::load_template(path)?;
+                // On a bigger or smaller screen, the picture is bigger or smaller too.
+                let tpl = if (self.scale - 1.0).abs() > 0.03 {
+                    let w = ((tpl.width() as f64 * self.scale).round() as u32).max(4);
+                    let h = ((tpl.height() as f64 * self.scale).round() as u32).max(4);
+                    image::imageops::resize(&tpl, w, h, image::imageops::FilterType::Triangle)
+                } else {
+                    tpl
+                };
                 let t0 = Instant::now();
                 loop {
                     if self.stop.load(Ordering::Relaxed) {
@@ -692,12 +1116,18 @@ impl<'a> Runner<'a> {
                     let hit = vision::locate_in(&tpl, *threshold, area)?;
                     if hit.found {
                         self.found = Some((hit.x, hit.y));
+                        self.vars.insert("found_x".into(), hit.x.to_string());
+                        self.vars.insert("found_y".into(), hit.y.to_string());
                         self.status(format!(
                             "◎ Found image at ({}, {}) – {:.0}% match",
                             hit.x,
                             hit.y,
                             hit.score * 100.0
                         ));
+                        self.log(
+                            LogLevel::Info,
+                            format!("Found at ({}, {}), {:.0}% match", hit.x, hit.y, hit.score * 100.0),
+                        );
                         if *click_when_found {
                             self.move_to(hit.x, hit.y)?;
                             self.sleep(25)?;
@@ -712,6 +1142,10 @@ impl<'a> Runner<'a> {
                             "◎ Image not found (best {:.0}% match) – taking the “not found” path",
                             hit.score.max(0.0) * 100.0
                         ));
+                        self.log(
+                            LogLevel::Info,
+                            format!("Not found – best match {:.0}%", hit.score.max(0.0) * 100.0),
+                        );
                         return Ok(Some(1));
                     }
                     self.sleep((*interval_ms).max(50))?;
@@ -781,8 +1215,13 @@ impl<'a> Runner<'a> {
                 timeout_ms,
                 interval_ms,
                 numbers_only,
+                save_to,
                 ..
             } => {
+                let save = save_to.trim();
+                if !save.is_empty() && !is_ident(save) {
+                    return Err(format!("“{save}” can't be a variable name. Use letters, numbers and _ (e.g. gold_now)."));
+                }
                 let mode = if compare.is_number() || *numbers_only {
                     vision::OcrMode::Number
                 } else {
@@ -804,14 +1243,20 @@ impl<'a> Runner<'a> {
                         baseline = Some(read.clone());
                     }
                     self.prev_reads.insert(node.id, read.clone());
-                    self.last_text = Some(read.clone());
+                    self.set_last_text(read.clone());
+                    let save = save_to.trim();
+                    if !save.is_empty() {
+                        self.vars.insert(save.to_string(), read.clone());
+                    }
                     let shown: String = read.replace('\n', " ⏎ ").chars().take(60).collect();
                     if ok {
                         self.status(format!("Aa Read “{shown}” – match"));
+                        self.log(LogLevel::Info, format!("Read “{shown}”"));
                         return Ok(Some(0));
                     }
                     if t0.elapsed().as_millis() as u64 >= *timeout_ms {
                         self.status(format!("Aa Read “{shown}” – no match"));
+                        self.log(LogLevel::Info, format!("Read “{shown}”"));
                         return Ok(Some(1));
                     }
                     self.sleep((*interval_ms).max(100))?;
@@ -861,6 +1306,58 @@ impl<'a> Runner<'a> {
                 Ok(Some(0))
             }
 
+            NodeKind::SetVar { name, expr } => {
+                let name = name.trim();
+                if !is_ident(name) {
+                    return Err(format!(
+                        "“{name}” can't be a variable name. Use letters, numbers and _ (e.g. gold_now)."
+                    ));
+                }
+                let value = eval_expr(expr, &self.vars)?.as_text();
+                self.log(LogLevel::Info, format!("{name} = {value}"));
+                self.status(format!("x= {name} = {value}"));
+                self.vars.insert(name.to_string(), value);
+                Ok(Some(0))
+            }
+
+            NodeKind::IfCompare { left, op, right } => {
+                let a = eval_expr(left, &self.vars)?;
+                let b = eval_expr(right, &self.vars)?;
+                let yes = compare_values(&a, *op, &b);
+                self.log(
+                    LogLevel::Info,
+                    format!("“{}” {} “{}” → {}", a.as_text(), op.label(), b.as_text(), if yes { "yes" } else { "no" }),
+                );
+                Ok(Some(if yes { 0 } else { 1 }))
+            }
+
+            NodeKind::PixelColor {
+                x,
+                y,
+                color,
+                tolerance,
+                timeout_ms,
+                interval_ms,
+            } => {
+                let t0 = Instant::now();
+                loop {
+                    let now = vision::pixel_at(*x, *y)?;
+                    let diff = color_distance(now, *color);
+                    if diff <= *tolerance {
+                        self.log(LogLevel::Info, format!("#{now:06X} at ({x}, {y}) – matches"));
+                        return Ok(Some(0));
+                    }
+                    if t0.elapsed().as_millis() as u64 >= *timeout_ms {
+                        self.log(
+                            LogLevel::Info,
+                            format!("#{now:06X} at ({x}, {y}) – off by {diff} (allowed {tolerance})"),
+                        );
+                        return Ok(Some(1));
+                    }
+                    self.sleep((*interval_ms).max(20))?;
+                }
+            }
+
             NodeKind::Loop { count } => {
                 if *count == 0 {
                     return Ok(Some(0));
@@ -885,12 +1382,34 @@ impl Drop for Runner<'_> {
     }
 }
 
-/// Watches for the Esc key while a macro plays, and sets the stop flag.
-fn spawn_esc_watch(stop: Arc<AtomicBool>, done: Arc<AtomicBool>, suppress_until: Arc<AtomicU64>) {
+/// "No position yet" for `last_auto`.
+const NO_POINT: u64 = u64::MAX;
+
+fn pack_point(x: i32, y: i32) -> u64 {
+    ((x as u32 as u64) << 32) | (y as u32 as u64)
+}
+
+fn unpack_point(p: u64) -> Option<(i32, i32)> {
+    (p != NO_POINT).then(|| ((p >> 32) as u32 as i32, p as u32 as i32))
+}
+
+/// Watches for the Esc key while a macro plays, and sets the stop flag. With
+/// `failsafe`, it also stops the macro when the mouse is pushed into an outer corner
+/// of the screen (unless the macro itself put it there).
+fn spawn_esc_watch(
+    stop: Arc<AtomicBool>,
+    done: Arc<AtomicBool>,
+    suppress_until: Arc<AtomicU64>,
+    failsafe: Option<(Arc<AtomicBool>, Arc<AtomicU64>)>,
+) {
     thread::spawn(move || {
         let Ok(ds) = device() else {
             return;
         };
+        let corners = if failsafe.is_some() { vision::screen_corners() } else { Vec::new() };
+        let in_corner = |(x, y): (i32, i32)| corners.iter().any(|(cx, cy)| (x - cx).abs() <= 2 && (y - cy).abs() <= 2);
+        // Only moving *into* a corner counts, so a mouse already resting in one is fine.
+        let mut was_in_corner = in_corner(ds.get_mouse().coords);
         loop {
             if done.load(Ordering::Relaxed) || stop.load(Ordering::Relaxed) {
                 return;
@@ -900,6 +1419,18 @@ fn spawn_esc_watch(stop: Arc<AtomicBool>, done: Arc<AtomicBool>, suppress_until:
             {
                 stop.store(true, Ordering::Relaxed);
                 return;
+            }
+            if let Some((hit, last_auto)) = &failsafe {
+                let pos = ds.get_mouse().coords;
+                let now_in = in_corner(pos);
+                let put_there_by_macro = unpack_point(last_auto.load(Ordering::Relaxed))
+                    .map_or(false, |(ax, ay)| (ax - pos.0).abs() <= 2 && (ay - pos.1).abs() <= 2);
+                if now_in && !was_in_corner && !put_there_by_macro {
+                    hit.store(true, Ordering::Relaxed);
+                    stop.store(true, Ordering::Relaxed);
+                    return;
+                }
+                was_in_corner = now_in;
             }
             thread::sleep(Duration::from_millis(25));
         }
@@ -1098,6 +1629,48 @@ pub fn record_step(tx: Tx, stop: Arc<AtomicBool>) {
 // Helpers for the editor
 // ---------------------------------------------------------------------------
 
+/// The biggest difference between two colours' red, green or blue (0 = the same).
+pub fn color_distance(a: u32, b: u32) -> u32 {
+    let ch = |c: u32, s: u32| ((c >> s) & 0xff) as i32;
+    [16, 8, 0]
+        .iter()
+        .map(|s| (ch(a, *s) - ch(b, *s)).unsigned_abs())
+        .max()
+        .unwrap_or(0)
+}
+
+/// After a countdown, report where the mouse is and the colour under it.
+pub fn pick_pixel(tx: Tx, stop: Arc<AtomicBool>) {
+    thread::spawn(move || {
+        let result = (|| -> Result<(i32, i32, u32), String> {
+            let ds = device()?;
+            countdown(&tx, &stop, "Hover over the spot – reading its colour", 3)?;
+            let (x, y) = ds.get_mouse().coords;
+            Ok((x, y, vision::pixel_at(x, y)?))
+        })();
+        match result {
+            Ok((x, y, color)) => send(&tx, WorkerMsg::Pixel { x, y, color }),
+            Err(e) => send(&tx, WorkerMsg::Failed(e)),
+        }
+    });
+}
+
+/// Check a Pixel colour step's spot once.
+pub fn test_pixel(tx: Tx, x: i32, y: i32, color: u32, tolerance: u32, wait_ms: u64) {
+    thread::spawn(move || {
+        thread::sleep(Duration::from_millis(wait_ms));
+        let msg = match vision::pixel_at(x, y) {
+            Err(e) => e,
+            Ok(now) => {
+                let diff = color_distance(now, color);
+                let verdict = if diff <= tolerance { "MATCH" } else { "no match" };
+                format!("The colour at ({x}, {y}) is #{now:06X}, off by {diff} from #{color:06X} (allowed {tolerance}) → {verdict}")
+            }
+        };
+        send(&tx, WorkerMsg::TestResult(msg));
+    });
+}
+
 /// After a countdown, report where the mouse is.
 pub fn pick_position(tx: Tx, stop: Arc<AtomicBool>) {
     thread::spawn(move || {
@@ -1135,11 +1708,18 @@ pub fn snip(tx: Tx, stop: Arc<AtomicBool>, size: u32) {
 }
 
 /// Search the screen once and report the result (and point the mouse at it).
-pub fn test_find(tx: Tx, path: PathBuf, threshold: f32, area: Option<ScreenRect>, wait_ms: u64) {
+pub fn test_find(tx: Tx, path: PathBuf, threshold: f32, area: Option<ScreenRect>, scale: f64, wait_ms: u64) {
     thread::spawn(move || {
         thread::sleep(Duration::from_millis(wait_ms));
         let result = (|| -> Result<String, String> {
             let tpl = vision::load_template(&path)?;
+            let tpl = if (scale - 1.0).abs() > 0.03 {
+                let w = ((tpl.width() as f64 * scale).round() as u32).max(4);
+                let h = ((tpl.height() as f64 * scale).round() as u32).max(4);
+                image::imageops::resize(&tpl, w, h, image::imageops::FilterType::Triangle)
+            } else {
+                tpl
+            };
             let t0 = Instant::now();
             let hit = vision::locate_in(&tpl, threshold, area.map(|r| (r.x, r.y, r.w, r.h)))?;
             let ms = t0.elapsed().as_millis();

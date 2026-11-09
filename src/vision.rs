@@ -500,6 +500,58 @@ fn notify_command(_t: &Toast) -> Result<Command, String> {
     Err("Pop-ups are only supported on macOS and Windows.".into())
 }
 
+/// The outer corners of the whole desktop (corners where one display meets another
+/// are left out, since the mouse can pass straight through those).
+pub fn screen_corners() -> Vec<(i32, i32)> {
+    let rects: Vec<(i32, i32, i32, i32)> = Monitor::all()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|m| {
+            Some((
+                m.x().ok()?,
+                m.y().ok()?,
+                m.width().ok()? as i32,
+                m.height().ok()? as i32,
+            ))
+        })
+        .filter(|r| r.2 > 0 && r.3 > 0)
+        .collect();
+    let on_screen = |x: i32, y: i32| rects.iter().any(|(rx, ry, rw, rh)| x >= *rx && x < rx + rw && y >= *ry && y < ry + rh);
+    let mut out = Vec::new();
+    for (x, y, w, h) in &rects {
+        for (cx, cy, ox, oy) in [
+            (*x, *y, -1, -1),
+            (x + w - 1, *y, 1, -1),
+            (*x, y + h - 1, -1, 1),
+            (x + w - 1, y + h - 1, 1, 1),
+        ] {
+            // Outer only if there's no display beyond it in either direction.
+            let beyond = on_screen(cx + ox * 3, cy) || on_screen(cx, cy + oy * 3) || on_screen(cx + ox * 3, cy + oy * 3);
+            if !beyond {
+                out.push((cx, cy));
+            }
+        }
+    }
+    out
+}
+
+/// The colour (0xRRGGBB) of one spot on the screen.
+pub fn pixel_at(x: i32, y: i32) -> Result<u32, String> {
+    let m = Monitor::from_point(x, y).map_err(|e| format!("({x}, {y}) isn't on any display ({e})."))?;
+    let lx = (x - m.x().map_err(|e| e.to_string())?).max(0) as u32;
+    let ly = (y - m.y().map_err(|e| e.to_string())?).max(0) as u32;
+    let mw = m.width().map_err(|e| e.to_string())?;
+    let mh = m.height().map_err(|e| e.to_string())?;
+    let img = m
+        .capture_region(lx.min(mw.saturating_sub(1)), ly.min(mh.saturating_sub(1)), 1, 1)
+        .map_err(|e| format!("{SCREEN_PERMISSION} ({e})"))?;
+    if img.width() == 0 || img.height() == 0 {
+        return Err(SCREEN_PERMISSION.into());
+    }
+    let p = img.get_pixel(0, 0).0;
+    Ok(((p[0] as u32) << 16) | ((p[1] as u32) << 8) | p[2] as u32)
+}
+
 /// Capture a live area of the screen (global points) at full resolution.
 pub fn capture_area(x: i32, y: i32, w: i32, h: i32) -> Result<RgbaImage, String> {
     if w < 2 || h < 2 {
@@ -892,6 +944,11 @@ pub struct WinInfo {
     pub title: String,
     /// Belongs to the app you're currently using.
     pub focused: bool,
+    /// Top-left corner and size, in the same coordinates the mouse uses.
+    pub x: i32,
+    pub y: i32,
+    pub w: u32,
+    pub h: u32,
 }
 
 /// Windows that are open on screen, front-most first.
@@ -919,17 +976,106 @@ pub fn list_windows() -> Result<Vec<WinInfo>, String> {
         if w.is_minimized().unwrap_or(false) {
             continue;
         }
-        let big = w.width().unwrap_or(0) >= 60 && w.height().unwrap_or(0) >= 40;
-        if !big {
+        let (ww, wh) = (w.width().unwrap_or(0), w.height().unwrap_or(0));
+        if ww < 60 || wh < 40 {
             continue;
         }
         out.push(WinInfo {
             title: w.title().unwrap_or_default(),
             focused: w.is_focused().unwrap_or(false),
             app,
+            x: w.x().unwrap_or(0),
+            y: w.y().unwrap_or(0),
+            w: ww,
+            h: wh,
         });
     }
     Ok(out)
+}
+
+/// The open window a macro follows: same app and title if possible, otherwise the
+/// front-most window of the same app (titles often change, e.g. in browsers).
+pub fn find_anchor_window(a: &crate::model::WindowAnchor) -> Option<WinInfo> {
+    let list = list_windows().ok()?;
+    let same_app: Vec<&WinInfo> = list.iter().filter(|w| w.app.eq_ignore_ascii_case(&a.app)).collect();
+    same_app
+        .iter()
+        .find(|w| w.title == a.title)
+        .or_else(|| same_app.first())
+        .map(|w| (*w).clone())
+}
+
+fn missing_window(a: &crate::model::WindowAnchor) -> String {
+    let name = if a.title.is_empty() {
+        a.app.clone()
+    } else {
+        format!("{} – {}", a.app, a.title)
+    };
+    format!("This macro follows the window “{name}”, but it isn't open (or it's minimised).")
+}
+
+/// How far the followed window has moved since the macro's positions were saved.
+pub fn anchor_offset(a: &crate::model::WindowAnchor) -> Result<(i32, i32), String> {
+    let w = find_anchor_window(a).ok_or_else(|| missing_window(a))?;
+    Ok((w.x - a.x, w.y - a.y))
+}
+
+/// The followed window's position and size right now.
+pub fn anchor_rect(a: &crate::model::WindowAnchor) -> Result<crate::model::ScreenRect, String> {
+    let w = find_anchor_window(a).ok_or_else(|| missing_window(a))?;
+    Ok(crate::model::ScreenRect {
+        x: w.x,
+        y: w.y,
+        w: w.w as i32,
+        h: w.h as i32,
+    })
+}
+
+/// The main display's position and size, in the coordinates the mouse uses.
+pub fn primary_screen() -> Result<crate::model::ScreenRect, String> {
+    let monitors = Monitor::all().map_err(|e| format!("Couldn't read the screen size ({e})."))?;
+    let m = monitors
+        .iter()
+        .find(|m| m.is_primary().unwrap_or(false))
+        .or_else(|| monitors.first())
+        .ok_or_else(|| "No display found.".to_string())?;
+    Ok(crate::model::ScreenRect {
+        x: m.x().map_err(|e| e.to_string())?,
+        y: m.y().map_err(|e| e.to_string())?,
+        w: m.width().map_err(|e| e.to_string())? as i32,
+        h: m.height().map_err(|e| e.to_string())? as i32,
+    })
+}
+
+/// The screen area a macro's saved positions should be fitted to right now:
+/// the followed window if there is one, otherwise the main display.
+pub fn target_rect(anchor: Option<&crate::model::WindowAnchor>) -> Result<crate::model::ScreenRect, String> {
+    match anchor {
+        Some(a) => anchor_rect(a),
+        None => primary_screen(),
+    }
+}
+
+/// How to turn a macro's saved positions into positions on this screen right now
+/// (None = they're already exact screen positions).
+pub fn current_mapping(
+    reference: Option<crate::model::ScreenRect>,
+    anchor: Option<&crate::model::WindowAnchor>,
+) -> Result<Option<crate::model::Mapping>, String> {
+    use crate::model::Mapping;
+    match (reference, anchor) {
+        (None, None) => Ok(None),
+        // Following a window without scaling: just move with it.
+        (None, Some(a)) => {
+            let (dx, dy) = anchor_offset(a)?;
+            Ok(Some(Mapping::translate(dx, dy)))
+        }
+        // Scaled: fit the saved screen / window onto the current one.
+        (Some(from), a) => Ok(Some(Mapping {
+            from,
+            to: target_rect(a)?,
+        })),
+    }
 }
 
 /// The front window of the app you're currently using.

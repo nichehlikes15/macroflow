@@ -3347,6 +3347,7 @@ dependencies = [
  "enigo",
  "gpui",
  "image",
+ "raw-window-handle",
  "regex",
  "serde",
  "serde_json",

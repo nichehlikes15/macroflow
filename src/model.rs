@@ -171,6 +171,152 @@ fn default_notice_ms() -> u64 {
     3000
 }
 
+impl ScreenRect {
+    #[allow(dead_code)]
+    pub fn shifted(self, dx: i32, dy: i32) -> ScreenRect {
+        ScreenRect {
+            x: self.x + dx,
+            y: self.y + dy,
+            ..self
+        }
+    }
+}
+
+/// Converts positions from one screen area to another, scaling them.
+/// "Positions saved for this screen / window" → "the same spot on that one".
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Mapping {
+    pub from: ScreenRect,
+    pub to: ScreenRect,
+}
+
+impl Mapping {
+    pub fn identity() -> Self {
+        let unit = ScreenRect { x: 0, y: 0, w: 1, h: 1 };
+        Mapping { from: unit, to: unit }
+    }
+
+    /// Just move positions by (dx, dy), no scaling.
+    pub fn translate(dx: i32, dy: i32) -> Self {
+        Mapping {
+            from: ScreenRect { x: 0, y: 0, w: 1, h: 1 },
+            to: ScreenRect { x: dx, y: dy, w: 1, h: 1 },
+        }
+    }
+
+    pub fn inverse(&self) -> Self {
+        Mapping { from: self.to, to: self.from }
+    }
+
+    fn sx(&self) -> f64 {
+        self.to.w.max(1) as f64 / self.from.w.max(1) as f64
+    }
+
+    fn sy(&self) -> f64 {
+        self.to.h.max(1) as f64 / self.from.h.max(1) as f64
+    }
+
+    /// How much bigger (> 1) or smaller (< 1) things are on the target.
+    pub fn scale(&self) -> f64 {
+        (self.sx() + self.sy()) / 2.0
+    }
+
+    pub fn is_identity(&self) -> bool {
+        self.from.x == self.to.x && self.from.y == self.to.y && (self.sx() - 1.0).abs() < 1e-9 && (self.sy() - 1.0).abs() < 1e-9
+    }
+
+    pub fn point(&self, x: i32, y: i32) -> (i32, i32) {
+        (
+            (self.to.x as f64 + (x - self.from.x) as f64 * self.sx()).round() as i32,
+            (self.to.y as f64 + (y - self.from.y) as f64 * self.sy()).round() as i32,
+        )
+    }
+
+    pub fn size(&self, w: i32, h: i32) -> (i32, i32) {
+        (
+            ((w as f64 * self.sx()).round() as i32).max(1),
+            ((h as f64 * self.sy()).round() as i32).max(1),
+        )
+    }
+
+    pub fn rect(&self, r: ScreenRect) -> ScreenRect {
+        let (x, y) = self.point(r.x, r.y);
+        let (w, h) = self.size(r.w, r.h);
+        ScreenRect { x, y, w, h }
+    }
+}
+
+/// The window a macro's screen positions are relative to. `x`/`y` is where that
+/// window's top-left corner was when the positions were captured.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WindowAnchor {
+    pub app: String,
+    #[serde(default)]
+    pub title: String,
+    pub x: i32,
+    pub y: i32,
+}
+
+/// How an If step compares its two sides.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CmpOp {
+    #[default]
+    Eq,
+    Ne,
+    Gt,
+    Ge,
+    Lt,
+    Le,
+    Contains,
+    NotContains,
+}
+
+impl CmpOp {
+    pub const ALL: [CmpOp; 8] = [
+        CmpOp::Eq,
+        CmpOp::Ne,
+        CmpOp::Gt,
+        CmpOp::Ge,
+        CmpOp::Lt,
+        CmpOp::Le,
+        CmpOp::Contains,
+        CmpOp::NotContains,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            CmpOp::Eq => "=",
+            CmpOp::Ne => "≠",
+            CmpOp::Gt => ">",
+            CmpOp::Ge => "≥",
+            CmpOp::Lt => "<",
+            CmpOp::Le => "≤",
+            CmpOp::Contains => "contains",
+            CmpOp::NotContains => "doesn't contain",
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_pixel_tolerance() -> u32 {
+    24
+}
+
+fn default_pixel_interval() -> u64 {
+    100
+}
+
+fn default_drag_ms() -> u64 {
+    400
+}
+
+fn default_mouse_speed() -> u32 {
+    100
+}
+
 /// How a "Read text" step compares what it reads.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TextCompare {
@@ -394,6 +540,58 @@ pub enum NodeKind {
         /// Number comparisons always do this. Optional, so older macros still open.
         #[serde(default)]
         numbers_only: bool,
+        /// Also store what was read in this variable (empty = don't).
+        #[serde(default)]
+        save_to: String,
+    },
+    /// Hold a mouse button at one spot, move to another, and let go.
+    Drag {
+        #[serde(default)]
+        from_x: i32,
+        #[serde(default)]
+        from_y: i32,
+        #[serde(default)]
+        to_x: i32,
+        #[serde(default)]
+        to_y: i32,
+        #[serde(default)]
+        button: MouseBtn,
+        /// How long the move between the two spots takes.
+        #[serde(default = "default_drag_ms")]
+        duration_ms: u64,
+    },
+    /// Store a value (text, a number, or a sum like `gold + 1000`) in a variable.
+    SetVar {
+        #[serde(default)]
+        name: String,
+        #[serde(default)]
+        expr: String,
+    },
+    /// Compare two values (variables, numbers, text) and branch on the result.
+    IfCompare {
+        #[serde(default)]
+        left: String,
+        #[serde(default)]
+        op: CmpOp,
+        #[serde(default)]
+        right: String,
+    },
+    /// Check the colour of one spot on the screen.
+    PixelColor {
+        #[serde(default)]
+        x: i32,
+        #[serde(default)]
+        y: i32,
+        /// 0xRRGGBB
+        #[serde(default)]
+        color: u32,
+        /// How far each of red / green / blue may be off (0 = exact, 255 = anything).
+        #[serde(default = "default_pixel_tolerance")]
+        tolerance: u32,
+        #[serde(default)]
+        timeout_ms: u64,
+        #[serde(default = "default_pixel_interval")]
+        interval_ms: u64,
     },
     End,
     /// A collapsed run of steps. Its steps live in `graph`, between a
@@ -452,6 +650,14 @@ impl NodeKind {
                 area: None,
                 jitter_px: 0,
             },
+            NodeKind::Drag {
+                from_x: 400,
+                from_y: 400,
+                to_x: 700,
+                to_y: 400,
+                button: MouseBtn::Left,
+                duration_ms: default_drag_ms(),
+            },
             NodeKind::KeyPress {
                 key: "enter".into(),
                 mods: Mods::default(),
@@ -507,6 +713,24 @@ impl NodeKind {
                 interval_ms: 500,
                 preview: None,
                 numbers_only: false,
+                save_to: String::new(),
+            },
+            NodeKind::PixelColor {
+                x: 0,
+                y: 0,
+                color: 0x34c77b,
+                tolerance: default_pixel_tolerance(),
+                timeout_ms: 0,
+                interval_ms: default_pixel_interval(),
+            },
+            NodeKind::SetVar {
+                name: "count".into(),
+                expr: "count + 1".into(),
+            },
+            NodeKind::IfCompare {
+                left: "count".into(),
+                op: CmpOp::Ge,
+                right: "10".into(),
             },
             NodeKind::Loop { count: 3 },
             NodeKind::Group {
@@ -526,6 +750,7 @@ impl NodeKind {
             NodeKind::Start => "Start",
             NodeKind::Click { .. } => "Click",
             NodeKind::MoveMouse { .. } => "Move mouse",
+            NodeKind::Drag { .. } => "Drag",
             NodeKind::KeyPress { .. } => "Key press",
             NodeKind::TypeText { .. } => "Type text",
             NodeKind::Wait { .. } => "Wait",
@@ -535,6 +760,9 @@ impl NodeKind {
             NodeKind::Loop { .. } => "Loop",
             NodeKind::WindowCheck { .. } => "Window check",
             NodeKind::ReadText { .. } => "Read text",
+            NodeKind::SetVar { .. } => "Set variable",
+            NodeKind::IfCompare { .. } => "If",
+            NodeKind::PixelColor { .. } => "Pixel colour",
             NodeKind::End => "End",
             NodeKind::Group { .. } => "Group",
             NodeKind::GroupIn => "Group start",
@@ -548,6 +776,7 @@ impl NodeKind {
             NodeKind::Start => "▶",
             NodeKind::Click { .. } => "◉",
             NodeKind::MoveMouse { .. } => "➜",
+            NodeKind::Drag { .. } => "⇢",
             NodeKind::KeyPress { .. } => "⌘",
             NodeKind::TypeText { .. } => "T",
             NodeKind::Wait { .. } => "◷",
@@ -557,6 +786,9 @@ impl NodeKind {
             NodeKind::Loop { .. } => "↻",
             NodeKind::WindowCheck { .. } => "▣",
             NodeKind::ReadText { .. } => "Aa",
+            NodeKind::SetVar { .. } => "x=",
+            NodeKind::IfCompare { .. } => "?",
+            NodeKind::PixelColor { .. } => "◈",
             NodeKind::End => "■",
             NodeKind::Group { .. } => "▤",
             NodeKind::GroupIn => "▷",
@@ -570,6 +802,7 @@ impl NodeKind {
             NodeKind::Start => 0x34c77b,
             NodeKind::Click { .. } => 0x4c8dff,
             NodeKind::MoveMouse { .. } => 0x2bb3c0,
+            NodeKind::Drag { .. } => 0x0abde3,
             NodeKind::KeyPress { .. } => 0xff9f43,
             NodeKind::TypeText { .. } => 0xf368e0,
             NodeKind::Wait { .. } => 0x9aa0b4,
@@ -579,6 +812,15 @@ impl NodeKind {
             NodeKind::Loop { .. } => 0xfeca57,
             NodeKind::WindowCheck { .. } => 0x1dd1a1,
             NodeKind::ReadText { .. } => 0xff7eb6,
+            NodeKind::SetVar { .. } => 0x48dbfb,
+            NodeKind::IfCompare { .. } => 0xc8d6e5,
+            NodeKind::PixelColor { color, .. } => {
+                if *color == 0 {
+                    0x9aa0b4
+                } else {
+                    *color
+                }
+            }
             NodeKind::End => 0x7f8796,
             NodeKind::Group { .. } | NodeKind::GroupIn | NodeKind::GroupOut => GROUP_COLOR,
             NodeKind::Notify { style, .. } => style.color(),
@@ -593,6 +835,8 @@ impl NodeKind {
             NodeKind::Loop { .. } => &["repeat", "done"],
             NodeKind::WindowCheck { .. } => &["yes", "no"],
             NodeKind::ReadText { .. } => &["match", "no match"],
+            NodeKind::IfCompare { .. } => &["yes", "no"],
+            NodeKind::PixelColor { .. } => &["match", "no match"],
             _ => &["next"],
         }
     }
@@ -748,6 +992,32 @@ impl NodeKind {
                 }
             }
             NodeKind::End => "Stop the macro".into(),
+            NodeKind::Drag {
+                from_x,
+                from_y,
+                to_x,
+                to_y,
+                button,
+                duration_ms,
+            } => format!(
+                "{} ({from_x}, {from_y}) → ({to_x}, {to_y}) · {duration_ms} ms",
+                button.label()
+            ),
+            NodeKind::SetVar { name, expr } => {
+                let n = if name.trim().is_empty() { "?" } else { name.trim() };
+                format!("{n} = {}", expr.trim())
+            }
+            NodeKind::IfCompare { left, op, right } => {
+                format!("{} {} {}", left.trim(), op.label(), right.trim())
+            }
+            NodeKind::PixelColor { x, y, color, timeout_ms, .. } => {
+                let wait = if *timeout_ms > 0 {
+                    format!(" · wait {timeout_ms} ms")
+                } else {
+                    String::new()
+                };
+                format!("#{color:06X} at ({x}, {y}){wait}")
+            }
             NodeKind::Group { name, graph } => {
                 let n = graph.step_count();
                 let label = if name.trim().is_empty() { "Group" } else { name.trim() };
@@ -802,6 +1072,26 @@ pub struct Node {
     pub delay_ms: u64,
     #[serde(default)]
     pub note: String,
+    /// Your own name for the step (shown instead of its type). Optional, so older
+    /// macros still open.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub name: String,
+    /// Pause here when the macro reaches this step (debugging).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub breakpoint: bool,
+}
+
+impl Node {
+    /// What to call this step: its own name, a group's name, or its type.
+    pub fn label(&self) -> String {
+        if !self.name.trim().is_empty() {
+            return self.name.trim().to_string();
+        }
+        match &self.kind {
+            NodeKind::Group { name, .. } if !name.trim().is_empty() => name.trim().to_string(),
+            k => k.title().to_string(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -991,6 +1281,20 @@ pub struct Macro {
     pub speed_pct: u32,
     /// How many times to run the whole macro (0 = until stopped).
     pub repeat: u32,
+    /// Screen positions are relative to this window (None = plain screen positions).
+    pub anchor: Option<WindowAnchor>,
+    /// Show a red pop-up when a run ends unexpectedly.
+    pub alert_on_stop: bool,
+    /// When set, positions are saved for this screen (or followed window) and scaled
+    /// to whatever screen / window size is used when the macro runs. None = exact
+    /// screen positions (how macros worked before this existed).
+    pub reference: Option<ScreenRect>,
+    /// Move the mouse along curved, varying-speed paths instead of jumping.
+    pub human_mouse: bool,
+    /// How fast human-like moves are, in percent (200 = twice as fast).
+    pub mouse_speed: u32,
+    /// Stop the macro if the mouse is pushed into a corner of the screen.
+    pub failsafe: bool,
 }
 
 /// The macro exactly as it's written to disk. This is the same layout older
@@ -1009,6 +1313,18 @@ struct MacroFile {
     speed_pct: u32,
     #[serde(default = "default_repeat")]
     repeat: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    anchor: Option<WindowAnchor>,
+    #[serde(default = "default_true")]
+    alert_on_stop: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reference: Option<ScreenRect>,
+    #[serde(default)]
+    human_mouse: bool,
+    #[serde(default = "default_mouse_speed")]
+    mouse_speed: u32,
+    #[serde(default = "default_true")]
+    failsafe: bool,
 }
 
 impl From<MacroFile> for Macro {
@@ -1027,6 +1343,12 @@ impl From<MacroFile> for Macro {
             step_delay_ms: f.step_delay_ms,
             speed_pct: f.speed_pct,
             repeat: f.repeat,
+            anchor: f.anchor,
+            alert_on_stop: f.alert_on_stop,
+            reference: f.reference,
+            human_mouse: f.human_mouse,
+            mouse_speed: f.mouse_speed,
+            failsafe: f.failsafe,
         }
     }
 }
@@ -1042,6 +1364,12 @@ impl From<Macro> for MacroFile {
             step_delay_ms: m.step_delay_ms,
             speed_pct: m.speed_pct,
             repeat: m.repeat,
+            anchor: m.anchor,
+            alert_on_stop: m.alert_on_stop,
+            reference: m.reference,
+            human_mouse: m.human_mouse,
+            mouse_speed: m.mouse_speed,
+            failsafe: m.failsafe,
         }
     }
 }
@@ -1069,6 +1397,12 @@ impl Default for Macro {
             step_delay_ms: default_step_delay(),
             speed_pct: default_speed(),
             repeat: default_repeat(),
+            anchor: None,
+            alert_on_stop: true,
+            reference: None,
+            human_mouse: false,
+            mouse_speed: default_mouse_speed(),
+            failsafe: true,
         };
         m.add_node(NodeKind::Start, 60.0, 180.0);
         m
@@ -1083,6 +1417,8 @@ fn blank_node(id: u64, kind: NodeKind, x: f32, y: f32) -> Node {
         y,
         delay_ms: 0,
         note: String::new(),
+        name: String::new(),
+        breakpoint: false,
     }
 }
 
@@ -1480,6 +1816,443 @@ impl Macro {
             }
         }
         Ok(moved_ids)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Copy and paste, and moving every position at once
+// ---------------------------------------------------------------------------
+
+/// Steps copied to the clipboard (as JSON), so they can be pasted into any macro.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct StepClip {
+    /// Marks the clipboard text as MacroFlow steps.
+    pub macroflow_steps: u32,
+    pub nodes: Vec<Node>,
+    pub edges: Vec<Edge>,
+}
+
+impl Macro {
+    /// Copy steps (and the connections between them). Start / group start / group end
+    /// are left out. All the steps must be in the same place (same group, or top level).
+    pub fn copy_steps(&self, ids: &[u64]) -> Option<StepClip> {
+        let first = *ids.first()?;
+        let g = self.root.owner(first)?;
+        let nodes: Vec<Node> = g
+            .nodes
+            .iter()
+            .filter(|n| ids.contains(&n.id) && !n.kind.is_fixed())
+            .cloned()
+            .collect();
+        if nodes.is_empty() {
+            return None;
+        }
+        let keep: Vec<u64> = nodes.iter().map(|n| n.id).collect();
+        let edges = g
+            .edges
+            .iter()
+            .copied()
+            .filter(|e| keep.contains(&e.from) && keep.contains(&e.to))
+            .collect();
+        Some(StepClip {
+            macroflow_steps: 1,
+            nodes,
+            edges,
+        })
+    }
+
+    /// Paste copied steps into the groups listed in `path`, moved by (dx, dy), with new ids.
+    /// Returns the new steps' ids.
+    pub fn paste_steps(&mut self, path: &[u64], clip: &StepClip, dx: f32, dy: f32) -> Vec<u64> {
+        let mut map: HashMap<u64, u64> = HashMap::new();
+        let mut new_nodes = Vec::new();
+        for n in &clip.nodes {
+            if n.kind.is_fixed() {
+                continue;
+            }
+            let mut c = n.clone();
+            let id = self.alloc();
+            map.insert(n.id, id);
+            c.id = id;
+            c.x += dx;
+            c.y += dy;
+            self.refresh_ids(&mut c.kind);
+            new_nodes.push(c);
+        }
+        let new_edges: Vec<Edge> = clip
+            .edges
+            .iter()
+            .filter_map(|e| {
+                Some(Edge {
+                    from: *map.get(&e.from)?,
+                    port: e.port,
+                    to: *map.get(&e.to)?,
+                })
+            })
+            .collect();
+        let ids: Vec<u64> = new_nodes.iter().map(|n| n.id).collect();
+        let path: &[u64] = if self.root.at(path).is_some() { path } else { &[] };
+        let g = self.root.at_mut(path).expect("the top level always exists");
+        g.nodes.extend(new_nodes);
+        g.edges.extend(new_edges);
+        ids
+    }
+
+    /// Move every saved screen position (clicks, areas, recordings…) by (dx, dy).
+    #[allow(dead_code)]
+    pub fn shift_positions(&mut self, dx: i32, dy: i32) {
+        self.map_positions(&Mapping::translate(dx, dy));
+    }
+
+    /// Convert every saved screen position (and area size) with `mapping`.
+    pub fn map_positions(&mut self, mapping: &Mapping) {
+        if mapping.is_identity() {
+            return;
+        }
+        self.root.for_each_mut(&mut |n: &mut Node| map_kind(&mut n.kind, mapping));
+    }
+}
+
+/// Move a step's screen positions by (dx, dy).
+#[allow(dead_code)]
+pub fn shift_kind(kind: &mut NodeKind, dx: i32, dy: i32) {
+    map_kind(kind, &Mapping::translate(dx, dy));
+}
+
+/// Convert a step's screen positions (and area sizes) with `m`.
+pub fn map_kind(kind: &mut NodeKind, m: &Mapping) {
+    if m.is_identity() {
+        return;
+    }
+    match kind {
+        NodeKind::Click { x, y, area, .. } | NodeKind::MoveMouse { x, y, area, .. } => {
+            (*x, *y) = m.point(*x, *y);
+            if let Some(r) = area {
+                *r = m.rect(*r);
+            }
+        }
+        NodeKind::FindImage { search_area, .. } => {
+            if let Some(r) = search_area {
+                *r = m.rect(*r);
+            }
+        }
+        NodeKind::ReadText { x, y, w, h, .. } => {
+            (*x, *y) = m.point(*x, *y);
+            if *w > 0 && *h > 0 {
+                (*w, *h) = m.size(*w, *h);
+            }
+        }
+        NodeKind::PixelColor { x, y, .. } => {
+            (*x, *y) = m.point(*x, *y);
+        }
+        NodeKind::Drag { from_x, from_y, to_x, to_y, .. } => {
+            (*from_x, *from_y) = m.point(*from_x, *from_y);
+            (*to_x, *to_y) = m.point(*to_x, *to_y);
+        }
+        NodeKind::Recording { events, .. } => {
+            for e in events.iter_mut() {
+                match &mut e.action {
+                    RecAction::Move { x, y } | RecAction::Down { x, y, .. } | RecAction::Up { x, y, .. } => {
+                        (*x, *y) = m.point(*x, *y);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Does this step use saved screen positions (so it moves with a followed window)?
+pub fn uses_screen_positions(kind: &NodeKind) -> bool {
+    match kind {
+        NodeKind::Click { target, .. } | NodeKind::MoveMouse { target, .. } => {
+            matches!(target, Target::Fixed | Target::Area)
+        }
+        NodeKind::FindImage { search_area, .. } => search_area.is_some(),
+        NodeKind::ReadText { .. } | NodeKind::PixelColor { .. } | NodeKind::Drag { .. } => true,
+        NodeKind::Recording { events, .. } => events.iter().any(|e| !matches!(e.action, RecAction::KeyDown { .. } | RecAction::KeyUp { .. })),
+        _ => false,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Variables and maths
+// ---------------------------------------------------------------------------
+
+/// A value worked out by a Set variable / If step.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Value {
+    Num(f64),
+    Text(String),
+}
+
+impl Value {
+    pub fn as_text(&self) -> String {
+        match self {
+            Value::Num(n) => format_number(*n),
+            Value::Text(t) => t.clone(),
+        }
+    }
+
+    pub fn as_num(&self) -> Option<f64> {
+        match self {
+            Value::Num(n) => Some(*n),
+            Value::Text(t) => text_to_number(t),
+        }
+    }
+}
+
+/// 1500.0 → "1500", 2.5 → "2.5", 1/3 → "0.333333".
+pub fn format_number(n: f64) -> String {
+    if !n.is_finite() {
+        return n.to_string();
+    }
+    if (n - n.round()).abs() < 1e-9 && n.abs() < 1e15 {
+        return format!("{}", n.round() as i64);
+    }
+    let s = format!("{n:.6}");
+    s.trim_end_matches('0').trim_end_matches('.').to_string()
+}
+
+/// "1500", " 1,500 ", "1 892 039", "-2.5" → numbers; anything else isn't one.
+pub fn text_to_number(t: &str) -> Option<f64> {
+    let s: String = t.trim().chars().filter(|c| *c != ',' && *c != ' ').collect();
+    if s.is_empty() {
+        return None;
+    }
+    s.parse::<f64>().ok().filter(|v| v.is_finite())
+}
+
+pub fn is_ident(s: &str) -> bool {
+    let mut c = s.chars();
+    matches!(c.next(), Some(f) if f.is_alphabetic() || f == '_') && c.all(|ch| ch.is_alphanumeric() || ch == '_')
+}
+
+/// Replace every `{name}` with that variable's value (unknown names become empty).
+/// Braces around anything that isn't a name are left alone.
+pub fn fill_vars(s: &str, vars: &HashMap<String, String>) -> String {
+    let mut out = String::new();
+    let mut rest = s;
+    while let Some(open) = rest.find('{') {
+        out.push_str(&rest[..open]);
+        let after = &rest[open + 1..];
+        match after.find('}') {
+            Some(close) => {
+                let name = after[..close].trim();
+                if is_ident(name) {
+                    out.push_str(vars.get(name).map(String::as_str).unwrap_or(""));
+                } else {
+                    out.push('{');
+                    out.push_str(&after[..close]);
+                    out.push('}');
+                }
+                rest = &after[close + 1..];
+            }
+            None => {
+                out.push_str(&rest[open..]);
+                rest = "";
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum Tok {
+    Num(f64),
+    Ident(String),
+    Op(char),
+    LParen,
+    RParen,
+}
+
+fn tokenize(src: &str) -> Option<Vec<Tok>> {
+    let chars: Vec<char> = src.chars().collect();
+    let mut i = 0;
+    let mut out = Vec::new();
+    while i < chars.len() {
+        let c = chars[i];
+        if c.is_whitespace() {
+            i += 1;
+            continue;
+        }
+        if c.is_ascii_digit() || (c == '.' && chars.get(i + 1).map_or(false, |d| d.is_ascii_digit())) {
+            let start = i;
+            while i < chars.len() && (chars[i].is_ascii_digit() || chars[i] == '.') {
+                i += 1;
+            }
+            let s: String = chars[start..i].iter().collect();
+            out.push(Tok::Num(s.parse().ok()?));
+            continue;
+        }
+        if c.is_alphabetic() || c == '_' {
+            let start = i;
+            while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_') {
+                i += 1;
+            }
+            out.push(Tok::Ident(chars[start..i].iter().collect()));
+            continue;
+        }
+        if c == '{' {
+            let mut j = i + 1;
+            while j < chars.len() && chars[j] != '}' {
+                j += 1;
+            }
+            if j >= chars.len() {
+                return None;
+            }
+            let name: String = chars[i + 1..j].iter().collect::<String>().trim().to_string();
+            if !is_ident(&name) {
+                return None;
+            }
+            out.push(Tok::Ident(name));
+            i = j + 1;
+            continue;
+        }
+        out.push(match c {
+            '+' | '-' | '*' | '/' | '%' => Tok::Op(c),
+            '×' => Tok::Op('*'),
+            '÷' => Tok::Op('/'),
+            '−' => Tok::Op('-'),
+            '(' => Tok::LParen,
+            ')' => Tok::RParen,
+            _ => return None,
+        });
+        i += 1;
+    }
+    Some(out)
+}
+
+enum EvalErr {
+    /// Not a sum at all: treat it as text.
+    Syntax,
+    /// A sum that can't be worked out (e.g. dividing by zero).
+    Math(String),
+}
+
+struct Parser<'a> {
+    toks: &'a [Tok],
+    pos: usize,
+    vars: &'a HashMap<String, String>,
+}
+
+impl Parser<'_> {
+    fn peek(&self) -> Option<&Tok> {
+        self.toks.get(self.pos)
+    }
+
+    fn expr(&mut self) -> Result<f64, EvalErr> {
+        let mut v = self.term()?;
+        loop {
+            let op = match self.peek() {
+                Some(Tok::Op(op)) if *op == '+' || *op == '-' => *op,
+                _ => return Ok(v),
+            };
+            self.pos += 1;
+            let r = self.term()?;
+            v = if op == '+' { v + r } else { v - r };
+        }
+    }
+
+    fn term(&mut self) -> Result<f64, EvalErr> {
+        let mut v = self.factor()?;
+        loop {
+            let op = match self.peek() {
+                Some(Tok::Op(op)) if *op == '*' || *op == '/' || *op == '%' => *op,
+                _ => return Ok(v),
+            };
+            self.pos += 1;
+            let r = self.factor()?;
+            v = match op {
+                '*' => v * r,
+                _ if r == 0.0 => return Err(EvalErr::Math("can't divide by zero".into())),
+                '/' => v / r,
+                _ => v % r,
+            };
+        }
+    }
+
+    fn factor(&mut self) -> Result<f64, EvalErr> {
+        let tok = self.peek().cloned().ok_or(EvalErr::Syntax)?;
+        self.pos += 1;
+        match tok {
+            Tok::Op('-') => Ok(-self.factor()?),
+            Tok::Op('+') => self.factor(),
+            Tok::Num(n) => Ok(n),
+            // Variables that haven't been set count as 0, so counters work straight away.
+            Tok::Ident(name) => match self.vars.get(&name) {
+                None => Ok(0.0),
+                Some(t) => text_to_number(t)
+                    .ok_or_else(|| EvalErr::Math(format!("“{name}” is “{t}”, which isn't a number"))),
+            },
+            Tok::LParen => {
+                let v = self.expr()?;
+                if self.peek() == Some(&Tok::RParen) {
+                    self.pos += 1;
+                    Ok(v)
+                } else {
+                    Err(EvalErr::Syntax)
+                }
+            }
+            _ => Err(EvalErr::Syntax),
+        }
+    }
+}
+
+/// Work out a value: a sum like `gold + 1000` or `(a + b) / 2`, a single variable
+/// (`gold`), a number, or otherwise text, where `{name}` is replaced by that variable.
+pub fn eval_expr(src: &str, vars: &HashMap<String, String>) -> Result<Value, String> {
+    let s = src.trim();
+    if s.is_empty() {
+        return Ok(Value::Text(String::new()));
+    }
+    if let Some(toks) = tokenize(s) {
+        // A single name: a variable's own value, or (if it isn't set) just that word.
+        if let [Tok::Ident(name)] = toks.as_slice() {
+            return Ok(match vars.get(name) {
+                Some(t) => text_to_number(t).map(Value::Num).unwrap_or_else(|| Value::Text(t.clone())),
+                None if s.starts_with('{') => Value::Text(String::new()),
+                None => Value::Text(name.clone()),
+            });
+        }
+        let mut p = Parser { toks: &toks, pos: 0, vars };
+        match p.expr() {
+            Ok(v) if p.pos == toks.len() => return Ok(Value::Num(v)),
+            Err(EvalErr::Math(e)) => return Err(e),
+            _ => {}
+        }
+    }
+    Ok(Value::Text(fill_vars(s, vars)))
+}
+
+/// Compare two values. Numbers compare as numbers; otherwise as text (ignoring case).
+pub fn compare_values(left: &Value, op: CmpOp, right: &Value) -> bool {
+    if let (Some(a), Some(b)) = (left.as_num(), right.as_num()) {
+        let eps = 1e-9;
+        return match op {
+            CmpOp::Eq => (a - b).abs() < eps,
+            CmpOp::Ne => (a - b).abs() >= eps,
+            CmpOp::Gt => a > b,
+            CmpOp::Ge => a >= b - eps,
+            CmpOp::Lt => a < b,
+            CmpOp::Le => a <= b + eps,
+            CmpOp::Contains => format_number(a).contains(&format_number(b)),
+            CmpOp::NotContains => !format_number(a).contains(&format_number(b)),
+        };
+    }
+    let a = left.as_text().trim().to_lowercase();
+    let b = right.as_text().trim().to_lowercase();
+    match op {
+        CmpOp::Eq => a == b,
+        CmpOp::Ne => a != b,
+        CmpOp::Gt => a > b,
+        CmpOp::Ge => a >= b,
+        CmpOp::Lt => a < b,
+        CmpOp::Le => a <= b,
+        CmpOp::Contains => a.contains(&b),
+        CmpOp::NotContains => !a.contains(&b),
     }
 }
 
@@ -1904,6 +2677,103 @@ mod tests {
         let old = r#"{"type":"FindImage","template":null,"threshold":0.85,"timeout_ms":5000,"interval_ms":250,"click_when_found":false}"#;
         let k: NodeKind = serde_json::from_str(old).expect("old Find image step should load");
         assert!(matches!(k, NodeKind::FindImage { search_area: None, .. }));
+    }
+
+    #[test]
+    fn variables_and_maths() {
+        let mut vars = HashMap::new();
+        vars.insert("gold".to_string(), "1500".to_string());
+        vars.insert("name".to_string(), "Bob".to_string());
+        let ev = |s: &str, v: &HashMap<String, String>| eval_expr(s, v).unwrap();
+        assert_eq!(ev("gold + 1000", &vars), Value::Num(2500.0));
+        assert_eq!(ev("(gold - 500) / 2", &vars), Value::Num(500.0));
+        assert_eq!(ev("count + 1", &vars), Value::Num(1.0)); // unset counts as 0
+        assert_eq!(ev("gold", &vars), Value::Num(1500.0));
+        assert_eq!(ev("name", &vars), Value::Text("Bob".into()));
+        assert_eq!(ev("Hello {name}!", &vars), Value::Text("Hello Bob!".into()));
+        assert_eq!(ev("-3 * 2", &vars), Value::Num(-6.0));
+        assert!(eval_expr("gold / 0", &vars).is_err());
+        assert!(eval_expr("name + 1", &vars).is_err());
+        assert_eq!(format_number(2.5), "2.5");
+        assert_eq!(format_number(1500.0), "1500");
+        assert!(compare_values(&Value::Text("1 500".into()), CmpOp::Ge, &Value::Num(1000.0)));
+        assert!(compare_values(&Value::Text("Upload complete".into()), CmpOp::Contains, &Value::Text("COMPLETE".into())));
+        assert_eq!(fill_vars("{gold} gold, {missing}!", &vars), "1500 gold, !");
+    }
+
+    #[test]
+    fn copy_paste_and_shift() {
+        let mut m = Macro::default();
+        let a = m.add_node(NodeKind::Wait { ms: 1, jitter_ms: 0 }, 300.0, 180.0);
+        let b = m.add_node(
+            NodeKind::PixelColor { x: 5, y: 6, color: 0xff0000, tolerance: 10, timeout_ms: 0, interval_ms: 100 },
+            600.0,
+            180.0,
+        );
+        m.connect(a, 0, b);
+        let clip = m.copy_steps(&[a, b]).unwrap();
+        let json = serde_json::to_string(&clip).unwrap();
+        let back: StepClip = serde_json::from_str(&json).unwrap();
+        let ids = m.paste_steps(&[], &back, 40.0, 40.0);
+        assert_eq!(ids.len(), 2);
+        assert_eq!(m.next(ids[0], 0), Some(ids[1]));
+        m.shift_positions(10, -5);
+        assert!(matches!(m.node(b).unwrap().kind, NodeKind::PixelColor { x: 15, y: 1, .. }));
+    }
+
+    #[test]
+    fn new_settings_have_safe_defaults_in_old_files() {
+        let m: Macro = serde_json::from_str(include_str!("../examples/hello.json")).unwrap();
+        assert!(!m.human_mouse);
+        assert_eq!(m.mouse_speed, 100);
+        assert!(m.failsafe);
+        assert!(m.root.nodes.iter().all(|n| !n.breakpoint));
+        // A step without a breakpoint saves exactly as before.
+        assert!(!serde_json::to_string(&m.root.nodes[0]).unwrap().contains("breakpoint"));
+        let d: NodeKind = serde_json::from_str(r#"{"type":"Drag","from_x":1,"from_y":2,"to_x":3,"to_y":4}"#).unwrap();
+        assert!(matches!(d, NodeKind::Drag { duration_ms: 400, button: MouseBtn::Left, .. }));
+    }
+
+    #[test]
+    fn positions_scale_between_screens() {
+        let from = ScreenRect { x: 0, y: 0, w: 1920, h: 1080 };
+        let to = ScreenRect { x: 0, y: 0, w: 2560, h: 1440 };
+        let m = Mapping { from, to };
+        assert_eq!(m.point(960, 540), (1280, 720)); // the middle stays the middle
+        assert_eq!(m.point(1919, 0), (2559, 0));
+        assert_eq!(m.inverse().point(1280, 720), (960, 540));
+        let mut k = NodeKind::ReadText {
+            x: 100, y: 100, w: 200, h: 50,
+            compare: TextCompare::Contains, value: String::new(), case_sensitive: false,
+            timeout_ms: 0, interval_ms: 500, preview: None, numbers_only: false, save_to: String::new(),
+        };
+        map_kind(&mut k, &m);
+        assert!(matches!(k, NodeKind::ReadText { x: 133, y: 133, w: 267, h: 67, .. }));
+        assert!(Mapping::translate(0, 0).is_identity());
+        assert_eq!(Mapping::translate(5, -3).point(10, 10), (15, 7));
+        // Old macros don't scale, and save exactly as before.
+        let old: Macro = serde_json::from_str(include_str!("../examples/hello.json")).unwrap();
+        assert!(old.reference.is_none());
+        assert!(serde_json::to_value(&old).unwrap().get("reference").is_none());
+    }
+
+    #[test]
+    fn old_macros_have_no_anchor_and_alerts_on() {
+        let m: Macro = serde_json::from_str(include_str!("../examples/hello.json")).unwrap();
+        assert!(m.anchor.is_none());
+        assert!(m.alert_on_stop);
+        let v: serde_json::Value = serde_json::to_value(&m).unwrap();
+        assert!(v.get("anchor").is_none(), "no anchor saved for macros that don't use one");
+    }
+
+    #[test]
+    fn steps_without_a_name_still_open() {
+        let old = r#"{"id":3,"kind":{"type":"End"},"x":1.0,"y":2.0,"delay_ms":0,"note":""}"#;
+        let n: Node = serde_json::from_str(old).expect("old step should load");
+        assert!(n.name.is_empty());
+        assert_eq!(n.label(), "End");
+        // An unnamed step saves exactly as before.
+        assert!(!serde_json::to_string(&n).unwrap().contains("name"));
     }
 
     #[test]

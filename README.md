@@ -76,7 +76,8 @@ Macro files are the same on both platforms. Keys are saved by name, but **screen
 |---|---|
 | **Title bar** | MacroFlow's own dark title bar: the app name (top left), show/hide panel, New / Open / Save, the macro name (click it to rename), Mouse moves toggle, **● Record**, **◎ Record step** and **▶ Run** / **■ Stop**. On macOS the traffic lights sit in it. On Windows it has minimise / maximise / close buttons. Drag empty space to move the window. |
 | **Left panel** | Three tabs. **Steps**: every step type, grouped (Mouse, Keyboard, Smart checks, Flow & timing, Recording). Click one to add it. **Edit**: settings for the selected step (opens automatically when you click a step). **Macro**: macro-wide settings (name, speed, repeat, start delay, bulk delay tools). ⌘B / Ctrl+B shows or hides the panel. |
-| **Canvas** | Drag steps to move them. Drag from a step's **right-hand dot** to another step to connect them. Click the **×** on a line, or right-click a dot, to disconnect. Drag empty space or scroll to pan. |
+| **Canvas** | **Ctrl + scroll** zooms in and out around the mouse (⌘ + scroll also works on a Mac); the **− 100% + Fit** box at the bottom right does the same, and clicking the % resets to 100%. **Right-click** a step for Edit settings, Rename (F2), Run from here, Group / Ungroup / Open group, Duplicate, Disconnect all and Delete; right-click several selected steps to group or delete them together; right-click empty canvas to **Add step here**, Select all, Zoom to fit, Reset zoom or go Full screen. (On a Mac, Control-click works as right-click.) Drag steps to move them. Drag from a step's **right-hand dot** to another step to connect them. Click the **×** on a line, or right-click a dot, to disconnect. Drag empty space or scroll to pan. |
+| **Log tab** | Every step the last run went through, with timings, what Read text read, what Find image found, variable values and which way each branch went, ending with why it stopped. Click a line to jump to its step. If a step went wrong it also shows a screenshot of the screen at that moment (saved in `Documents/MacroFlow Macros/images/`). **Copy** copies the whole log. |
 | **Status bar** | Shows what's happening and which step is running. The running step is outlined in yellow. When a run ends, it says **why** (reached an End step, a path with nothing connected, you pressed Esc/Stop, or a step went wrong), and the step responsible is outlined in **red** with a "stopped here" tag. If it ended on an unconnected output, that output's dot is red too. **Show step** jumps to it, even inside a group. ✕ clears the highlight. |
 
 If a step is selected, new steps are placed after it and connected automatically.
@@ -90,6 +91,7 @@ If you close the window or quit with unsaved changes, MacroFlow asks whether to 
 |---|---|---|
 | **Start** | next | Every run begins here. |
 | **Click** | next | Left / right / middle, single or double click, at a fixed spot, **randomly inside an area** (drag a box around it), at the found image (+ offset), or wherever the pointer is. **Random offset (px)** moves each click up to that many pixels in a random direction, so it never clicks exactly the same place twice in a row. "Pick position on screen" captures the pointer position after 3 s. |
+| **Drag** | next | Presses a mouse button at a start spot, moves smoothly to an end spot and lets go, for sliders, drag-and-drop or selecting text. **Pick start / end on screen** captures each spot after 3 s. You can set the button and how long the move takes. |
 | **Move mouse** | next | Same targeting options as Click. |
 | **Key press** | next | Any key plus ⌃⌥⇧⌘. Use "Capture key from keyboard" to set it by pressing the keys. |
 | **Type text** | next | Types a string, optionally followed by Return. |
@@ -99,12 +101,44 @@ If you close the window or quit with unsaved changes, MacroFlow asks whether to 
 | **Find image** | **found** / **not found** | Looks for an image on every display until it appears or the timeout runs out. **Drag a box on screen** around what to find, snip the area around the pointer, or choose a PNG. **Look in → One area** limits the search to part of the screen you drag a box around: much faster, and it can't match the same picture somewhere else. "Test now" checks it straight away. You can make it click the image when found. Later Click / Move steps can target the found image. |
 | **Window check** | **yes** / **no** | Checks whether the **current window** (the front window of the app you're using) or **any open window** has a title / app name that contains, equals or starts with some text. Optional match case, "keep checking for N ms" (to wait for a window to open or come to the front) and "bring it to the front if found". **Show open windows** lists what's open right now. Click one to fill in the text. |
 | **Read text** | **match** / **no match** | Reads the text in a screen area using the OCR built into the system (Apple Vision on macOS, Windows OCR on Windows). Each read cleans the image up (enlarges it, boosts contrast, flips light-on-dark text, adds a margin), reads three versions at once and takes the answer they agree on, re-reading if they don't. Number comparisons (and **Only read a number**) fix common misreads (O→0, l→1, S→5), join split digits and handle thousands separators. Click **Select area (drag a box)**: MacroFlow minimises and you drag a box around the text or number anywhere on your screen. Compare as **text** (contains, is exactly, starts with, matches regex, has any text, has changed) or as a **number** (=, ≠, >, ≥, <, ≤, using the first number in the area). "Read now" shows what it reads. "Keep reading for N ms" waits for the condition. A Type text step can type what was read with `{text}`. |
+| **Set variable** | next | Stores a value in a named variable: a number (`0`), a sum (`gold + 1000`, `(a + b) / 2`, `count * 3`, `total % 10`), another variable, or text with `{name}` in it. Unset variables count as 0 in sums, so `count = count + 1` works straight away. Built-in variables: `text` (last Read text), `run` (which repeat this is), `found_x` / `found_y` (last found image). Use any variable as `{name}` in Type text and Pop-up steps. Read text can also **save what it reads into a variable**. |
+| **If** | **yes** / **no** | Compares two values (numbers, variables, sums or text) with =, ≠, >, ≥, <, ≤, contains or doesn't contain, e.g. `gold ≥ gold_before + 1000`. Numbers compare as numbers; text ignores case. |
+| **Pixel colour** | **match** / **no match** | Checks the colour of one spot, e.g. a health bar or a button turning green. **Pick spot & colour** samples it after 3 s; tolerance allows small differences; "Keep checking for" waits for the colour. Much faster than Find image. |
 | **Pop-up** | next | Shows a small card at the top of the screen (top centre or top right) with a title, message and style (Info / Success / Warning / Error), optionally with a sound. It never takes focus, so it doesn't interrupt what the macro is typing or clicking. It fades out after a set time, or with **Pause until I click it** the macro waits for you to click it. `{text}` shows what the last Read text step read. **Preview pop-up** shows it without running the macro. |
 | **Group** | next | A collapsed run of steps that shows as one step (a little stack of cards). Double-click it to open it. See **Groups** below. |
 | **Loop** | **repeat** / **done** | Runs the "repeat" branch N times (0 = forever), then follows "done". Connect the last step of the loop back into the Loop step. |
 | **End** | none | Stops the macro. A step with nothing connected also stops it. |
 
 Every step also has a **Note** and a **Delay before** field.
+
+### Debugging: step by step and breakpoints
+
+- **⏭ Step** in the title bar (or **F10**) starts the macro paused before its first step. Each further F10 / **Step** runs one step and pauses again. The step about to run is outlined in yellow, and the status bar and Log say which it is. **Resume** (F9) runs the rest normally.
+- **Breakpoints:** right-click a step → **Add breakpoint**, or tick **Breakpoint** in its Edit tab. A red dot appears on the step, and the macro pauses just before it runs. From there you can Step or Resume. Breakpoints are saved with the macro; older macros simply have none.
+
+### Human-like mouse movement and the failsafe
+
+- **Human-like mouse movement** (Macro tab) makes the mouse glide to every spot along a slightly curved path that starts slow, speeds up and slows down, different every time. Longer moves take longer. **Mouse speed** adjusts it. Recordings still play back exactly as recorded. It's off for older macros until you turn it on.
+- **Failsafe** (Macro tab, on by default): throwing the mouse into any outer corner of the screen stops the macro instantly. Corners where two monitors meet don't count, and nor does the macro itself moving there. The status bar says "Stopped by the failsafe".
+
+### Hotkeys, pausing and alerts
+
+- **F8** starts the macro from any app, and stops it while it runs. **F10** runs one step (see Debugging above). **F9** pauses and resumes (the ❚❚ Pause button in the title bar does the same). **Esc** still stops.
+- If a run ends **unexpectedly** (a step went wrong, or it reached a path with nothing connected), a **red pop-up** appears at the top of the screen saying why, even when MacroFlow is minimised. Reaching an End step or pressing Stop doesn't count. Turn it off in the **Macro** tab.
+- If MacroFlow itself crashes, a red "MacroFlow crashed" pop-up appears with the reason.
+
+### Working on other screens and computers
+
+In the **Macro** tab, **Scale positions to the screen size** saves every position as a *place on the screen* instead of exact pixels. Moving the macro to a bigger or smaller monitor, or another computer, puts each click, read area, search area, colour check and recording in the same spot. Find image pictures are resized to match too. It's **on for new macros**. Older macros keep exact pixel positions until you switch it on; switching it on doesn't move anything on your current screen. Positions are measured against the main display. If the macro also follows a window, they're measured against that window instead, so they scale with the window's size.
+
+### Following a window
+
+In the **Macro** tab, **Follow a window…** makes every saved position (clicks, click areas, read areas, search areas, colour checks, recordings) relative to the window you pick. Move that window, or use a different monitor, and the macro still clicks the right places. The window is found by app name (and title when it matches). **Use screen positions** turns it off without moving anything.
+
+### Undo, copy and paste
+
+- **Ctrl+Z** undo, **Ctrl+Y** / **Ctrl+Shift+Z** redo (⌘ on a Mac), or the ↶ ↷ buttons in the title bar. A whole drag is one undo.
+- **Ctrl+C / Ctrl+X / Ctrl+V** copy, cut and paste the selected steps and the connections between them. They go on the system clipboard, so you can paste into another macro. Right-click empty canvas → **Paste here** pastes where you clicked.
 
 ### Groups
 
@@ -159,10 +193,14 @@ Select nothing (click empty canvas) to open the **Macro** settings:
 | Delete step | ⌫ | Backspace / Delete |
 | Run / Quit | ⌘R / ⌘Q | Ctrl+R / Ctrl+Q |
 | Group / Ungroup | ⌘G / ⇧⌘G | Ctrl+G / Ctrl+Shift+G |
+| Rename step | F2 | F2 |
+| Zoom in / out / 100% / fit | ⌘= / ⌘− / ⌘0 / ⌘1 (or ⌘ + scroll) | Ctrl+= / Ctrl+− / Ctrl+0 / Ctrl+1 (or Ctrl + scroll) |
+| Full screen | ⌃⌘F (or the green button) | F11 |
+| Select all steps | ⌘A | Ctrl+A |
 | Open group / go back out | Enter (or double-click) / Esc | Enter (or double-click) / Esc |
 | Add to selection | Shift-click | Shift-click |
 
-In a text or number box: Enter/Tab to confirm, Esc to cancel, ⌘V / Ctrl+V to paste, ⌘⌫ / Ctrl+Backspace to clear.
+In a text or number box: click to put the cursor there, drag (or Shift-click) to select, double-click to select everything. **Ctrl+A** (⌘A) selects all, **Ctrl+C / X / V** (⌘C / X / V) copy, cut and paste, **← →** move, **Shift + ← →** select, **Ctrl + ← →** (⌥ ← → on a Mac) jump a word, **Home / End** (⌘ ← → on a Mac) go to the start / end, **Ctrl+Backspace / Delete** (⌥⌫) delete a word. **Enter / Tab** confirms, **Esc** cancels.
 
 ## Files
 
