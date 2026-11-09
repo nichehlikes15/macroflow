@@ -330,8 +330,11 @@ pub fn combo_label(key: &str, mods: &Mods) -> String {
     let m = mods.symbols();
     if m.is_empty() {
         label(key)
-    } else {
+    } else if cfg!(target_os = "macos") {
         format!("{m} {}", label(key))
+    } else {
+        // Windows style: "Ctrl+Shift+S"
+        format!("{m}{}", label(key))
     }
 }
 

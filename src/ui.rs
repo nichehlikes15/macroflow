@@ -69,6 +69,15 @@ enum Mode {
     Working,
 }
 
+/// What the mouse is currently dragging on the canvas.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Drag {
+    None,
+    Node { id: u64, dx: f32, dy: f32 },
+    Pan { x: f32, y: f32 },
+    Connect { from: u64, port: usize },
+}
+
 /// Which page the left sidebar shows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SideTab {
@@ -410,7 +419,7 @@ impl MacroApp {
     /// Take a screenshot and let the user drag a box on it.
     /// Normally MacroFlow hides itself so the screenshot shows what's behind it;
     /// with `countdown` the user gets 3 seconds to switch windows instead.
-    fn start_area(&mut self, purpose: AreaPurpose, countdown: bool, window: &mut Window, cx: &mut Context<Self>) {
+    fn start_area(&mut self, purpose: AreaPurpose, countdown: bool, window: &mut Window, _cx: &mut Context<Self>) {
         if !self.begin_worker(Mode::Capturing) {
             return;
         }
@@ -1277,9 +1286,8 @@ impl MacroApp {
             .child(divider())
             .when(busy, |d| {
                 d.child(
-                    tool_btn("tb-stop", "■ Stop", true)
+                    tool_btn_colored("tb-stop", "■ Stop", true, RED, 0xf47373)
                         .h(px(26.))
-                        .bg(rgb(RED))
                         .text_color(rgb(0xffffff))
                         .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                             this.stop_worker();
@@ -1289,12 +1297,10 @@ impl MacroApp {
             })
             .when(idle, |d| {
                 d.child(
-                    tool_btn("tb-run", "▶ Run", true)
+                    tool_btn_colored("tb-run", "▶ Run", true, GREEN, 0x45d98c)
                         .h(px(26.))
-                        .bg(rgb(GREEN))
                         .text_color(rgb(0x0b1a10))
                         .font_weight(FontWeight::BOLD)
-                        .hover(|s| s.bg(rgb(0x45d98c)))
                         .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                             this.start_run();
                             cx.notify();
@@ -2689,7 +2695,7 @@ impl MacroApp {
                 )))
                 .into_any_element(),
         );
-        out.push(help("⇧-click “Select area” to get 3 seconds to switch to another window first.").into_any_element());
+        out.push(help("Shift-click “Select area” to get 3 seconds to switch to another window first.").into_any_element());
         out.push(self.num_field("X", Field::X, 1.0, cx).into_any_element());
         out.push(self.num_field("Y", Field::Y, 1.0, cx).into_any_element());
         out.push(self.num_field("Width", Field::W, 1.0, cx).into_any_element());
@@ -2892,6 +2898,18 @@ fn stroke_curve(window: &mut Window, x0: f32, y0: f32, x1: f32, y1: f32, width: 
 }
 
 fn tool_btn(id: impl Into<ElementId>, label: &'static str, enabled: bool) -> Stateful<Div> {
+    tool_btn_colored(id, label, enabled, BTN, BTN_HOVER)
+}
+
+/// A solid button. (GPUI only allows one hover style per element, so the hover
+/// colour is chosen here rather than added afterwards.)
+fn tool_btn_colored(
+    id: impl Into<ElementId>,
+    label: &'static str,
+    enabled: bool,
+    bg: u32,
+    hover_bg: u32,
+) -> Stateful<Div> {
     div()
         .id(id)
         .flex()
@@ -2899,9 +2917,9 @@ fn tool_btn(id: impl Into<ElementId>, label: &'static str, enabled: bool) -> Sta
         .px_3()
         .h(px(28.))
         .rounded_md()
-        .bg(rgb(BTN))
+        .bg(rgb(bg))
         .text_color(rgb(TEXT))
-        .when(enabled, |d| d.hover(|s| s.bg(rgb(BTN_HOVER))).cursor_pointer())
+        .when(enabled, |d| d.hover(move |s| s.bg(rgb(hover_bg))).cursor_pointer())
         .when(!enabled, |d| d.opacity(0.4))
         .child(label)
 }

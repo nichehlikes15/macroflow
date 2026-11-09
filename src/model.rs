@@ -728,12 +728,14 @@ impl Macro {
 }
 
 /// Where MacroFlow keeps macros and snipped images by default.
+/// (Not "Documents/MacroFlow": macOS and Windows ignore letter case in folder names,
+/// so that would be the same folder as a "Documents/macroflow" source checkout.)
 pub fn app_dir() -> PathBuf {
     let home = std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
-    home.join("Documents").join("MacroFlow")
+    home.join("Documents").join("MacroFlow Macros")
 }
 
 pub fn images_dir() -> PathBuf {

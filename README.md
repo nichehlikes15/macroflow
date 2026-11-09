@@ -98,7 +98,7 @@ If you close the window or quit with unsaved changes, MacroFlow asks whether to 
 | **Recording** | next | A recorded sequence of raw events. Each event has its own delay, which you can edit, nudge with −/+ (Shift-click for ×10), or delete. You can also halve or double all delays, set them all to one value, remove mouse moves, or change the playback speed. |
 | **Find image** | **found** / **not found** | Looks for an image on every display until it appears or the timeout runs out. **Drag a box on screen** around what to find, snip the area around the pointer, or choose a PNG. "Test now" checks it straight away. You can make it click the image when found. Later Click / Move steps can target the found image. |
 | **Window check** | **yes** / **no** | Checks whether the **current window** (the front window of the app you're using) or **any open window** has a title / app name that contains, equals or starts with some text. Optional match case, "keep checking for N ms" (to wait for a window to open or come to the front) and "bring it to the front if found". **Show open windows** lists what's open right now. Click one to fill in the text. |
-| **Read text** | **match** / **no match** | Reads the text in a screen area using Apple's built-in OCR (Vision). Click **Select area (drag a box)**: MacroFlow hides, takes a screenshot, and you drag a box around the text or number. Compare as **text** (contains, is exactly, starts with, matches regex, has any text, has changed) or as a **number** (=, ≠, >, ≥, <, ≤, using the first number in the area). "Read now" shows what it reads. "Keep reading for N ms" waits for the condition. A Type text step can type what was read with `{text}`. |
+| **Read text** | **match** / **no match** | Reads the text in a screen area using the OCR built into the system (Apple Vision on macOS, Windows OCR on Windows). Click **Select area (drag a box)**: MacroFlow minimises and you drag a box around the text or number anywhere on your screen. Compare as **text** (contains, is exactly, starts with, matches regex, has any text, has changed) or as a **number** (=, ≠, >, ≥, <, ≤, using the first number in the area). "Read now" shows what it reads. "Keep reading for N ms" waits for the condition. A Type text step can type what was read with `{text}`. |
 | **Loop** | **repeat** / **done** | Runs the "repeat" branch N times (0 = forever), then follows "done". Connect the last step of the loop back into the Loop step. |
 | **End** | none | Stops the macro. A step with nothing connected also stops it. |
 
@@ -138,8 +138,8 @@ In a text or number box: Enter/Tab to confirm, Esc to cancel, ⌘V / Ctrl+V to p
 
 ## Files
 
-- Macros are saved as readable JSON. By default they go in `Documents/MacroFlow/` in your home folder.
-- Snipped images are saved in `Documents/MacroFlow/images/`.
+- Macros are saved as readable JSON. By default they go in `Documents/MacroFlow Macros/` in your home folder.
+- Snipped images are saved in `Documents/MacroFlow Macros/images/`.
 - `examples/hello.json` is a small sample you can open.
 
 ## Project layout

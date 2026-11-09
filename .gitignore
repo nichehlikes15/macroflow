@@ -2,3 +2,5 @@
 /dist
 *.DS_Store
 Thumbs.db
+# Macros and snips saved by older builds into this folder
+/images
