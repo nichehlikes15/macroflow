@@ -2,6 +2,7 @@
 //!   helpers/ocr.swift    -> macroflow-ocr     (Read text steps)
 //!   helpers/select.swift -> macroflow-select  (the drag-a-box area selector)
 //!   helpers/notify.swift -> macroflow-notify  (Pop-up steps)
+//!   helpers/marker.swift -> macroflow-marker  (the green dot where a macro clicks)
 //! If one can't be built, MacroFlow still builds; only that feature reports an error.
 //! (On Windows the helpers are PowerShell scripts embedded into the app instead.)
 
@@ -43,6 +44,7 @@ fn main() {
         println!("cargo:rustc-env=MACROFLOW_OCR_HELPER=");
         println!("cargo:rustc-env=MACROFLOW_SELECT_HELPER=");
         println!("cargo:rustc-env=MACROFLOW_NOTIFY_HELPER=");
+        println!("cargo:rustc-env=MACROFLOW_MARKER_HELPER=");
         return;
     }
     build_swift("helpers/ocr.swift", &out_dir, "macroflow-ocr", "MACROFLOW_OCR_HELPER", "Read text steps");
@@ -52,6 +54,13 @@ fn main() {
         "macroflow-notify",
         "MACROFLOW_NOTIFY_HELPER",
         "pop-up steps",
+    );
+    build_swift(
+        "helpers/marker.swift",
+        &out_dir,
+        "macroflow-marker",
+        "MACROFLOW_MARKER_HELPER",
+        "the green click marker",
     );
     build_swift(
         "helpers/select.swift",

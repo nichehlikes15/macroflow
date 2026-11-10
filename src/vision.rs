@@ -48,6 +48,8 @@ pub fn load_template(path: &Path) -> Result<GrayImage, String> {
 }
 
 fn capture_all() -> Result<Vec<Screen>, String> {
+    // Never let the click marker end up in a capture.
+    crate::marker::before_capture();
     let monitors = Monitor::all().map_err(|e| format!("{SCREEN_PERMISSION} ({e})"))?;
     let mut out = Vec::new();
     for m in monitors {
@@ -149,6 +151,157 @@ fn seen_view(screens: &[Screen], hit: &Hit, whole: bool) -> Option<RgbaImage> {
     Some(shrink_for_display(out))
 }
 
+// ---------------------------------------------------------------------------
+// Playback pictures for the run log
+// ---------------------------------------------------------------------------
+
+/// What a playback picture marks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mark {
+    /// A filled green dot (a click, or where a drag presses).
+    Click,
+    /// A green ring (a plain mouse move, or where a drag lets go).
+    Move,
+    /// A ring with arrows (scrolling).
+    Scroll,
+    /// No mark (keys and typing: just the screen).
+    None,
+}
+
+/// The screen around one or two spots (global points), with markers drawn on:
+/// `a` with `mark`, and for a drag a line to a ring at `b`. Without a spot, the
+/// whole display the mouse is on. Small enough to keep lots of them.
+pub fn playback_shot(a: Option<(i32, i32)>, b: Option<(i32, i32)>, mark: Mark) -> Result<RgbaImage, String> {
+    // Without a spot: the display the mouse is on.
+    let (cx, cy) = a.unwrap_or_else(|| {
+        device_query::DeviceState::checked_new()
+            .map(|d| device_query::DeviceQuery::get_mouse(&d).coords)
+            .unwrap_or((0, 0))
+    });
+    let m = Monitor::from_point(cx, cy).map_err(|e| e.to_string())?;
+    let (ox, oy) = (m.x().map_err(|e| e.to_string())?, m.y().map_err(|e| e.to_string())?);
+    let (mw, mh) = (
+        m.width().map_err(|e| e.to_string())? as i32,
+        m.height().map_err(|e| e.to_string())? as i32,
+    );
+    // The part of the screen to keep: around the spot(s), or the whole display.
+    let (x0, y0, x1, y1) = match a {
+        None => (ox, oy, ox + mw, oy + mh),
+        Some((ax, ay)) => {
+            let (bx, by) = b.unwrap_or((ax, ay));
+            let (lx, hx) = (ax.min(bx), ax.max(bx));
+            let (ly, hy) = (ay.min(by), ay.max(by));
+            let w = ((hx - lx) + 240).max(900).min(mw);
+            let h = ((hy - ly) + 160).max(560).min(mh);
+            let cx = (lx + hx) / 2;
+            let cy = (ly + hy) / 2;
+            let x0 = (cx - w / 2).clamp(ox, ox + mw - w);
+            let y0 = (cy - h / 2).clamp(oy, oy + mh - h);
+            (x0, y0, x0 + w, y0 + h)
+        }
+    };
+    let mut img = capture_area_raw(x0, y0, x1 - x0, y1 - y0)?;
+    // From points to this picture's pixels (Retina pictures are twice the size).
+    let k = img.width() as f32 / (x1 - x0).max(1) as f32;
+    let to_px = |(x, y): (i32, i32)| ((x - x0) as f32 * k, (y - y0) as f32 * k);
+    let r = 9.0 * k;
+    let green = [52u8, 199, 123];
+    if let (Some(pa), Some(pb)) = (a, b) {
+        let (p, q) = (to_px(pa), to_px(pb));
+        draw_line(&mut img, p, q, 2.5 * k, green, 0.9);
+        draw_ring(&mut img, q, r, 3.0 * k, green);
+    }
+    if let Some(pa) = a {
+        let p = to_px(pa);
+        match mark {
+            Mark::Click => {
+                // A soft halo, a dark edge, then the dot with a white rim.
+                draw_disc(&mut img, p, r * 2.4, green, 0.22);
+                draw_disc(&mut img, p, r + 2.0 * k, [0, 0, 0], 0.45);
+                draw_disc(&mut img, p, r + 1.0 * k, [255, 255, 255], 0.95);
+                draw_disc(&mut img, p, r - 0.5 * k, green, 1.0);
+            }
+            Mark::Move => draw_ring(&mut img, p, r, 3.0 * k, green),
+            Mark::Scroll => {
+                draw_ring(&mut img, p, r, 3.0 * k, green);
+                draw_line(&mut img, (p.0, p.1 - r * 1.6), (p.0, p.1 - r * 2.8), 2.5 * k, green, 1.0);
+                draw_line(&mut img, (p.0, p.1 + r * 1.6), (p.0, p.1 + r * 2.8), 2.5 * k, green, 1.0);
+            }
+            Mark::None => {}
+        }
+    }
+    Ok(shrink_to(img, 1000))
+}
+
+/// Blend a colour into one pixel.
+fn blend(img: &mut RgbaImage, x: i64, y: i64, c: [u8; 3], a: f32) {
+    if x < 0 || y < 0 || x >= img.width() as i64 || y >= img.height() as i64 || a <= 0.0 {
+        return;
+    }
+    let a = a.min(1.0);
+    let p = img.get_pixel_mut(x as u32, y as u32);
+    for i in 0..3 {
+        p.0[i] = (p.0[i] as f32 * (1.0 - a) + c[i] as f32 * a).round() as u8;
+    }
+    p.0[3] = 255;
+}
+
+/// A filled circle with a soft edge.
+fn draw_disc(img: &mut RgbaImage, (cx, cy): (f32, f32), r: f32, c: [u8; 3], alpha: f32) {
+    let (x0, x1) = ((cx - r - 1.0).floor() as i64, (cx + r + 1.0).ceil() as i64);
+    let (y0, y1) = ((cy - r - 1.0).floor() as i64, (cy + r + 1.0).ceil() as i64);
+    for y in y0..=y1 {
+        for x in x0..=x1 {
+            let d = ((x as f32 + 0.5 - cx).powi(2) + (y as f32 + 0.5 - cy).powi(2)).sqrt();
+            blend(img, x, y, c, alpha * (r - d + 0.5).clamp(0.0, 1.0));
+        }
+    }
+}
+
+/// A circle outline of width `w`.
+fn draw_ring(img: &mut RgbaImage, (cx, cy): (f32, f32), r: f32, w: f32, c: [u8; 3]) {
+    let outer = r + w / 2.0;
+    let (x0, x1) = ((cx - outer - 1.0).floor() as i64, (cx + outer + 1.0).ceil() as i64);
+    let (y0, y1) = ((cy - outer - 1.0).floor() as i64, (cy + outer + 1.0).ceil() as i64);
+    for y in y0..=y1 {
+        for x in x0..=x1 {
+            let d = ((x as f32 + 0.5 - cx).powi(2) + (y as f32 + 0.5 - cy).powi(2)).sqrt();
+            let a = (w / 2.0 - (d - r).abs() + 0.5).clamp(0.0, 1.0);
+            blend(img, x, y, c, a);
+        }
+    }
+}
+
+/// A straight line of width `w`.
+fn draw_line(img: &mut RgbaImage, (ax, ay): (f32, f32), (bx, by): (f32, f32), w: f32, c: [u8; 3], alpha: f32) {
+    let (x0, x1) = ((ax.min(bx) - w).floor() as i64, (ax.max(bx) + w).ceil() as i64);
+    let (y0, y1) = ((ay.min(by) - w).floor() as i64, (ay.max(by) + w).ceil() as i64);
+    let (dx, dy) = (bx - ax, by - ay);
+    let len2 = (dx * dx + dy * dy).max(1e-6);
+    for y in y0..=y1 {
+        for x in x0..=x1 {
+            let (px, py) = (x as f32 + 0.5, y as f32 + 0.5);
+            let t = (((px - ax) * dx + (py - ay) * dy) / len2).clamp(0.0, 1.0);
+            let d = ((px - ax - t * dx).powi(2) + (py - ay - t * dy).powi(2)).sqrt();
+            blend(img, x, y, c, alpha * (w / 2.0 - d + 0.5).clamp(0.0, 1.0));
+        }
+    }
+}
+
+fn shrink_to(img: RgbaImage, max: u32) -> RgbaImage {
+    let (w, h) = img.dimensions();
+    if w <= max && h <= max {
+        return img;
+    }
+    let f = max as f32 / w.max(h) as f32;
+    imageops::resize(
+        &img,
+        ((w as f32 * f).round() as u32).max(1),
+        ((h as f32 * f).round() as u32).max(1),
+        FilterType::Triangle,
+    )
+}
+
 /// Draw a hollow rectangle (clipped to the image).
 fn draw_box(img: &mut RgbaImage, x: u32, y: u32, w: u32, h: u32, t: u32, color: [u8; 4]) {
     let (iw, ih) = img.dimensions();
@@ -237,6 +390,8 @@ fn locate_on(screens: &[Screen], template: &GrayImage, threshold: f32) -> Result
 
 /// Grab a square of `size` points centred on (x, y) in global screen points.
 pub fn snip_around(x: i32, y: i32, size: u32) -> Result<RgbaImage, String> {
+    // Never let the click marker end up in a capture.
+    crate::marker::before_capture();
     let m = Monitor::from_point(x, y).map_err(|e| format!("{SCREEN_PERMISSION} ({e})"))?;
     let ox = m.x().map_err(|e| e.to_string())?;
     let oy = m.y().map_err(|e| e.to_string())?;
@@ -291,6 +446,8 @@ pub struct Shot {
 
 /// Screenshot the display under (x, y) and save it to a temporary file.
 pub fn screenshot_display_at(x: i32, y: i32) -> Result<Shot, String> {
+    // Never let the click marker end up in a capture.
+    crate::marker::before_capture();
     let m = Monitor::from_point(x, y)
         .or_else(|_| {
             Monitor::all()
@@ -483,6 +640,7 @@ pub fn warm_up_selector() {
                 .stderr(Stdio::null())
                 .status();
         }
+        crate::marker::warm_up();
     });
 }
 
@@ -634,6 +792,8 @@ pub fn screen_corners() -> Vec<(i32, i32)> {
 
 /// The colour (0xRRGGBB) of one spot on the screen.
 pub fn pixel_at(x: i32, y: i32) -> Result<u32, String> {
+    // Never let the click marker end up in a capture.
+    crate::marker::before_capture();
     let m = Monitor::from_point(x, y).map_err(|e| format!("({x}, {y}) isn't on any display ({e})."))?;
     let lx = (x - m.x().map_err(|e| e.to_string())?).max(0) as u32;
     let ly = (y - m.y().map_err(|e| e.to_string())?).max(0) as u32;
@@ -651,6 +811,14 @@ pub fn pixel_at(x: i32, y: i32) -> Result<u32, String> {
 
 /// Capture a live area of the screen (global points) at full resolution.
 pub fn capture_area(x: i32, y: i32, w: i32, h: i32) -> Result<RgbaImage, String> {
+    // Never let the click marker end up in a capture.
+    crate::marker::before_capture();
+    capture_area_raw(x, y, w, h)
+}
+
+/// `capture_area` without taking the click marker down first (for the run log's
+/// playback pictures, where it doesn't matter and waiting would slow the macro).
+fn capture_area_raw(x: i32, y: i32, w: i32, h: i32) -> Result<RgbaImage, String> {
     if w < 2 || h < 2 {
         return Err("Select an area on screen first.".into());
     }
@@ -673,7 +841,7 @@ pub fn capture_area(x: i32, y: i32, w: i32, h: i32) -> Result<RgbaImage, String>
 
 /// Find a helper built by build.rs (or a copy next to the executable, for a packaged app).
 #[cfg(target_os = "macos")]
-fn mac_helper(built: Option<&'static str>, name: &str, what: &str) -> Result<PathBuf, String> {
+pub(crate) fn mac_helper(built: Option<&'static str>, name: &str, what: &str) -> Result<PathBuf, String> {
     let built = built.unwrap_or("");
     if !built.is_empty() && Path::new(built).exists() {
         return Ok(PathBuf::from(built));
@@ -730,7 +898,7 @@ fn run_ocr_batch(paths: &[PathBuf]) -> Result<Vec<String>, String> {
 const WINDOWS_OCR_SCRIPT: &str = include_str!("../helpers/ocr.ps1");
 
 #[cfg(target_os = "windows")]
-fn hidden_powershell() -> Command {
+pub(crate) fn hidden_powershell() -> Command {
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     let mut cmd = Command::new("powershell.exe");
@@ -852,7 +1020,16 @@ fn border_mean(g: &GrayImage) -> f32 {
 
 /// Black-and-white version using Otsu's threshold.
 fn binarize(g: &GrayImage) -> GrayImage {
-    let h = histogram(g);
+    let threshold = otsu_threshold(&histogram(g));
+    let mut out = g.clone();
+    for p in out.pixels_mut() {
+        p.0[0] = if p.0[0] > threshold { 255 } else { 0 };
+    }
+    out
+}
+
+/// The brightness that best splits a histogram into two groups (Otsu's method).
+fn otsu_threshold(h: &[u32; 256]) -> u8 {
     let total: f64 = h.iter().map(|c| *c as f64).sum();
     let sum_all: f64 = h.iter().enumerate().map(|(i, c)| i as f64 * *c as f64).sum();
     let (mut sum_b, mut w_b, mut best, mut threshold) = (0f64, 0f64, 0f64, 128u8);
@@ -873,11 +1050,7 @@ fn binarize(g: &GrayImage) -> GrayImage {
             threshold = t as u8;
         }
     }
-    let mut out = g.clone();
-    for p in out.pixels_mut() {
-        p.0[0] = if p.0[0] > threshold { 255 } else { 0 };
-    }
-    out
+    threshold
 }
 
 /// Surround with a white margin: OCR often drops characters that touch the image edge.
@@ -885,6 +1058,182 @@ fn pad_white(g: &GrayImage, pad: u32) -> GrayImage {
     let (w, h) = g.dimensions();
     let mut out = GrayImage::from_pixel(w + pad * 2, h + pad * 2, image::Luma([255]));
     imageops::overlay(&mut out, g, pad as i64, pad as i64);
+    out
+}
+
+// --- text with a fill colour and an outline (game numbers) -------------------
+
+/// One connected blob of ink in a mask.
+#[derive(Clone, Copy, Debug)]
+struct Blob {
+    x0: u32,
+    y0: u32,
+    x1: u32,
+    y1: u32,
+    area: u32,
+}
+
+impl Blob {
+    fn w(&self) -> u32 {
+        self.x1 - self.x0 + 1
+    }
+    fn h(&self) -> u32 {
+        self.y1 - self.y0 + 1
+    }
+}
+
+/// Label the blobs of `ink` pixels (8-connected). Returns the label of every pixel
+/// (0 = not ink) and the blobs (label n is `blobs[n - 1]`).
+fn blobs(ink: &[bool], w: u32, h: u32) -> (Vec<u32>, Vec<Blob>) {
+    let (w, h) = (w as usize, h as usize);
+    let mut label = vec![0u32; w * h];
+    let mut out: Vec<Blob> = Vec::new();
+    let mut stack: Vec<usize> = Vec::new();
+    for start in 0..w * h {
+        if !ink[start] || label[start] != 0 {
+            continue;
+        }
+        let id = out.len() as u32 + 1;
+        let (sx, sy) = ((start % w) as u32, (start / w) as u32);
+        let mut b = Blob { x0: sx, y0: sy, x1: sx, y1: sy, area: 0 };
+        label[start] = id;
+        stack.push(start);
+        while let Some(p) = stack.pop() {
+            let (x, y) = (p % w, p / w);
+            b.area += 1;
+            b.x0 = b.x0.min(x as u32);
+            b.x1 = b.x1.max(x as u32);
+            b.y0 = b.y0.min(y as u32);
+            b.y1 = b.y1.max(y as u32);
+            for dy in -1i32..=1 {
+                for dx in -1i32..=1 {
+                    let (nx, ny) = (x as i32 + dx, y as i32 + dy);
+                    if nx < 0 || ny < 0 || nx >= w as i32 || ny >= h as i32 {
+                        continue;
+                    }
+                    let q = ny as usize * w + nx as usize;
+                    if ink[q] && label[q] == 0 {
+                        label[q] = id;
+                        stack.push(q);
+                    }
+                }
+            }
+        }
+        out.push(b);
+    }
+    (label, out)
+}
+
+/// Keep only the blobs that look like characters of one line of text: about the
+/// same height, not much wider than tall, not a solid block, not a strip of
+/// background running edge to edge. Small marks in the same line (dots, commas,
+/// decimal points) are kept too. Returns the cleaned mask (black ink on white) and
+/// how many character-like blobs it kept (0 = this doesn't look like text).
+fn keep_text_blobs(ink: &[bool], w: u32, h: u32) -> (GrayImage, usize) {
+    let (label, all) = blobs(ink, w, h);
+    let min_h = ((h as f32 * 0.15) as u32).max(6);
+    let glyph = |b: &Blob| {
+        let fill = b.area as f32 / (b.w() * b.h()) as f32;
+        let spans_width = b.x0 == 0 && b.x1 == w - 1;
+        b.h() >= min_h && b.w() as f32 <= b.h() as f32 * 2.0 && (0.1..0.97).contains(&fill) && !spans_width
+    };
+    let mut heights: Vec<u32> = all.iter().filter(|b| glyph(b)).map(|b| b.h()).collect();
+    let mut out = GrayImage::from_pixel(w, h, image::Luma([255]));
+    if heights.is_empty() {
+        return (out, 0);
+    }
+    heights.sort_unstable();
+    let text_h = heights[heights.len() / 2] as f32;
+    let mut keep = vec![false; all.len()];
+    let mut count = 0;
+    let (mut top, mut bottom, mut left, mut right) = (u32::MAX, 0u32, u32::MAX, 0u32);
+    for (i, b) in all.iter().enumerate() {
+        let hh = b.h() as f32;
+        if glyph(b) && hh >= text_h * 0.6 && hh <= text_h * 1.4 {
+            keep[i] = true;
+            count += 1;
+            top = top.min(b.y0);
+            bottom = bottom.max(b.y1);
+            left = left.min(b.x0);
+            right = right.max(b.x1);
+        }
+    }
+    if count == 0 {
+        return (out, 0);
+    }
+    // Small marks inside the line of text (a decimal point, a comma, the dot of an i).
+    let band = (text_h * 0.3) as u32;
+    for (i, b) in all.iter().enumerate() {
+        let small = (b.h() as f32) < text_h * 0.6 && (b.h() as f32) >= text_h * 0.12;
+        let inside = b.y0 + band >= top && b.y1 <= bottom + band && b.x0 >= left && b.x1 <= right;
+        if !keep[i] && small && inside && (b.w() as f32) < text_h {
+            keep[i] = true;
+        }
+    }
+    for (p, l) in label.iter().enumerate() {
+        if *l > 0 && keep[*l as usize - 1] {
+            out.put_pixel(p as u32 % w, p as u32 / w, image::Luma([0]));
+        }
+    }
+    (out, count)
+}
+
+/// Versions of the area that keep only one colour of letter fill, as black on white:
+/// light fills (white or cream text, judged by its darkest colour channel, so
+/// coloured backgrounds drop out) and dark fills (by its brightest channel). Each
+/// is tried at two thresholds, since outlined text has three layers (fill, outline,
+/// background). The ones that look most like a line of text come first.
+fn fill_masks(img: &RgbaImage) -> Vec<GrayImage> {
+    let (w, h) = img.dimensions();
+    if w < 4 || h < 4 {
+        return Vec::new();
+    }
+    let mut tries: Vec<(usize, usize, GrayImage)> = Vec::new();
+    for light in [true, false] {
+        let ch: Vec<u8> = img
+            .pixels()
+            .map(|p| {
+                let [r, g, b, _] = p.0;
+                if light { r.min(g).min(b) } else { r.max(g).max(b) }
+            })
+            .collect();
+        let mut hist = [0u32; 256];
+        for v in &ch {
+            hist[*v as usize] += 1;
+        }
+        let t1 = otsu_threshold(&hist);
+        // The second split: within the side the fill would be on.
+        let mut side = [0u32; 256];
+        for (i, c) in hist.iter().enumerate() {
+            if (light && i as u8 > t1) || (!light && i as u8 <= t1) {
+                side[i] = *c;
+            }
+        }
+        let t2 = otsu_threshold(&side);
+        for t in [t1, t2] {
+            let ink: Vec<bool> = ch.iter().map(|v| if light { *v > t } else { *v <= t }).collect();
+            let (mask, score) = keep_text_blobs(&ink, w, h);
+            if score > 0 {
+                tries.push((score, tries.len(), mask));
+            }
+        }
+    }
+    // Most character-like first; ties keep the light-text versions first.
+    tries.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+    tries.into_iter().take(2).map(|(_, _, m)| m).collect()
+}
+
+/// The capture with what the reader was actually given underneath it, so you can
+/// see why it read what it read.
+fn reader_preview(shot: &RgbaImage, seen: &GrayImage) -> RgbaImage {
+    let w = shot.width().max(1);
+    let sh = ((seen.height() as f32 * w as f32 / seen.width().max(1) as f32).round() as u32).max(1);
+    let seen = imageops::resize(seen, w, sh, FilterType::Triangle);
+    let gap = (w / 120).max(3);
+    let mut out = RgbaImage::from_pixel(w, shot.height() + gap + sh, image::Rgba([60, 66, 80, 255]));
+    imageops::overlay(&mut out, shot, 0, 0);
+    let seen = image::DynamicImage::ImageLuma8(seen).to_rgba8();
+    imageops::overlay(&mut out, &seen, 0, (shot.height() + gap) as i64);
     out
 }
 
@@ -911,6 +1260,29 @@ fn ocr_variants(img: &RgbaImage, mode: OcrMode) -> Vec<GrayImage> {
     let mut f = (target / h.max(1) as f32).clamp(1.0, 8.0);
     f = f.min(max_side / w.max(h).max(1) as f32).max(0.25);
 
+    // Versions that keep only the letters' fill colour come first: they cope with
+    // outlined text on busy backgrounds (game numbers), where plain black-and-white
+    // versions turn the outlines into extra shapes.
+    let color = if (f - 1.0).abs() < 0.05 {
+        img.clone()
+    } else {
+        let nw = ((img.width() as f32 * f).round() as u32).max(1);
+        let nh = ((img.height() as f32 * f).round() as u32).max(1);
+        imageops::resize(img, nw, nh, FilterType::CatmullRom)
+    };
+    let masks = fill_masks(&color);
+    let mut out: Vec<GrayImage> = masks
+        .iter()
+        .map(|m| pad_white(m, (m.height() / 3).clamp(16, 120)))
+        .collect();
+    // The best one a bit smaller too (very large characters can trip the reader up).
+    if let Some(m) = masks.first() {
+        let small = scaled(m, 0.6);
+        if small.height() >= 32 {
+            out.push(pad_white(&small, (small.height() / 3).clamp(16, 120)));
+        }
+    }
+
     let base = stretch_contrast(&scaled(&gray, f));
     // Light text on a dark background (common in games and dark themes): flip it.
     let base = if border_mean(&base) < 128.0 {
@@ -921,7 +1293,8 @@ fn ocr_variants(img: &RgbaImage, mode: OcrMode) -> Vec<GrayImage> {
         base
     };
     let pad = (base.height() / 3).clamp(16, 120);
-    let mut out = vec![pad_white(&base, pad), pad_white(&binarize(&base), pad)];
+    out.push(pad_white(&base, pad));
+    out.push(pad_white(&binarize(&base), pad));
     // The same thing a bit smaller: engines sometimes split or merge characters at one
     // size but not another.
     let smaller = scaled(&base, 0.6);
@@ -942,6 +1315,12 @@ fn normalise_text(t: &str) -> String {
 
 /// Read the text inside an image.
 pub fn ocr_image(img: &RgbaImage, mode: OcrMode) -> Result<OcrRead, String> {
+    ocr_image_detailed(img, mode).map(|(r, _)| r)
+}
+
+/// `ocr_image`, also returning the cleaned-up versions it read (in the same order
+/// as `raw`).
+fn ocr_image_detailed(img: &RgbaImage, mode: OcrMode) -> Result<(OcrRead, Vec<GrayImage>), String> {
     let variants = ocr_variants(img, mode);
     let mut paths = Vec::new();
     for (i, v) in variants.iter().enumerate() {
@@ -958,18 +1337,20 @@ pub fn ocr_image(img: &RgbaImage, mode: OcrMode) -> Result<OcrRead, String> {
         let _ = std::fs::remove_file(p);
     }
     let raw: Vec<String> = result?.iter().map(|r| normalise_text(r)).collect();
-    Ok(vote(raw, mode))
+    Ok((vote(raw, mode), variants))
+}
+
+/// What a read counts as (for numbers, the cleaned-up number).
+fn answer(raw: &str, mode: OcrMode) -> String {
+    match mode {
+        OcrMode::Text => raw.to_string(),
+        OcrMode::Number => crate::model::clean_number(raw).unwrap_or_default(),
+    }
 }
 
 /// Pick the answer most of the reads agree on.
 fn vote(raw: Vec<String>, mode: OcrMode) -> OcrRead {
-    let answers: Vec<String> = raw
-        .iter()
-        .map(|r| match mode {
-            OcrMode::Text => r.clone(),
-            OcrMode::Number => crate::model::clean_number(r).unwrap_or_default(),
-        })
-        .collect();
+    let answers: Vec<String> = raw.iter().map(|r| answer(r, mode)).collect();
     // Most common non-empty answer wins; ties go to the longest, then to the earlier,
     // cleaner version. For numbers, a read that's part of a longer read ("892" inside
     // "892390", "892039" inside "1892039") counts as agreeing with the longer one:
@@ -1019,8 +1400,9 @@ pub fn read_text_sure(
     read_text_seen(x, y, w, h, mode, stop).map(|(r, _)| r)
 }
 
-/// Like `read_text_sure`, and also returns the capture of the area that was read
-/// (the last one, if it read more than once).
+/// Like `read_text_sure`, and also returns a picture of the area that was read (the
+/// last capture, if it read more than once) with, underneath, the cleaned-up
+/// version the reader was given.
 pub fn read_text_seen(
     x: i32,
     y: i32,
@@ -1033,16 +1415,28 @@ pub fn read_text_seen(
     let mut result = None;
     for _ in 0..3 {
         let shot = capture_area(x, y, w, h)?;
-        let r = ocr_image(&shot, mode)?;
+        let (r, variants) = ocr_image_detailed(&shot, mode)?;
+        let round = r.raw.clone();
         pooled.extend(r.raw);
         let v = vote(pooled.clone(), mode);
         let sure = v.agreed >= 2;
-        result = Some((v, shot));
+        result = Some((v, shot, variants, round));
         if sure || stop() {
             break;
         }
     }
-    Ok(result.expect("at least one read"))
+    let (v, shot, variants, round) = result.expect("at least one read");
+    // Show the version that gave the answer (or the first one that read anything).
+    let pick = round
+        .iter()
+        .position(|r| !v.text.is_empty() && answer(r, mode) == v.text)
+        .or_else(|| round.iter().position(|r| !answer(r, mode).is_empty()))
+        .unwrap_or(0);
+    let preview = match variants.get(pick) {
+        Some(seen) => reader_preview(&shot, seen),
+        None => shot,
+    };
+    Ok((v, preview))
 }
 
 // ---------------------------------------------------------------------------
@@ -1399,4 +1793,66 @@ pub fn match_template(screen: &GrayImage, tpl: &GrayImage) -> Option<(u32, u32, 
         }
     }
     best
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// White "0"s with a thick black outline on a speckled pink background,
+    /// like the numbers in many games.
+    fn outlined_digits() -> RgbaImage {
+        let (w, h) = (320u32, 110u32);
+        let mut img = RgbaImage::from_fn(w, h, |x, y| {
+            let n = (x * 7 + y * 13) % 23;
+            image::Rgba([220 + (n as u8 % 30), 90 + n as u8 * 3, 160, 255])
+        });
+        for (i, cx) in [60i32, 160, 260].iter().enumerate() {
+            let _ = i;
+            for y in 0..h as i32 {
+                for x in 0..w as i32 {
+                    // An oval ring: fill 22..34 from the centre, outline 34..40.
+                    let dx = (x - cx) as f32 / 0.6;
+                    let d = (dx * dx + ((y - 55) as f32).powi(2)).sqrt();
+                    let c = if (22.0..34.0).contains(&d) {
+                        Some([250, 248, 235])
+                    } else if (18.0..22.0).contains(&d) || (34.0..40.0).contains(&d) {
+                        Some([10, 10, 10])
+                    } else {
+                        None
+                    };
+                    if let Some([r, g, b]) = c {
+                        img.put_pixel(x as u32, y as u32, image::Rgba([r, g, b, 255]));
+                    }
+                }
+            }
+        }
+        img
+    }
+
+    #[test]
+    fn fill_mask_keeps_only_the_letters() {
+        let img = outlined_digits();
+        let masks = fill_masks(&img);
+        assert!(!masks.is_empty());
+        let m = &masks[0];
+        // Ink on the fill of each digit, none on the background or the outline.
+        assert_eq!(m.get_pixel(60, 55 - 28).0[0], 0, "fill");
+        assert_eq!(m.get_pixel(110, 10).0[0], 255, "background");
+        assert_eq!(m.get_pixel(60, 55 - 37).0[0], 255, "outline");
+        let ink: Vec<bool> = m.pixels().map(|p| p.0[0] == 0).collect();
+        let (_, found) = blobs(&ink, m.width(), m.height());
+        assert_eq!(found.len(), 3);
+    }
+
+    #[test]
+    fn reader_preview_stacks_both_pictures() {
+        let shot = RgbaImage::from_pixel(200, 50, image::Rgba([255, 0, 0, 255]));
+        let seen = GrayImage::from_pixel(400, 150, image::Luma([0]));
+        let p = reader_preview(&shot, &seen);
+        assert_eq!(p.width(), 200);
+        assert!(p.height() > 50 + 70);
+        assert_eq!(p.get_pixel(5, 5).0, [255, 0, 0, 255]);
+        assert_eq!(p.get_pixel(5, p.height() - 2).0, [0, 0, 0, 255]);
+    }
 }

@@ -1,5 +1,6 @@
 mod engine;
 mod keys;
+mod marker;
 mod model;
 mod ui;
 mod vision;

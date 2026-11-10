@@ -526,6 +526,10 @@ pub enum NodeKind {
         /// Optional, so macros saved before this existed still open.
         #[serde(default)]
         search_area: Option<ScreenRect>,
+        /// Wait for the image to go away instead ("gone" / "still there").
+        /// Optional, so older macros still open.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        until_gone: bool,
     },
     Loop {
         count: u32,
@@ -560,6 +564,10 @@ pub enum NodeKind {
         /// Also store what was read in this variable (empty = don't).
         #[serde(default)]
         save_to: String,
+        /// Wait until the text stops matching instead ("gone" / "still there").
+        /// Optional, so older macros still open.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        until_gone: bool,
     },
     /// Hold a mouse button at one spot, move to another, and let go.
     Drag {
@@ -708,6 +716,16 @@ impl NodeKind {
                 interval_ms: 250,
                 click_when_found: false,
                 search_area: None,
+                until_gone: false,
+            },
+            NodeKind::FindImage {
+                template: None,
+                threshold: 0.85,
+                timeout_ms: 30000,
+                interval_ms: 250,
+                click_when_found: false,
+                search_area: None,
+                until_gone: true,
             },
             NodeKind::WindowCheck {
                 scope: WinScope::Frontmost,
@@ -732,6 +750,7 @@ impl NodeKind {
                 preview: None,
                 numbers_only: false,
                 save_to: String::new(),
+                until_gone: false,
             },
             NodeKind::PixelColor {
                 x: 0,
@@ -774,6 +793,7 @@ impl NodeKind {
             NodeKind::Wait { .. } => "Wait",
             NodeKind::Scroll { .. } => "Scroll",
             NodeKind::Recording { .. } => "Recording",
+            NodeKind::FindImage { until_gone: true, .. } => "Wait until gone",
             NodeKind::FindImage { .. } => "Find image",
             NodeKind::Loop { .. } => "Loop",
             NodeKind::WindowCheck { .. } => "Window check",
@@ -849,6 +869,9 @@ impl NodeKind {
     pub fn outputs(&self) -> &'static [&'static str] {
         match self {
             NodeKind::End | NodeKind::GroupOut => &[],
+            NodeKind::FindImage { until_gone: true, .. } | NodeKind::ReadText { until_gone: true, .. } => {
+                &["gone", "still there"]
+            }
             NodeKind::FindImage { .. } => &["found", "not found"],
             NodeKind::Loop { .. } => &["repeat", "done"],
             NodeKind::WindowCheck { .. } => &["yes", "no"],
@@ -967,7 +990,11 @@ impl NodeKind {
                     .map(|n| n.to_string_lossy().to_string())
                     .unwrap_or_else(|| "no image yet".into());
                 let area = if search_area.is_some() { " · in area" } else { "" };
-                format!("{name} · ≥{:.0}% · {timeout_ms} ms{area}", threshold * 100.0)
+                if matches!(self, NodeKind::FindImage { until_gone: true, .. }) {
+                    format!("until {name} is gone · up to {timeout_ms} ms{area}")
+                } else {
+                    format!("{name} · ≥{:.0}% · {timeout_ms} ms{area}", threshold * 100.0)
+                }
             }
             NodeKind::Loop { count } => {
                 if *count == 0 {
@@ -1005,12 +1032,13 @@ impl NodeKind {
                 }
             }
             NodeKind::ReadText {
-                w, h, compare, value, ..
+                w, h, compare, value, until_gone, ..
             } => {
                 if *w <= 0 || *h <= 0 {
                     return "Select an area on screen".into();
                 }
                 let what = if compare.is_number() { "Number" } else { "Text" };
+                let what = if *until_gone { format!("Until no longer: {}", what.to_lowercase()) } else { what.to_string() };
                 if compare.needs_value() {
                     format!("{what} {} “{value}”", compare.label())
                 } else {
@@ -1105,6 +1133,10 @@ pub struct Node {
     /// Pause here when the macro reaches this step (debugging).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub breakpoint: bool,
+    /// Skip this step (or the whole group) and carry on with what it's connected to.
+    /// Optional, so older macros still open.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub disabled: bool,
 }
 
 impl Node {
@@ -1325,6 +1357,8 @@ pub struct Macro {
     pub alert_on_finish: bool,
     /// Show a pop-up when the macro pauses at a breakpoint.
     pub alert_on_breakpoint: bool,
+    /// Show a green dot where the macro is about to click while it runs.
+    pub show_clicks: bool,
 }
 
 /// The macro exactly as it's written to disk. This is the same layout older
@@ -1359,6 +1393,8 @@ struct MacroFile {
     alert_on_finish: bool,
     #[serde(default = "default_true", skip_serializing_if = "is_true")]
     alert_on_breakpoint: bool,
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    show_clicks: bool,
 }
 
 impl From<MacroFile> for Macro {
@@ -1385,6 +1421,7 @@ impl From<MacroFile> for Macro {
             failsafe: f.failsafe,
             alert_on_finish: f.alert_on_finish,
             alert_on_breakpoint: f.alert_on_breakpoint,
+            show_clicks: f.show_clicks,
         }
     }
 }
@@ -1408,6 +1445,7 @@ impl From<Macro> for MacroFile {
             failsafe: m.failsafe,
             alert_on_finish: m.alert_on_finish,
             alert_on_breakpoint: m.alert_on_breakpoint,
+            show_clicks: m.show_clicks,
         }
     }
 }
@@ -1443,6 +1481,7 @@ impl Default for Macro {
             failsafe: true,
             alert_on_finish: false,
             alert_on_breakpoint: true,
+            show_clicks: true,
         };
         m.add_node(NodeKind::Start, 60.0, 180.0);
         m
@@ -1459,6 +1498,7 @@ fn blank_node(id: u64, kind: NodeKind, x: f32, y: f32) -> Node {
         note: String::new(),
         name: String::new(),
         breakpoint: false,
+        disabled: false,
     }
 }
 
@@ -1521,6 +1561,37 @@ impl Macro {
 
     pub fn next(&self, from: u64, port: usize) -> Option<u64> {
         self.root.owner(from)?.next_local(from, port)
+    }
+
+    /// Where a run goes when it skips a disabled step: its first output that's
+    /// connected (normally "next"; for a branching step, the first branch that leads
+    /// somewhere). Returns the output and the step it leads to (None = nothing).
+    pub fn skip_target(&self, id: u64) -> (usize, Option<u64>) {
+        let outputs = self.node(id).map_or(0, |n| n.kind.outputs().len());
+        for port in 0..outputs {
+            if let Some(to) = self.next(id, port) {
+                return (port, Some(to));
+            }
+        }
+        (0, None)
+    }
+
+    /// Can this step be disabled? (Start and a group's start / end can't.)
+    pub fn can_disable(&self, id: u64) -> bool {
+        self.node(id).map_or(false, |n| !n.kind.is_fixed())
+    }
+
+    /// Is this step skipped when the macro runs: disabled itself, or inside a
+    /// disabled group?
+    pub fn is_skipped(&self, id: u64) -> bool {
+        if self.node(id).map_or(false, |n| n.disabled) {
+            return true;
+        }
+        self.root
+            .path_to(id)
+            .unwrap_or_default()
+            .iter()
+            .any(|g| self.node(*g).map_or(false, |n| n.disabled))
     }
 
     pub fn start_id(&self) -> Option<u64> {
@@ -2527,6 +2598,365 @@ impl Macro {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Ready-made macros, recent files and autosave
+// ---------------------------------------------------------------------------
+
+/// The palette's default step with this title (e.g. "Click").
+fn stock(title: &str) -> NodeKind {
+    NodeKind::palette()
+        .into_iter()
+        .find(|k| k.title() == title)
+        .unwrap_or(NodeKind::End)
+}
+
+/// A few macros to start from: (name, what it does, the macro).
+pub fn templates() -> Vec<(&'static str, &'static str, Macro)> {
+    let col = |i: f32| 60.0 + i * 270.0;
+    let mut out = Vec::new();
+
+    // Click over and over.
+    {
+        let mut m = Macro::default();
+        m.name = "Click over and over".into();
+        let start = m.start_id().unwrap_or(1);
+        let lp = m.add_node(NodeKind::Loop { count: 10 }, col(1.0), 180.0);
+        let mut click = stock("Click");
+        if let NodeKind::Click { target, .. } = &mut click {
+            *target = Target::Current;
+        }
+        let click = m.add_node(click, col(2.0), 80.0);
+        let wait = m.add_node(NodeKind::Wait { ms: 500, jitter_ms: 100 }, col(3.0), 80.0);
+        let mut done = stock("Pop-up");
+        if let NodeKind::Notify { title, message, style, .. } = &mut done {
+            *title = "Done".into();
+            *message = "Clicked 10 times.".into();
+            *style = NoticeStyle::Success;
+        }
+        let done = m.add_node(done, col(2.0), 300.0);
+        let end = m.add_node(NodeKind::End, col(3.0), 300.0);
+        m.connect(start, 0, lp);
+        m.connect(lp, 0, click);
+        m.connect(click, 0, wait);
+        m.connect(wait, 0, lp);
+        m.connect(lp, 1, done);
+        m.connect(done, 0, end);
+        out.push(("Click over and over", "Clicks where the mouse is 10 times, with a short random wait.", m));
+    }
+
+    // Wait for an image, then click it.
+    {
+        let mut m = Macro::default();
+        m.name = "Find and click an image".into();
+        let start = m.start_id().unwrap_or(1);
+        let mut find = stock("Find image");
+        if let NodeKind::FindImage { click_when_found, timeout_ms, .. } = &mut find {
+            *click_when_found = true;
+            *timeout_ms = 10000;
+        }
+        let find = m.add_node(find, col(1.0), 180.0);
+        let end = m.add_node(NodeKind::End, col(2.0), 100.0);
+        let mut missed = stock("Pop-up");
+        if let NodeKind::Notify { title, message, style, .. } = &mut missed {
+            *title = "Couldn't find it".into();
+            *message = "The image didn't show up within 10 seconds.".into();
+            *style = NoticeStyle::Warning;
+        }
+        let missed = m.add_node(missed, col(2.0), 260.0);
+        let end2 = m.add_node(NodeKind::End, col(3.0), 260.0);
+        m.connect(start, 0, find);
+        m.connect(find, 0, end);
+        m.connect(find, 1, missed);
+        m.connect(missed, 0, end2);
+        out.push(("Find and click an image", "Waits up to 10 s for an image and clicks it. Snip the image first.", m));
+    }
+
+    // Read a number and react to it.
+    {
+        let mut m = Macro::default();
+        m.name = "Watch a number".into();
+        let start = m.start_id().unwrap_or(1);
+        let mut read = stock("Read text");
+        if let NodeKind::ReadText { compare, numbers_only, save_to, .. } = &mut read {
+            *compare = TextCompare::NotEmpty;
+            *numbers_only = true;
+            *save_to = "amount".into();
+        }
+        let read = m.add_node(read, col(1.0), 180.0);
+        let check = m.add_node(
+            NodeKind::IfCompare { left: "amount".into(), op: CmpOp::Ge, right: "1000".into() },
+            col(2.0),
+            100.0,
+        );
+        let mut hit = stock("Pop-up");
+        if let NodeKind::Notify { title, message, style, .. } = &mut hit {
+            *title = "Reached it".into();
+            *message = "It's {amount} now.".into();
+            *style = NoticeStyle::Success;
+        }
+        let hit = m.add_node(hit, col(3.0), 40.0);
+        let end = m.add_node(NodeKind::End, col(4.0), 40.0);
+        let wait = m.add_node(NodeKind::Wait { ms: 2000, jitter_ms: 0 }, col(3.0), 260.0);
+        m.connect(start, 0, read);
+        m.connect(read, 0, check);
+        m.connect(read, 1, wait);
+        m.connect(check, 0, hit);
+        m.connect(hit, 0, end);
+        m.connect(check, 1, wait);
+        m.connect(wait, 0, read);
+        out.push(("Watch a number", "Reads a number every 2 s and pops up once it reaches 1000. Select the area first.", m));
+    }
+
+    // Wait for a loading screen to go away.
+    {
+        let mut m = Macro::default();
+        m.name = "Wait for loading to finish".into();
+        let start = m.start_id().unwrap_or(1);
+        let mut gone = stock("Wait until gone");
+        if let NodeKind::FindImage { timeout_ms, .. } = &mut gone {
+            *timeout_ms = 60000;
+        }
+        let gone = m.add_node(gone, col(1.0), 180.0);
+        let mut ok = stock("Pop-up");
+        if let NodeKind::Notify { title, message, style, .. } = &mut ok {
+            *title = "Loaded".into();
+            *message = "The loading screen has gone.".into();
+            *style = NoticeStyle::Success;
+        }
+        let ok = m.add_node(ok, col(2.0), 100.0);
+        let end = m.add_node(NodeKind::End, col(3.0), 100.0);
+        let mut slow = stock("Pop-up");
+        if let NodeKind::Notify { title, message, style, .. } = &mut slow {
+            *title = "Still loading".into();
+            *message = "It was still there after a minute.".into();
+            *style = NoticeStyle::Error;
+        }
+        let slow = m.add_node(slow, col(2.0), 260.0);
+        let end2 = m.add_node(NodeKind::End, col(3.0), 260.0);
+        m.connect(start, 0, gone);
+        m.connect(gone, 0, ok);
+        m.connect(ok, 0, end);
+        m.connect(gone, 1, slow);
+        m.connect(slow, 0, end2);
+        out.push(("Wait for loading to finish", "Waits up to a minute for a loading image to disappear. Snip it first.", m));
+    }
+    out
+}
+
+fn recent_file() -> PathBuf {
+    app_dir().join("recent.json")
+}
+
+/// Macros you opened or saved lately, newest first (only ones that still exist).
+pub fn recent_macros() -> Vec<PathBuf> {
+    std::fs::read_to_string(recent_file())
+        .ok()
+        .and_then(|s| serde_json::from_str::<Vec<PathBuf>>(&s).ok())
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|p| p.exists())
+        .collect()
+}
+
+/// Put a macro at the top of the recent list.
+pub fn remember_recent(path: &std::path::Path) {
+    let mut list = recent_macros();
+    list.retain(|p| p != path);
+    list.insert(0, path.to_path_buf());
+    list.truncate(8);
+    let _ = std::fs::create_dir_all(app_dir());
+    if let Ok(s) = serde_json::to_string_pretty(&list) {
+        let _ = std::fs::write(recent_file(), s);
+    }
+}
+
+/// Unsaved work, saved every few seconds so a crash doesn't lose it.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Autosave {
+    /// The file the macro came from (None = never saved).
+    #[serde(default)]
+    pub path: Option<PathBuf>,
+    /// When it was autosaved (ms since 1970).
+    #[serde(default)]
+    pub saved_ms: u64,
+    pub doc: Macro,
+}
+
+pub fn autosave_file() -> PathBuf {
+    app_dir().join("autosave.json")
+}
+
+pub fn write_autosave(a: &Autosave) -> Result<(), String> {
+    std::fs::create_dir_all(app_dir()).map_err(|e| e.to_string())?;
+    let s = serde_json::to_string(a).map_err(|e| e.to_string())?;
+    // Write to a temporary file first, so a crash mid-write can't leave half a file.
+    let tmp = app_dir().join("autosave.json.tmp");
+    std::fs::write(&tmp, s).map_err(|e| e.to_string())?;
+    std::fs::rename(&tmp, autosave_file()).map_err(|e| e.to_string())
+}
+
+pub fn read_autosave() -> Option<Autosave> {
+    let s = std::fs::read_to_string(autosave_file()).ok()?;
+    serde_json::from_str(&s).ok()
+}
+
+pub fn clear_autosave() {
+    let _ = std::fs::remove_file(autosave_file());
+}
+
+// ---------------------------------------------------------------------------
+// Checking a macro before it runs
+// ---------------------------------------------------------------------------
+
+/// Something wrong with a step, found before running.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Problem {
+    pub step: u64,
+    pub text: String,
+    /// The run would certainly go wrong at this step (rather than a likely mistake).
+    pub serious: bool,
+}
+
+fn texts_with_vars(kind: &NodeKind) -> Vec<(&str, VarMode)> {
+    match kind {
+        NodeKind::SetVar { expr, .. } => vec![(expr.as_str(), VarMode::Expr)],
+        NodeKind::IfCompare { left, right, .. } => vec![(left.as_str(), VarMode::Expr), (right.as_str(), VarMode::Expr)],
+        NodeKind::TypeText { text, .. } => vec![(text.as_str(), VarMode::Text)],
+        NodeKind::Notify { title, message, .. } => vec![(title.as_str(), VarMode::Text), (message.as_str(), VarMode::Text)],
+        NodeKind::ReadText { value, .. } => vec![(value.as_str(), VarMode::Text)],
+        _ => vec![],
+    }
+}
+
+impl Macro {
+    /// Everything that looks wrong, step by step (including steps inside groups).
+    pub fn problems(&self) -> Vec<Problem> {
+        let set = self.variables_set();
+        let known = |n: &str| set.contains(n) || BUILTIN_VARS.contains(&n);
+        let mut has_find = false;
+        let mut copy = self.root.clone();
+        copy.for_each_mut(&mut |n: &mut Node| {
+            if matches!(n.kind, NodeKind::FindImage { until_gone: false, .. }) {
+                has_find = true;
+            }
+        });
+        let mut out = Vec::new();
+        graph_problems(&self.root, true, has_find, &known, &mut out);
+        out
+    }
+}
+
+fn graph_problems(g: &Graph, top: bool, has_find: bool, known: &dyn Fn(&str) -> bool, out: &mut Vec<Problem>) {
+    let mut found: Vec<Problem> = Vec::new();
+    let mut nested: Vec<Problem> = Vec::new();
+    let mut push = |step: u64, serious: bool, text: String| found.push(Problem { step, text, serious });
+    // Which steps a run can reach from Start (or the group's start).
+    let entry: Vec<u64> = g
+        .nodes
+        .iter()
+        .filter(|n| matches!(n.kind, NodeKind::Start | NodeKind::GroupIn))
+        .map(|n| n.id)
+        .collect();
+    let mut reached: std::collections::HashSet<u64> = entry.iter().copied().collect();
+    let mut todo = entry.clone();
+    while let Some(id) = todo.pop() {
+        for e in g.edges.iter().filter(|e| e.from == id) {
+            if reached.insert(e.to) {
+                todo.push(e.to);
+            }
+        }
+    }
+    let others = g.nodes.iter().filter(|n| !n.kind.is_fixed()).count();
+    for n in &g.nodes {
+        let id = n.id;
+        // Disabled steps (and everything in a disabled group) never run, so they
+        // can't go wrong.
+        if n.disabled {
+            continue;
+        }
+        let reachable = reached.contains(&id);
+        if matches!(n.kind, NodeKind::Start | NodeKind::GroupIn) && others > 0 && g.next_local(id, 0).is_none() {
+            let what = if top { "Start" } else { "the group's start" };
+            push(id, true, format!("Nothing is connected to {what}, so nothing would run."));
+        }
+        if !reachable && !n.kind.is_fixed() && !entry.is_empty() {
+            push(id, false, "Never runs: nothing leads to this step.".into());
+        }
+        match &n.kind {
+            NodeKind::FindImage { template, .. } => match template {
+                None => push(id, true, "No image to look for yet. Drag a box, snip or choose one.".into()),
+                Some(p) if !p.exists() => {
+                    let name = p.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default();
+                    push(id, true, format!("The image “{name}” is missing (moved or deleted?)."));
+                }
+                _ => {}
+            },
+            NodeKind::ReadText { w, h, compare, value, save_to, .. } => {
+                if *w <= 1 || *h <= 1 {
+                    push(id, true, "No area to read yet. Use “Select area”.".into());
+                }
+                if compare.needs_value() && value.trim().is_empty() {
+                    push(id, false, "“Compare with” is empty.".into());
+                }
+                let save = save_to.trim();
+                if !save.is_empty() && !is_ident(save) {
+                    push(id, true, format!("“{save}” can't be a variable name (letters, numbers and _ only)."));
+                }
+            }
+            NodeKind::SetVar { name, .. } if !is_ident(name.trim()) => {
+                push(id, true, format!("“{}” can't be a variable name (letters, numbers and _ only).", name.trim()));
+            }
+            NodeKind::KeyPress { key, .. } if key.trim().is_empty() => {
+                push(id, true, "No key chosen yet.".into());
+            }
+            NodeKind::TypeText { text, .. } if text.is_empty() => {
+                push(id, false, "There's no text to type.".into());
+            }
+            NodeKind::WindowCheck { text, .. } if text.trim().is_empty() => {
+                push(id, true, "No window text to look for yet.".into());
+            }
+            NodeKind::Click { target, area, .. } | NodeKind::MoveMouse { target, area, .. } => {
+                if *target == Target::Area && area.is_none() {
+                    push(id, true, "It aims at a random spot in an area, but no area is selected yet.".into());
+                }
+                if *target == Target::FoundImage && !has_find {
+                    push(id, true, "It aims at the found image, but there's no Find image step.".into());
+                }
+            }
+            NodeKind::Group { graph, .. } => {
+                if graph.step_count() == 0 {
+                    push(id, false, "This group is empty.".into());
+                }
+                graph_problems(graph, false, has_find, known, &mut nested);
+            }
+            _ => {}
+        }
+        // Branches that lead nowhere.
+        let outputs = n.kind.outputs();
+        if reachable && outputs.len() > 1 {
+            for (port, label) in outputs.iter().enumerate() {
+                if g.next_local(id, port).is_none() {
+                    push(id, false, format!("“{label}” isn't connected, so the macro would stop there."));
+                }
+            }
+        }
+        // Variables nothing sets (usually a typo).
+        let mut missing = std::collections::BTreeSet::new();
+        for (text, mode) in texts_with_vars(&n.kind) {
+            for r in var_ranges(text, mode, known) {
+                if !known(&r.name) {
+                    missing.insert(r.name);
+                }
+            }
+        }
+        for name in missing {
+            push(id, false, format!("Uses “{name}”, but no step sets it (a typo?)."));
+        }
+    }
+    out.extend(found);
+    out.extend(nested);
+}
+
 /// Compare two values. Numbers compare as numbers; otherwise as text (ignoring case).
 pub fn compare_values(left: &Value, op: CmpOp, right: &Value) -> bool {
     if let (Some(a), Some(b)) = (left.as_num(), right.as_num()) {
@@ -3002,6 +3432,67 @@ mod tests {
     }
 
     #[test]
+    fn disabled_steps() {
+        let mut m = Macro::default();
+        let start = m.start_id().unwrap();
+        let find = m.add_node(stock("Find image"), 300.0, 100.0);
+        let after = m.add_node(NodeKind::End, 600.0, 200.0);
+        m.connect(start, 0, find);
+        // Only "not found" is connected: skipping follows that.
+        m.connect(find, 1, after);
+        assert_eq!(m.skip_target(find), (1, Some(after)));
+        m.connect(find, 0, after);
+        assert_eq!(m.skip_target(find), (0, Some(after)));
+        assert!(!m.can_disable(start) && m.can_disable(find));
+        // A disabled step has no problems (it never runs)...
+        assert!(m.problems().iter().any(|p| p.step == find));
+        m.node_mut(find).unwrap().disabled = true;
+        assert!(!m.problems().iter().any(|p| p.step == find));
+        assert!(m.is_skipped(find));
+        // ...and it saves and loads.
+        let back: Macro = serde_json::from_str(&serde_json::to_string(&m).unwrap()).unwrap();
+        assert!(back.node(find).unwrap().disabled);
+        // An enabled step saves exactly as before.
+        let plain = serde_json::to_string(&m.root.nodes[0]).unwrap();
+        assert!(!plain.contains("disabled"));
+        let old: Node = serde_json::from_str(r#"{"id":1,"kind":{"type":"End"},"x":0.0,"y":0.0}"#).unwrap();
+        assert!(!old.disabled);
+    }
+
+    #[test]
+    fn templates_and_problems() {
+        for (name, _, t) in templates() {
+            // Every template saves and loads.
+            let json = serde_json::to_string(&t).unwrap();
+            let back: Macro = serde_json::from_str(&json).unwrap();
+            assert_eq!(back.root.nodes.len(), t.root.nodes.len(), "{name}");
+            // Nothing is left unconnected or unreachable.
+            let bad: Vec<_> = t
+                .problems()
+                .into_iter()
+                .filter(|p| p.text.contains("isn't connected") || p.text.contains("Never runs"))
+                .collect();
+            assert!(bad.is_empty(), "{name}: {bad:?}");
+        }
+        let mut m = Macro::default();
+        let start = m.start_id().unwrap();
+        let f = m.add_node(stock("Find image"), 300.0, 100.0);
+        m.connect(start, 0, f);
+        let p = m.problems();
+        assert!(p.iter().any(|p| p.step == f && p.serious && p.text.contains("No image")));
+        assert!(p.iter().any(|p| p.step == f && !p.serious && p.text.contains("not found")));
+        let lonely = m.add_node(NodeKind::Wait { ms: 1, jitter_ms: 0 }, 600.0, 100.0);
+        assert!(m.problems().iter().any(|p| p.step == lonely && p.text.contains("Never runs")));
+        // "Wait until gone" doesn't change how old files look.
+        let n: Node = serde_json::from_str(
+            r#"{"id":1,"kind":{"type":"FindImage","template":null,"threshold":0.85,"timeout_ms":5000,"interval_ms":250,"click_when_found":false},"x":0.0,"y":0.0}"#,
+        )
+        .unwrap();
+        assert!(matches!(n.kind, NodeKind::FindImage { until_gone: false, .. }));
+        assert!(!serde_json::to_string(&n).unwrap().contains("until_gone"));
+    }
+
+    #[test]
     fn old_scroll_steps_and_alerts_still_load() {
         let old = r#"{"id":1,"kind":{"type":"Scroll","amount":5,"horizontal":false},"x":0.0,"y":0.0,"delay_ms":0,"note":""}"#;
         let n: Node = serde_json::from_str(old).unwrap();
@@ -3011,8 +3502,9 @@ mod tests {
         let m = Macro::default();
         let json = serde_json::to_string(&MacroFile::from(m)).unwrap();
         assert!(!json.contains("alert_on_finish") && !json.contains("alert_on_breakpoint"));
+        assert!(!json.contains("show_clicks"));
         let back: Macro = MacroFile::from(Macro::default()).into();
-        assert!(back.alert_on_breakpoint && !back.alert_on_finish);
+        assert!(back.alert_on_breakpoint && !back.alert_on_finish && back.show_clicks);
     }
 
     #[test]
@@ -3082,6 +3574,7 @@ mod tests {
             x: 100, y: 100, w: 200, h: 50,
             compare: TextCompare::Contains, value: String::new(), case_sensitive: false,
             timeout_ms: 0, interval_ms: 500, preview: None, numbers_only: false, save_to: String::new(),
+            until_gone: false,
         };
         map_kind(&mut k, &m);
         assert!(matches!(k, NodeKind::ReadText { x: 133, y: 133, w: 267, h: 67, .. }));

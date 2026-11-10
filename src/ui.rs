@@ -2,6 +2,7 @@
 
 use crate::engine::{self, AreaPurpose, EndKind, Hotkey, LogEntry, LogLevel, RunEnd, WorkerMsg};
 use crate::keys;
+use crate::marker;
 use crate::model::*;
 use crate::vision;
 use gpui::{
@@ -123,6 +124,8 @@ enum MenuAction {
     Undo,
     Redo,
     ToggleBreakpoint(u64),
+    /// Disable / enable the selected steps.
+    ToggleDisabled,
 }
 
 enum MenuEntry {
@@ -275,6 +278,36 @@ pub struct MacroApp {
     /// Show the original picture (the area when it was selected / the image to find)
     /// instead of what the step last saw.
     show_original: bool,
+    /// What each step did on the last run.
+    results: HashMap<u64, CardResult>,
+    /// Variables and their values during / after the last run.
+    live_vars: Vec<(String, String)>,
+    /// The variables panel is showing.
+    show_vars: bool,
+    quick: Option<QuickAdd>,
+    run_check: Option<RunCheck>,
+    /// The run was started with F8 (so MacroFlow may be hidden).
+    hotkey_start: bool,
+    /// The run-log line being looked at (its picture shows on the canvas).
+    log_sel: Option<usize>,
+    /// Playing the run log back.
+    replay_playing: bool,
+    /// Playback speed: 1, 2 or 4 ×.
+    replay_speed: u32,
+    /// When playback moves to the next line.
+    replay_next: Option<Instant>,
+    /// The step the selected log line belongs to (outlined like a running step).
+    replay_node: Option<u64>,
+    /// Also flash the green dot on the real screen when a log line is picked.
+    log_on_screen: bool,
+    /// Problems with each step (refreshed every frame).
+    problems: HashMap<u64, StepProblems>,
+    /// The start screen (templates, recent macros) is showing.
+    show_start: bool,
+    recent: Vec<PathBuf>,
+    /// Unsaved work found from last time (MacroFlow closed without saving it).
+    autosave_found: Option<Autosave>,
+    last_autosave: Instant,
     capturing_key: bool,
     mode: Mode,
     status: String,
@@ -388,6 +421,23 @@ impl MacroApp {
                 HashMap::new()
             },
             show_original: false,
+            results: HashMap::new(),
+            log_sel: None,
+            replay_playing: false,
+            replay_speed: 1,
+            replay_next: None,
+            replay_node: None,
+            log_on_screen: true,
+            live_vars: Vec::new(),
+            show_vars: true,
+            quick: None,
+            run_check: None,
+            hotkey_start: false,
+            problems: HashMap::new(),
+            show_start: true,
+            recent: recent_macros(),
+            autosave_found: read_autosave().filter(|a| a.doc.root.nodes.len() > 1),
+            last_autosave: Instant::now(),
             capturing_key: false,
             mode: Mode::Idle,
             status: "Welcome! Add steps from the left, or record a macro. Drag from a step's right-hand dot to connect it.".into(),
@@ -450,7 +500,10 @@ impl MacroApp {
                 }
                 WorkerMsg::Hotkey(Hotkey::StartStop) => match self.mode {
                     Mode::Running => self.stop_worker(),
-                    Mode::Idle => self.start_run(),
+                    Mode::Idle => {
+                        self.hotkey_start = true;
+                        self.start_run();
+                    }
                     _ => {}
                 },
                 WorkerMsg::Hotkey(Hotkey::Pause) => self.toggle_pause(),
@@ -530,6 +583,14 @@ impl MacroApp {
                     }
                     self.mode = Mode::Idle;
                 }
+                WorkerMsg::StepResult { step, text, ok } => {
+                    let r = self.results.entry(step).or_insert(CardResult { text: String::new(), ok, count: 0 });
+                    r.text = text;
+                    r.ok = ok;
+                    r.count += 1;
+                }
+                WorkerMsg::Vars(v) => self.live_vars = v,
+                WorkerMsg::Refresh => {}
                 WorkerMsg::Seen { step, path, caption, ok } => {
                     if let Some(old) = self.seen.insert(step, SeenShot { path, caption, ok }) {
                         let _ = std::fs::remove_file(old.path);
@@ -595,6 +656,32 @@ impl MacroApp {
                 }
             }
         }
+        // Playing the run log back.
+        if self.replay_playing {
+            let due = self.replay_next.map_or(true, |t| Instant::now() >= t);
+            if !self.idle() {
+                self.replay_playing = false;
+                changed = true;
+            } else if due {
+                let next = self.log_sel.map_or(0, |i| i + 1);
+                if next < self.log.len() {
+                    self.select_log(next, true);
+                } else {
+                    self.replay_playing = false;
+                    self.status = "Playback finished.".into();
+                }
+                changed = true;
+            }
+        }
+        // Keep a copy of unsaved work every few seconds, in case MacroFlow crashes.
+        if self.dirty && self.last_autosave.elapsed() >= Duration::from_secs(8) {
+            self.last_autosave = Instant::now();
+            let saved_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            let _ = write_autosave(&Autosave { path: self.path.clone(), saved_ms, doc: self.doc.clone() });
+        }
         if changed {
             cx.notify();
         }
@@ -606,6 +693,210 @@ impl MacroApp {
 
     fn idle(&self) -> bool {
         self.mode == Mode::Idle
+    }
+
+    /// Open the quick-add box. With `link`, the new step is connected to that output
+    /// and placed at `at` (canvas) / shown at `screen` (window).
+    fn open_quick(&mut self, link: Option<(u64, usize)>, at: Option<(f32, f32)>, screen: Option<(f32, f32)>) {
+        if !self.idle() {
+            return;
+        }
+        self.commit_edit();
+        self.menu = None;
+        self.show_start = false;
+        self.quick = Some(QuickAdd { query: String::new(), sel: 0, link, at, screen });
+    }
+
+    /// The steps matching what's typed in the quick-add box (indexes into the palette).
+    fn quick_matches(&self) -> Vec<usize> {
+        let Some(q) = &self.quick else { return Vec::new() };
+        let words: Vec<String> = q.query.to_lowercase().split_whitespace().map(|w| w.to_string()).collect();
+        let mut hits: Vec<(usize, usize)> = NodeKind::palette()
+            .iter()
+            .enumerate()
+            .filter_map(|(i, k)| {
+                let title = k.title().to_lowercase();
+                let text = format!("{title} {}", step_blurb(k).to_lowercase());
+                if !words.iter().all(|w| text.contains(w.as_str())) {
+                    return None;
+                }
+                // Titles that start with what you typed come first.
+                let rank = match words.first() {
+                    Some(w) if title.starts_with(w.as_str()) => 0,
+                    Some(w) if title.contains(w.as_str()) => 1,
+                    Some(_) => 2,
+                    None => 0,
+                };
+                Some((rank, i))
+            })
+            .collect();
+        hits.sort();
+        hits.into_iter().map(|(_, i)| i).collect()
+    }
+
+    /// Add the step chosen in the quick-add box.
+    fn quick_pick(&mut self, palette_index: usize) {
+        let Some(q) = self.quick.take() else { return };
+        let Some(kind) = NodeKind::palette().into_iter().nth(palette_index) else { return };
+        match q.at {
+            Some((x, y)) => {
+                // Put the new step's input dot where the line was let go.
+                self.add_step_at(kind, x + 24.0, y + 16.0 - NODE_H / 2.0);
+                if let (Some((from, port)), Some(new_id)) = (q.link, self.selected) {
+                    self.doc.connect(from, port, new_id);
+                }
+            }
+            None => {
+                self.add_step(kind);
+                self.side_tab = SideTab::Edit;
+                self.sidebar_open = true;
+            }
+        }
+    }
+
+    /// Keys while the quick-add box is open.
+    fn quick_key(&mut self, ev: &KeyDownEvent, cx: &mut Context<Self>) {
+        let ks = &ev.keystroke;
+        let key = ks.key.as_str();
+        let m = ks.modifiers;
+        let cmd = if IS_MACOS { m.platform } else { m.control && !m.alt };
+        let matches = self.quick_matches();
+        let count = matches.len();
+        let Some(q) = self.quick.as_mut() else { return };
+        match key {
+            "escape" => self.quick = None,
+            "k" if cmd => self.quick = None,
+            "enter" | "return" => {
+                let pick = matches.get(q.sel.min(count.saturating_sub(1))).copied();
+                match pick {
+                    Some(i) => self.quick_pick(i),
+                    None => self.quick = None,
+                }
+            }
+            "down" | "tab" => q.sel = if count == 0 { 0 } else { (q.sel + 1) % count },
+            "up" => q.sel = if count == 0 { 0 } else { (q.sel + count - 1) % count },
+            "backspace" => {
+                if cmd {
+                    q.query.clear();
+                } else {
+                    q.query.pop();
+                }
+                q.sel = 0;
+            }
+            _ => {
+                let shortcut = if IS_MACOS { m.platform || m.control } else { m.control && !m.alt };
+                if !shortcut {
+                    match &ks.key_char {
+                        Some(ch) => q.query.push_str(ch),
+                        None if key == "space" => q.query.push(' '),
+                        None => {}
+                    }
+                    q.sel = 0;
+                }
+            }
+        }
+        cx.stop_propagation();
+        cx.notify();
+    }
+
+    /// Stop playback and forget the selected log line.
+    fn reset_replay(&mut self) {
+        self.log_sel = None;
+        self.replay_playing = false;
+        self.replay_next = None;
+        self.replay_node = None;
+    }
+
+    /// Look at one line of the run log: outline its step, show its picture, and
+    /// (with `flash`) show the action on the real screen too.
+    fn select_log(&mut self, i: usize, flash: bool) {
+        let Some(entry) = self.log.get(i).cloned() else { return };
+        self.log_sel = Some(i);
+        self.replay_node = entry.step.filter(|id| self.doc.node(*id).is_some());
+        if let Some(id) = self.replay_node {
+            self.reveal_step(id);
+        }
+        if flash && self.log_on_screen && self.idle() {
+            if let Some(a) = &entry.action {
+                if let Some((x, y)) = a.at {
+                    marker::flash(x, y, a.mark == vision::Mark::Click);
+                }
+            }
+        }
+        // When playing, wait about as long as the macro did before the next line.
+        if self.replay_playing {
+            let gap = self
+                .log
+                .get(i + 1)
+                .map_or(600, |n| n.ms.saturating_sub(entry.ms))
+                .clamp(150, 1500);
+            let gap = if entry.action.is_some() { gap.max(700) } else { gap };
+            self.replay_next = Some(Instant::now() + Duration::from_millis(gap / self.replay_speed.max(1) as u64));
+        }
+    }
+
+    fn replay_toggle(&mut self) {
+        if self.replay_playing {
+            self.replay_playing = false;
+            return;
+        }
+        if self.log.is_empty() || !self.idle() {
+            return;
+        }
+        self.replay_playing = true;
+        let at_end = self.log_sel.map_or(true, |i| i + 1 >= self.log.len());
+        if at_end {
+            self.select_log(0, true);
+        } else {
+            self.replay_next = Some(Instant::now());
+        }
+        self.status = "Playing the run back… (Space pauses, ← → step)".into();
+    }
+
+    fn replay_step(&mut self, forward: bool) {
+        if self.log.is_empty() {
+            return;
+        }
+        self.replay_playing = false;
+        let i = match (self.log_sel, forward) {
+            (None, _) => 0,
+            (Some(i), true) => (i + 1).min(self.log.len() - 1),
+            (Some(i), false) => i.saturating_sub(1),
+        };
+        self.select_log(i, true);
+    }
+
+    /// Show a step on the canvas (opening its group if needed) without changing the
+    /// sidebar, panning only if it's off screen.
+    fn reveal_step(&mut self, id: u64) {
+        let Some(path) = self.doc.root.path_to(id) else { return };
+        if self.view != path {
+            self.view = path;
+        }
+        let Some(n) = self.doc.node(id) else { return };
+        let (cw, ch) = self.canvas_size.get();
+        let (sx, sy) = (n.x * self.zoom + self.pan.0, n.y * self.zoom + self.pan.1);
+        let (w, h) = (NODE_W * self.zoom, NODE_H * self.zoom);
+        let visible = sx >= 20.0 && sy >= 20.0 && sx + w <= cw - 20.0 && sy + h <= ch - 20.0;
+        if !visible && cw > 0.0 {
+            self.pan = (cw * 0.35 - n.x * self.zoom - w / 2.0, ch * 0.4 - n.y * self.zoom - h / 2.0);
+        }
+    }
+
+    /// The picture for the selected log line: its own, or the last action before it
+    /// in the same step.
+    fn replay_picture(&self) -> Option<(PathBuf, usize)> {
+        let i = self.log_sel?;
+        for j in (0..=i).rev() {
+            let e = self.log.get(j)?;
+            if let Some(p) = e.action.as_ref().and_then(|a| a.shot.clone()) {
+                return Some((p, j));
+            }
+            if j < i && e.level == LogLevel::Step {
+                break;
+            }
+        }
+        None
     }
 
     /// Drop the picture of what a step last saw (e.g. it has a new area now).
@@ -702,9 +993,48 @@ impl MacroApp {
     /// Play the macro (from `from`, or Start). With `stepping`, it pauses before every
     /// step so you can go through it one step at a time.
     fn start_run_with(&mut self, from: Option<u64>, stepping: bool) {
+        if !self.idle() {
+            return;
+        }
+        self.commit_edit();
+        let hotkey = std::mem::take(&mut self.hotkey_start);
+        // Check first: steps that would certainly go wrong.
+        let problems: Vec<Problem> = self.doc.problems().into_iter().filter(|p| p.serious).collect();
+        if !problems.is_empty() {
+            if hotkey {
+                // MacroFlow may be hidden behind the app you're using.
+                let n = problems.len();
+                let _ = vision::show_notification(&vision::Toast {
+                    title: "Macro didn't start".into(),
+                    message: format!(
+                        "{n} step{} would go wrong. Switch to MacroFlow to see {} or run anyway.",
+                        if n == 1 { "" } else { "s" },
+                        if n == 1 { "it" } else { "them" }
+                    ),
+                    style: "warning",
+                    position: "top-center",
+                    duration_ms: 6000,
+                    wait: false,
+                    sound: true,
+                });
+            }
+            self.run_check = Some(RunCheck { from, stepping, problems });
+            return;
+        }
+        self.run_now(from, stepping);
+    }
+
+    /// Play the macro without checking it first.
+    fn run_now(&mut self, from: Option<u64>, stepping: bool) {
+        self.run_check = None;
         if self.begin_worker(Mode::Running) {
+            self.results.clear();
+            self.live_vars.clear();
+            self.show_vars = true;
+            self.show_start = false;
             self.last_end = None;
             self.log.clear();
+        self.reset_replay();
             self.paused.store(false, Ordering::Relaxed);
             self.step_mode.store(stepping, Ordering::Relaxed);
             self.status = match (from, stepping) {
@@ -846,6 +1176,34 @@ impl MacroApp {
                 format!("Breakpoint removed from “{label}”.")
             };
         }
+    }
+
+    /// Disable the selected steps (or enable them, if they're all disabled already).
+    /// A disabled step or group is skipped when the macro runs.
+    fn toggle_disabled(&mut self) {
+        self.commit_edit();
+        let ids: Vec<u64> = self.selection().into_iter().filter(|id| self.doc.can_disable(*id)).collect();
+        if ids.is_empty() {
+            self.status = "Start and a group's start / end can't be disabled.".into();
+            return;
+        }
+        let all_off = ids.iter().all(|id| self.doc.node(*id).map_or(false, |n| n.disabled));
+        let off = !all_off;
+        for id in &ids {
+            if let Some(n) = self.doc.node_mut(*id) {
+                n.disabled = off;
+            }
+        }
+        self.dirty = true;
+        let what = match (ids.len(), self.doc.node(ids[0])) {
+            (1, Some(n)) => format!("“{}”", n.label()),
+            (k, _) => format!("{k} steps"),
+        };
+        self.status = if off {
+            format!("Disabled {what}: runs skip it and carry on with what it's connected to. {SHORTCUT_KEY}E turns it back on.")
+        } else {
+            format!("Enabled {what} again.")
+        };
     }
 
     fn start_drag_pick(&mut self, id: u64, end: bool) {
@@ -998,6 +1356,7 @@ impl MacroApp {
     fn confirm_close(&mut self, after: AfterSave, window: &mut Window, cx: &mut Context<Self>) -> bool {
         self.commit_edit();
         if !self.dirty || self.close_confirmed {
+            clear_autosave();
             return true;
         }
         if self.close_prompt_open {
@@ -1056,6 +1415,8 @@ impl MacroApp {
     }
 
     fn finish_close(&mut self, after: AfterSave, window: &mut Window, cx: &mut Context<Self>) {
+        // Closing on purpose (saved, or "Don't Save"): nothing to restore next time.
+        clear_autosave();
         self.close_confirmed = true;
         self.stop.store(true, Ordering::Relaxed);
         match after {
@@ -1617,8 +1978,55 @@ impl MacroApp {
         self.pan = (0.0, 0.0);
         self.zoom = 1.0;
         self.log.clear();
+        self.reset_replay();
+        self.results.clear();
+        self.live_vars.clear();
         self.reset_history();
+        self.recent = recent_macros();
+        self.show_start = true;
         self.status = "New macro.".into();
+    }
+
+    /// Start from one of the ready-made macros.
+    fn use_template(&mut self, i: usize) {
+        let Some((name, _, mut doc)) = templates().into_iter().nth(i) else { return };
+        if !self.idle() {
+            return;
+        }
+        doc.reference = vision::primary_screen().ok();
+        self.replace_doc(doc, None);
+        self.dirty = true;
+        self.status = format!("“{name}” is ready. Steps with a ⚠ still need setting up.");
+    }
+
+    /// Bring back unsaved work from last time.
+    fn restore_autosave(&mut self) {
+        let Some(a) = self.autosave_found.take() else { return };
+        if !self.idle() {
+            return;
+        }
+        self.replace_doc(a.doc, a.path);
+        self.dirty = true;
+        self.status = "Restored your unsaved work. Save it to keep it.".into();
+    }
+
+    /// Show a different macro (without asking about the old one).
+    fn replace_doc(&mut self, doc: Macro, path: Option<PathBuf>) {
+        self.doc = doc;
+        self.path = path;
+        self.selected = None;
+        self.extra.clear();
+        self.view.clear();
+        self.last_end = None;
+        self.editing = None;
+        self.pan = (0.0, 0.0);
+        self.zoom = 1.0;
+        self.log.clear();
+        self.reset_replay();
+        self.results.clear();
+        self.live_vars.clear();
+        self.reset_history();
+        self.show_start = false;
     }
 
     fn open(&mut self, cx: &mut Context<Self>) {
@@ -1650,6 +2058,11 @@ impl MacroApp {
             .and_then(|s| serde_json::from_str::<Macro>(&s).map_err(|e| e.to_string()));
         match parsed {
             Ok(doc) => {
+                remember_recent(&path);
+                self.recent = recent_macros();
+                self.show_start = false;
+                self.results.clear();
+                self.live_vars.clear();
                 self.doc = doc;
                 self.path = Some(path.clone());
                 self.dirty = false;
@@ -1661,6 +2074,7 @@ impl MacroApp {
                 self.pan = (0.0, 0.0);
                 self.zoom = 1.0;
                 self.log.clear();
+        self.reset_replay();
                 self.reset_history();
                 self.status = format!("Opened {}", path.display());
             }
@@ -1696,6 +2110,9 @@ impl MacroApp {
         match result {
             Ok(()) => {
                 self.status = format!("Saved {}", path.display());
+                remember_recent(&path);
+                self.recent = recent_macros();
+                clear_autosave();
                 self.path = Some(path);
                 self.dirty = false;
             }
@@ -2095,6 +2512,51 @@ impl MacroApp {
         let key = ks.key.as_str();
         let m = ks.modifiers;
 
+        if self.quick.is_some() {
+            self.quick_key(ev, cx);
+            return;
+        }
+        if self.run_check.is_some() {
+            match key {
+                "escape" => self.run_check = None,
+                "enter" | "return" => {
+                    if let Some(c) = self.run_check.take() {
+                        self.run_now(c.from, c.stepping);
+                    }
+                }
+                _ => {}
+            }
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
+        // Going through the run log: Space plays / pauses, ← → step, Esc stops.
+        if self.log_sel.is_some() && self.editing.is_none() && self.menu.is_none() && self.idle() {
+            let handled = match key {
+                "space" => {
+                    self.replay_toggle();
+                    true
+                }
+                "left" | "up" => {
+                    self.replay_step(false);
+                    true
+                }
+                "right" | "down" => {
+                    self.replay_step(true);
+                    true
+                }
+                "escape" => {
+                    self.reset_replay();
+                    true
+                }
+                _ => false,
+            };
+            if handled {
+                cx.stop_propagation();
+                cx.notify();
+                return;
+            }
+        }
         // Esc closes an open right-click menu first.
         if self.menu.is_some() && key == "escape" {
             self.menu = None;
@@ -2260,7 +2722,9 @@ impl MacroApp {
                 "o" => self.open(cx),
                 "n" => self.new_doc(),
                 "d" => self.duplicate_selected(),
+                "e" => self.toggle_disabled(),
                 "r" => self.start_run(),
+                "k" => self.open_quick(None, None, None),
                 "b" => self.sidebar_open = !self.sidebar_open,
                 "g" if m.shift => self.ungroup_selected(),
                 "g" => self.group_selection(),
@@ -2372,6 +2836,15 @@ impl MacroApp {
                     out.push(item("Group these steps", hint("⌘G", "Ctrl+G"), MenuAction::Group, idle));
                     out.push(item("Copy", hint("⌘C", "Ctrl+C"), MenuAction::Copy, true));
                     out.push(item("Cut", hint("⌘X", "Ctrl+X"), MenuAction::Cut, idle));
+                    let all_off = sel.iter().filter(|i| self.doc.can_disable(**i)).all(|i| {
+                        self.doc.node(*i).map_or(false, |n| n.disabled)
+                    });
+                    out.push(item(
+                        if all_off { "Enable these steps" } else { "Disable these steps" },
+                        hint("⌘E", "Ctrl+E"),
+                        MenuAction::ToggleDisabled,
+                        idle && sel.iter().any(|i| self.doc.can_disable(*i)),
+                    ));
                     out.push(MenuEntry::Sep);
                     out.push(item("Clear selection", "Esc", MenuAction::ClearSelection, true));
                     out.push(danger("Delete these steps", hint("⌫", "Del"), MenuAction::Delete, idle));
@@ -2392,6 +2865,13 @@ impl MacroApp {
                     "",
                     MenuAction::ToggleBreakpoint(id),
                     !marker,
+                ));
+                let what = if n.kind.is_group() { "group" } else { "step" };
+                out.push(item(
+                    &if n.disabled { format!("Enable {what}") } else { format!("Disable {what} (skip it)") },
+                    hint("⌘E", "Ctrl+E"),
+                    MenuAction::ToggleDisabled,
+                    idle && !n.kind.is_fixed(),
                 ));
                 out.push(MenuEntry::Sep);
                 if n.kind.is_group() {
@@ -2499,6 +2979,7 @@ impl MacroApp {
             MenuAction::Paste(at) => self.paste(at, cx),
             MenuAction::Undo => self.undo(),
             MenuAction::ToggleBreakpoint(id) => self.toggle_breakpoint(id),
+            MenuAction::ToggleDisabled => self.toggle_disabled(),
             MenuAction::Redo => self.redo(),
             MenuAction::LeaveGroup => {
                 if !self.view.is_empty() {
@@ -2851,6 +3332,24 @@ impl MacroApp {
     /// Mouse released anywhere in the window.
     fn finish_drag(&mut self, pos: Point<Pixels>, cx: &mut Context<Self>) {
         self.field_drag = false;
+        // Let go of a new line on empty canvas: pick a step to add there, connected.
+        if let Drag::Connect { from, port } = self.drag {
+            let (ox, oy) = self.canvas_origin.get();
+            let (cw, ch) = self.canvas_size.get();
+            let (wx, wy) = (f32::from(pos.x), f32::from(pos.y));
+            let on_canvas = wx >= ox && wy >= oy && wx <= ox + cw && wy <= oy + ch;
+            let (x, y) = self.to_local(pos);
+            let moved = self.doc.node(from).map_or(false, |n| {
+                let (px0, py0) = out_port_pos(n, port);
+                ((x - px0).powi(2) + (y - py0).powi(2)).sqrt() * self.zoom > 24.0
+            });
+            if on_canvas && moved {
+                self.drag = Drag::None;
+                self.open_quick(Some((from, port)), Some((x, y)), Some((wx, wy)));
+                cx.notify();
+                return;
+            }
+        }
         if let Drag::Select { x, y } = self.drag {
             let (ox, oy) = self.canvas_origin.get();
             let (px0, py0) = self.screen_to_canvas(x - ox, y - oy);
@@ -3432,6 +3931,15 @@ impl MacroApp {
                 .items_center()
                 .gap_1()
                 .child(div().flex_1().child(section_title("Run log")))
+                .when(!self.log.is_empty() && self.idle(), |d| {
+                    d.child(
+                        small_btn("log-play", if self.replay_playing { "❚❚ Pause" } else { "▶ Play back" })
+                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                this.replay_toggle();
+                                cx.notify();
+                            })),
+                    )
+                })
                 .child(small_btn("log-copy", "Copy").on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                     let text: String = this
                         .log
@@ -3444,6 +3952,7 @@ impl MacroApp {
                 })))
                 .child(small_btn("log-clear", "Clear").on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                     this.log.clear();
+                    this.reset_replay();
                     cx.notify();
                 })))
                 .into_any_element(),
@@ -3468,6 +3977,9 @@ impl MacroApp {
             out.push(help("Run the macro to see every step it ran here, with timings, what Read text saw, which way each branch went and why it stopped. Click a line to jump to its step.").into_any_element());
             return out;
         }
+        if self.log_sel.is_none() {
+            out.push(help("Click a line to see what happened at that moment (a green dot shows where it clicked), or press ▶ Play back to watch the whole run again.").into_any_element());
+        }
         const SHOW: usize = 600;
         let skip = self.log.len().saturating_sub(SHOW);
         if skip > 0 {
@@ -3482,8 +3994,10 @@ impl MacroApp {
                 LogLevel::Bad => (RED, RED, true),
             };
             let step = e.step.filter(|id| self.doc.node(*id).is_some());
+            let picked = self.log_sel == Some(i);
             let mut row = div()
                 .id(("log-row", i))
+                .when(picked, |d| d.bg(rgba((ACCENT << 8) | 0x40)))
                 .flex()
                 .items_start()
                 .gap_2()
@@ -3508,13 +4022,13 @@ impl MacroApp {
                         .when(e.level != LogLevel::Step, |d| d.pl_2())
                         .child(e.text.clone()),
                 );
-            if let Some(id) = step {
+            if step.is_some() || e.action.is_some() {
                 row = row
                     .cursor_pointer()
-                    .hover(|s| s.bg(rgb(PANEL2)))
+                    .when(!picked, |d| d.hover(|s| s.bg(rgb(PANEL2))))
                     .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                        this.jump_to_step(id);
-                        this.side_tab = SideTab::Log;
+                        this.replay_playing = false;
+                        this.select_log(i, true);
                         cx.notify();
                     }));
             }
@@ -3855,6 +4369,7 @@ impl MacroApp {
                 for off in [8.0, 4.0] {
                     graph = graph.child(
                         div()
+                            .when(n.disabled, |d| d.opacity(0.5))
                             .absolute()
                             .left(px(sx(n.x + off)))
                             .top(px(sy(n.y + off)))
@@ -3921,6 +4436,29 @@ impl MacroApp {
 
         if inside {
             graph = graph.child(self.render_breadcrumb(cx));
+            if self.view.iter().any(|g| self.doc.node(*g).map_or(false, |n| n.disabled)) {
+                graph = graph.child(
+                    div()
+                        .absolute()
+                        .top(px(56.))
+                        .left_0()
+                        .right_0()
+                        .flex()
+                        .justify_center()
+                        .child(
+                            div()
+                                .px_3()
+                                .py_1()
+                                .rounded_lg()
+                                .bg(rgba(0x161922f0))
+                                .border_1()
+                                .border_color(rgb(BORDER))
+                                .text_xs()
+                                .text_color(rgb(MUTED))
+                                .child("⊘ This group is disabled: runs skip everything in it."),
+                        ),
+                );
+            }
         }
         if let Some(bar) = self.render_selection_bar(cx) {
             graph = graph.child(bar);
@@ -3943,7 +4481,700 @@ impl MacroApp {
                     .child("Build a macro like a flowchart: add steps from the left (they chain after the selected step), record a whole macro with ● Record macro, or capture one click or key with ◎ Record one step. Find image steps branch into “found” and “not found”."),
             );
         }
+        if !self.live_vars.is_empty() && self.show_vars && !self.show_start {
+            graph = graph.child(self.render_vars_panel(cx));
+        }
+        if self.log_sel.is_some() && !self.show_start {
+            graph = graph.child(self.render_replay(cx));
+        }
+        if self.show_start && !inside {
+            graph = graph.child(self.render_start(cx));
+        }
         graph
+    }
+
+    /// The run-log playback card, bottom right of the canvas: the screen at that
+    /// moment with the action drawn on, what happened, and the playback buttons.
+    fn render_replay(&self, cx: &mut Context<Self>) -> Stateful<Div> {
+        let i = self.log_sel.unwrap_or(0);
+        let total = self.log.len();
+        let entry = self.log.get(i);
+        let picture = self.replay_picture();
+        let (content, from_earlier): (AnyElement, bool) = match &picture {
+            Some((p, j)) if p.exists() => (
+                img(p.clone()).size_full().object_fit(ObjectFit::Contain).into_any_element(),
+                *j != i,
+            ),
+            Some(_) => (
+                div().text_color(rgb(MUTED)).child("Picture still saving…").into_any_element(),
+                false,
+            ),
+            None => (
+                div()
+                    .text_color(rgb(MUTED))
+                    .text_center()
+                    .px_4()
+                    .child("No picture for this line. Clicks, moves, drags, scrolls and keys have one.")
+                    .into_any_element(),
+                false,
+            ),
+        };
+        let step_label = entry
+            .and_then(|e| e.step)
+            .and_then(|id| self.doc.node(id))
+            .map(|n| n.label())
+            .unwrap_or_default();
+        let caption = entry.map(|e| e.text.clone()).unwrap_or_default();
+        let when = entry.map(|e| format!("+{:.2}s", e.ms as f32 / 1000.0)).unwrap_or_default();
+        let speed_label: &'static str = match self.replay_speed {
+            1 => "1×",
+            2 => "2×",
+            _ => "4×",
+        };
+        let ctl = |id: &'static str, label: &'static str| {
+            div()
+                .id(id)
+                .flex()
+                .flex_none()
+                .items_center()
+                .justify_center()
+                .h(px(26.))
+                .min_w(px(30.))
+                .px_2()
+                .rounded_md()
+                .bg(rgb(BTN))
+                .text_color(rgb(TEXT))
+                .cursor_pointer()
+                .hover(|s| s.bg(rgb(BTN_HOVER)))
+                .child(label)
+        };
+        div()
+            .id("replay-card")
+            .occlude()
+            .absolute()
+            .bottom(px(56.))
+            .right(px(16.))
+            .w(px(420.))
+            .flex()
+            .flex_col()
+            .rounded_lg()
+            .bg(rgba(0x161922f5))
+            .border_1()
+            .border_color(rgb(if self.replay_playing { GREEN } else { BORDER }))
+            .shadow_lg()
+            .text_xs()
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_1()
+                    .pl_2()
+                    .pr_1()
+                    .h(px(28.))
+                    .border_b_1()
+                    .border_color(rgb(BORDER))
+                    .child(div().font_weight(FontWeight::SEMIBOLD).child("Playback"))
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_color(rgb(MUTED))
+                            .child(format!("· line {} of {total} · {when}", i + 1)),
+                    )
+                    .child(
+                        div()
+                            .id("replay-close")
+                            .px_1p5()
+                            .rounded_md()
+                            .cursor_pointer()
+                            .text_color(rgb(MUTED))
+                            .hover(|s| s.bg(rgb(BTN_HOVER)).text_color(rgb(TEXT)))
+                            .child("×")
+                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                this.reset_replay();
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .child(
+                div()
+                    .h(px(240.))
+                    .m_1()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded_md()
+                    .bg(rgb(BG))
+                    .border_1()
+                    .border_color(rgb(BORDER))
+                    .p_1()
+                    .child(content),
+            )
+            .child(
+                div()
+                    .px_2()
+                    .pb_1()
+                    .flex()
+                    .flex_col()
+                    .gap_0p5()
+                    .child(div().text_color(rgb(TEXT)).child(caption))
+                    .child(div().text_color(rgb(MUTED)).child(match (step_label.is_empty(), from_earlier) {
+                        (true, _) => String::new(),
+                        (false, false) => format!("Step: {step_label}"),
+                        (false, true) => format!("Step: {step_label} · picture from its last action"),
+                    })),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_1()
+                    .px_2()
+                    .pb_2()
+                    .child(ctl("replay-first", "⏮").on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                        this.replay_playing = false;
+                        this.select_log(0, true);
+                        cx.notify();
+                    })))
+                    .child(ctl("replay-prev", "◀").on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                        this.replay_step(false);
+                        cx.notify();
+                    })))
+                    .child(
+                        ctl("replay-play", if self.replay_playing { "❚❚" } else { "▶" })
+                            .min_w(px(44.))
+                            .bg(rgb(if self.replay_playing { BTN } else { GREEN }))
+                            .text_color(rgb(if self.replay_playing { TEXT } else { 0x0b1a12 }))
+                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                this.replay_toggle();
+                                cx.notify();
+                            })),
+                    )
+                    .child(ctl("replay-next", "▶|").on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                        this.replay_step(true);
+                        cx.notify();
+                    })))
+                    .child(ctl("replay-speed", speed_label).on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                        this.replay_speed = match this.replay_speed {
+                            1 => 2,
+                            2 => 4,
+                            _ => 1,
+                        };
+                        cx.notify();
+                    })))
+                    .child(div().flex_1())
+                    .child(
+                        chip("replay-on-screen", "Show on screen", self.log_on_screen).on_click(cx.listener(
+                            |this, _: &ClickEvent, _, cx| {
+                                this.log_on_screen = !this.log_on_screen;
+                                cx.notify();
+                            },
+                        )),
+                    ),
+            )
+    }
+
+    /// Every variable and its value, bottom left of the canvas, during and after a run.
+    fn render_vars_panel(&self, cx: &mut Context<Self>) -> Stateful<Div> {
+        let live = self.mode == Mode::Running;
+        let mut list = div().id("vars-list").flex().flex_col().p_1().gap_0p5().overflow_y_scroll();
+        // Your own variables first, then the built-in ones.
+        let mut vars: Vec<&(String, String)> = self.live_vars.iter().collect();
+        vars.sort_by_key(|(n, _)| (BUILTIN_VARS.contains(&n.as_str()), n.clone()));
+        for (name, value) in vars {
+            let shown: String = value.replace('\n', " ⏎ ").chars().take(40).collect();
+            let shown = if shown.is_empty() { "(empty)".to_string() } else { shown };
+            list = list.child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_1()
+                    .px_1()
+                    .min_h(px(20.))
+                    .child(var_pill(name, true, false, 1.0))
+                    .child(div().text_color(rgb(MUTED)).child("="))
+                    .child(div().flex_1().min_w(px(0.)).truncate().text_color(rgb(TEXT)).child(shown)),
+            );
+        }
+        div()
+            .id("vars-panel")
+            .occlude()
+            .absolute()
+            .bottom(px(16.))
+            .left(px(16.))
+            .w(px(270.))
+            .max_h(px(300.))
+            .flex()
+            .flex_col()
+            .rounded_lg()
+            .bg(rgba(0x161922f2))
+            .border_1()
+            .border_color(rgb(if live { ACCENT } else { BORDER }))
+            .shadow_md()
+            .text_xs()
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .flex_none()
+                    .items_center()
+                    .gap_1()
+                    .pl_2()
+                    .pr_1()
+                    .h(px(28.))
+                    .border_b_1()
+                    .border_color(rgb(BORDER))
+                    .child(div().font_weight(FontWeight::SEMIBOLD).child("Variables"))
+                    .child(div().flex_1().text_color(rgb(MUTED)).child(if live { "· live" } else { "· last run" }))
+                    .child(
+                        div()
+                            .id("vars-close")
+                            .px_1p5()
+                            .rounded_md()
+                            .cursor_pointer()
+                            .text_color(rgb(MUTED))
+                            .hover(|s| s.bg(rgb(BTN_HOVER)).text_color(rgb(TEXT)))
+                            .child("×")
+                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                this.show_vars = false;
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .child(list)
+    }
+
+    /// Templates, recent macros and unsaved work, over the canvas when MacroFlow opens.
+    fn render_start(&self, cx: &mut Context<Self>) -> Stateful<Div> {
+        let tile = |id: SharedString, title: String, text: String| {
+            div()
+                .id(id)
+                .w(px(184.))
+                .h(px(86.))
+                .p_3()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .rounded_lg()
+                .bg(rgb(PANEL))
+                .border_1()
+                .border_color(rgb(BORDER))
+                .cursor_pointer()
+                .hover(|s| s.border_color(rgb(ACCENT)).bg(rgb(NODE_BG)))
+                .child(div().font_weight(FontWeight::SEMIBOLD).text_color(rgb(TEXT)).child(title))
+                .child(div().text_xs().text_color(rgb(MUTED)).child(text))
+        };
+        let mut tiles = div().flex().flex_row().flex_wrap().gap_2();
+        tiles = tiles.child(
+            tile("start-blank".into(), "Blank macro".into(), "Just a Start step. Add steps from the left.".into())
+                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                    this.show_start = false;
+                    cx.notify();
+                })),
+        );
+        for (i, (name, text, _)) in templates().into_iter().enumerate() {
+            tiles = tiles.child(
+                tile(SharedString::from(format!("start-template-{i}")), name.to_string(), text.to_string()).on_click(
+                    cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        this.use_template(i);
+                        cx.notify();
+                    }),
+                ),
+            );
+        }
+        tiles = tiles.child(
+            tile("start-open".into(), "Open a file…".into(), "A macro you saved before (.json).".into()).on_click(
+                cx.listener(|this, _: &ClickEvent, _, cx| {
+                    this.open(cx);
+                    cx.notify();
+                }),
+            ),
+        );
+
+        let mut card = div()
+            .w(px(616.))
+            .p_4()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .rounded_xl()
+            .bg(rgb(PANEL2))
+            .border_1()
+            .border_color(rgb(BORDER))
+            .shadow_lg()
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .child(logo_mark())
+                    .child(div().text_base().font_weight(FontWeight::BOLD).child("Welcome to MacroFlow"))
+                    .child(div().flex_1())
+                    .child(
+                        div()
+                            .id("start-close")
+                            .px_2()
+                            .py_0p5()
+                            .rounded_md()
+                            .cursor_pointer()
+                            .text_color(rgb(MUTED))
+                            .hover(|s| s.bg(rgb(BTN_HOVER)).text_color(rgb(TEXT)))
+                            .child("×")
+                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                this.show_start = false;
+                                cx.notify();
+                            })),
+                    ),
+            );
+
+        if let Some(a) = &self.autosave_found {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            let mins = now.saturating_sub(a.saved_ms) / 60_000;
+            let when = match mins {
+                0 => "just now".to_string(),
+                1..=59 => format!("{mins} min ago"),
+                60..=1439 => format!("{} h ago", mins / 60),
+                _ => format!("{} days ago", mins / 1440),
+            };
+            card = card.child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .p_3()
+                    .rounded_lg()
+                    .bg(rgba((VAR_WARN << 8) | 0x14))
+                    .border_1()
+                    .border_color(rgba((VAR_WARN << 8) | 0x77))
+                    .child(
+                        div()
+                            .flex_1()
+                            .flex()
+                            .flex_col()
+                            .child(
+                                div()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child(format!("Unsaved work: “{}”", a.doc.name)),
+                            )
+                            .child(div().text_xs().text_color(rgb(MUTED)).child(format!(
+                                "MacroFlow closed before it was saved (kept {when}).",
+                            ))),
+                    )
+                    .child(small_btn("start-restore", "Restore").on_click(cx.listener(
+                        |this, _: &ClickEvent, _, cx| {
+                            this.restore_autosave();
+                            cx.notify();
+                        },
+                    )))
+                    .child(small_btn("start-discard", "Discard").on_click(cx.listener(
+                        |this, _: &ClickEvent, _, cx| {
+                            this.autosave_found = None;
+                            if !this.dirty {
+                                clear_autosave();
+                            }
+                            cx.notify();
+                        },
+                    ))),
+            );
+        }
+
+        card = card.child(section_title("Start from")).child(tiles);
+        card = card.child(section_title("Recent"));
+        if self.recent.is_empty() {
+            card = card.child(help("Macros you open or save show up here."));
+        } else {
+            let mut list = div().flex().flex_col();
+            for (i, p) in self.recent.iter().take(6).enumerate() {
+                let name = p
+                    .file_stem()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| p.display().to_string());
+                let folder = p.parent().map(|d| d.display().to_string()).unwrap_or_default();
+                let path = p.clone();
+                list = list.child(
+                    div()
+                        .id(("start-recent", i))
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_2()
+                        .px_2()
+                        .h(px(28.))
+                        .rounded_md()
+                        .cursor_pointer()
+                        .hover(|s| s.bg(rgb(BTN_HOVER)))
+                        .child(div().flex_none().text_color(rgb(ACCENT)).child("▤"))
+                        .child(div().flex_none().text_color(rgb(TEXT)).child(name))
+                        .child(div().flex_1().min_w(px(0.)).truncate().text_xs().text_color(rgb(MUTED)).child(folder))
+                        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                            this.load(path.clone());
+                            cx.notify();
+                        })),
+                );
+            }
+            card = card.child(list);
+        }
+        card = card.child(help(&format!(
+            "Tip: {} + K adds a step by typing its name. Drag from a step's output dot into empty space to add a step that's already connected.",
+            SHORTCUT_KEY
+        )));
+
+        div()
+            .id("start-screen")
+            .occlude()
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(rgba((CANVAS_BG << 8) | 0xcc))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(card)
+    }
+
+    /// The quick-add box: type to find a step, Enter adds it.
+    fn render_quick(&self, vw: f32, vh: f32, cx: &mut Context<Self>) -> Stateful<Div> {
+        let Some(q) = &self.quick else { return div().id("quick-add") };
+        let matches = self.quick_matches();
+        let palette = NodeKind::palette();
+        let w = 360.0;
+        let shown = matches.len().min(8);
+        let h = 40.0 + shown.max(1) as f32 * 40.0 + 34.0;
+        let (x, y) = match q.screen {
+            Some((sx, sy)) => ((sx + 8.0).min(vw - w - 8.0).max(8.0), (sy - 20.0).min(vh - h - 8.0).max(8.0)),
+            None => (((vw - w) / 2.0).max(8.0), 72.0),
+        };
+        let caret = div().flex_none().w(px(1.5)).h(px(16.)).bg(rgb(TEXT));
+        let input = if q.query.is_empty() {
+            div()
+                .flex()
+                .items_center()
+                .child(caret)
+                .child(div().pl_1().text_color(rgb(MUTED)).child("Type to find a step…"))
+        } else {
+            div().flex().items_center().child(q.query.clone()).child(caret)
+        };
+        let mut list = div().flex().flex_col().p_1();
+        if matches.is_empty() {
+            list = list.child(
+                div()
+                    .h(px(40.))
+                    .px_2()
+                    .flex()
+                    .items_center()
+                    .text_color(rgb(MUTED))
+                    .child(format!("No steps match “{}”", q.query)),
+            );
+        }
+        let sel = q.sel.min(matches.len().saturating_sub(1));
+        for (row, &pi) in matches.iter().take(8).enumerate() {
+            let k = &palette[pi];
+            let on = row == sel;
+            list = list.child(
+                div()
+                    .id(("quick-item", pi))
+                    .h(px(40.))
+                    .px_2()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .when(on, |d| d.bg(rgba((ACCENT << 8) | 0x55)))
+                    .when(!on, |d| d.hover(|s| s.bg(rgb(BTN_HOVER))))
+                    .child(
+                        div()
+                            .w(px(20.))
+                            .flex_none()
+                            .text_color(rgb(k.color()))
+                            .font_weight(FontWeight::BOLD)
+                            .child(k.icon()),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .flex()
+                            .flex_col()
+                            .child(div().text_color(rgb(TEXT)).child(k.title()))
+                            .child(div().text_xs().text_color(rgb(MUTED)).truncate().child(step_blurb(k))),
+                    )
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _: &MouseDownEvent, _, cx| {
+                            cx.stop_propagation();
+                            this.quick_pick(pi);
+                            cx.notify();
+                        }),
+                    ),
+            );
+        }
+        div()
+            .id("quick-add")
+            .occlude()
+            .absolute()
+            .left(px(x))
+            .top(px(y))
+            .w(px(w))
+            .flex()
+            .flex_col()
+            .rounded_lg()
+            .bg(rgb(PANEL2))
+            .border_1()
+            .border_color(rgb(ACCENT))
+            .shadow_lg()
+            .text_sm()
+            .text_color(rgb(TEXT))
+            .on_mouse_down_out(cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                if this.quick.is_some() {
+                    this.quick = None;
+                    cx.notify();
+                }
+            }))
+            .child(
+                div()
+                    .h(px(40.))
+                    .px_3()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .border_b_1()
+                    .border_color(rgb(BORDER))
+                    .child(div().flex_none().text_color(rgb(ACCENT)).child(if q.link.is_some() {
+                        "＋ Add & connect"
+                    } else {
+                        "＋ Add step"
+                    }))
+                    .child(input),
+            )
+            .child(list)
+            .child(
+                div()
+                    .h(px(28.))
+                    .px_3()
+                    .flex()
+                    .items_center()
+                    .border_t_1()
+                    .border_color(rgb(BORDER))
+                    .text_xs()
+                    .text_color(rgb(MUTED))
+                    .child("↑ ↓ choose · Enter adds · Esc closes"),
+            )
+    }
+
+    /// "These steps would go wrong – run anyway?"
+    fn render_run_check(&self, cx: &mut Context<Self>) -> Stateful<Div> {
+        let Some(c) = &self.run_check else { return div().id("run-check") };
+        let n = c.problems.len();
+        let mut list = div().flex().flex_col().gap_1();
+        for (i, p) in c.problems.iter().take(6).enumerate() {
+            let label = self.doc.node(p.step).map(|n| n.label()).unwrap_or_else(|| "A step".into());
+            let step = p.step;
+            list = list.child(
+                div()
+                    .id(("run-check-item", i))
+                    .flex()
+                    .flex_row()
+                    .gap_2()
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .bg(rgba((RED << 8) | 0x14))
+                    .border_1()
+                    .border_color(rgba((RED << 8) | 0x55))
+                    .cursor_pointer()
+                    .hover(|s| s.border_color(rgb(RED)))
+                    .child(div().flex_none().text_color(rgb(RED)).child("⚠"))
+                    .child(
+                        div()
+                            .flex_1()
+                            .flex()
+                            .flex_col()
+                            .child(div().font_weight(FontWeight::SEMIBOLD).child(label))
+                            .child(div().text_xs().text_color(rgb(MUTED)).child(p.text.clone())),
+                    )
+                    .child(div().flex_none().text_xs().text_color(rgb(MUTED)).child("Show"))
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        this.run_check = None;
+                        this.jump_to_step(step);
+                        cx.notify();
+                    })),
+            );
+        }
+        if n > 6 {
+            list = list.child(help(&format!("…and {} more.", n - 6)));
+        }
+        div()
+            .id("run-check")
+            .occlude()
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(rgba(0x0000_0088))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(
+                div()
+                    .w(px(460.))
+                    .p_4()
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .rounded_xl()
+                    .bg(rgb(PANEL2))
+                    .border_1()
+                    .border_color(rgb(BORDER))
+                    .shadow_lg()
+                    .text_sm()
+                    .text_color(rgb(TEXT))
+                    .child(div().text_base().font_weight(FontWeight::BOLD).child(format!(
+                        "{n} step{} would go wrong",
+                        if n == 1 { "" } else { "s" }
+                    )))
+                    .child(help("Fix them first (click one to go to it), or run anyway."))
+                    .child(list)
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .gap_2()
+                            .justify_end()
+                            .child(small_btn("run-check-cancel", "Cancel  (Esc)").on_click(cx.listener(
+                                |this, _: &ClickEvent, _, cx| {
+                                    this.run_check = None;
+                                    cx.notify();
+                                },
+                            )))
+                            .child(
+                                small_btn("run-check-go", "Run anyway  (Enter)")
+                                    .bg(rgb(ACCENT))
+                                    .text_color(rgb(0xffffff))
+                                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                        if let Some(c) = this.run_check.take() {
+                                            this.run_now(c.from, c.stepping);
+                                        }
+                                        cx.notify();
+                                    })),
+                            ),
+                    ),
+            )
     }
 
     /// − 100% + Fit, bottom right of the canvas.
@@ -4106,7 +5337,8 @@ impl MacroApp {
 
     /// Is this step running right now (for a group: is one of its steps running)?
     fn is_active(&self, n: &Node) -> bool {
-        match (self.active_node, &n.kind) {
+        let shown = self.active_node.or(if self.idle() { self.replay_node } else { None });
+        match (shown, &n.kind) {
             (Some(a), _) if a == n.id => true,
             (Some(a), NodeKind::Group { graph, .. }) => graph.contains(a),
             _ => false,
@@ -4226,6 +5458,8 @@ impl MacroApp {
             n.name.trim().to_string()
         };
         let text_pr = if outputs.len() > 1 { 64. } else { 12. };
+        // Disabled itself, or inside a disabled group: runs skip it.
+        let skipped = self.doc.is_skipped(id);
 
         let mut el = div()
             .absolute()
@@ -4271,18 +5505,37 @@ impl MacroApp {
                     .h(s(26.))
                     .flex_none()
                     .rounded_t(s(6.))
-                    .bg(rgba((color << 8) | 0x2e))
-                    .child(div().flex_none().text_color(rgb(color)).child(n.kind.icon()))
+                    .bg(if skipped { rgba((MUTED << 8) | 0x1c) } else { rgba((color << 8) | 0x2e) })
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_color(rgb(if skipped { MUTED } else { color }))
+                            .child(if n.disabled { "⊘" } else { n.kind.icon() }),
+                    )
                     .child(
                         div()
                             .min_w(px(0.))
                             .truncate()
                             .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(rgb(TEXT))
+                            .text_color(rgb(if skipped { MUTED } else { TEXT }))
+                            .when(n.disabled, |d| d.line_through())
                             .child(heading),
                     )
                     .child(div().flex_1())
-                    .when(n.delay_ms > 0, |d| {
+                    .when(n.disabled, |d| {
+                        d.child(
+                            div()
+                                .flex_none()
+                                .px(s(5.))
+                                .rounded(s(4.))
+                                .bg(rgb(BTN))
+                                .text_size(s(11.))
+                                .font_weight(FontWeight::BOLD)
+                                .text_color(rgb(MUTED))
+                                .child("⊘ OFF"),
+                        )
+                    })
+                    .when(n.delay_ms > 0 && !n.disabled, |d| {
                         d.child(
                             div()
                                 .flex_none()
@@ -4396,6 +5649,58 @@ impl MacroApp {
                     .shadow_sm(),
             );
         }
+        // ⚠ in the corner when something about the step looks wrong.
+        if let Some(p) = self.problems.get(&id) {
+            let total = p.serious + p.minor + p.inside;
+            if total > 0 {
+                let col = if p.serious > 0 || p.inside_serious { RED } else { VAR_WARN };
+                el = el.child(
+                    div()
+                        .absolute()
+                        .right(s(-7.))
+                        .top(s(-8.))
+                        .h(s(17.))
+                        .px(s(4.))
+                        .flex()
+                        .items_center()
+                        .gap(s(2.))
+                        .rounded(s(5.))
+                        .bg(rgb(col))
+                        .border(line(2.))
+                        .border_color(rgb(NODE_BG))
+                        .text_size(s(10.))
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(rgb(if col == RED { 0xffffff } else { 0x1a1400 }))
+                        .child("⚠")
+                        .when(total > 1, |d| d.child(total.to_string())),
+                );
+            }
+        }
+        // What the step did on the last run, under the card.
+        if let Some(r) = self.results.get(&id) {
+            let col = if r.ok { GREEN } else { VAR_WARN };
+            let text = if r.count > 1 { format!("{}  ×{}", r.text, r.count) } else { r.text.clone() };
+            el = el.child(
+                div()
+                    .absolute()
+                    .left(px(0.))
+                    .top(s(NODE_H + 5.))
+                    .max_w(s(NODE_W))
+                    .h(s(18.))
+                    .px(s(6.))
+                    .flex()
+                    .items_center()
+                    .rounded(s(5.))
+                    .bg(rgba((col << 8) | 0x1f))
+                    .border(line(1.))
+                    .border_color(rgba((col << 8) | 0x66))
+                    .text_size(s(11.))
+                    .text_color(rgb(col))
+                    .whitespace_nowrap()
+                    .overflow_hidden()
+                    .child(text),
+            );
+        }
         if culprit {
             let (tag, why) = match self.last_end.as_ref().map(|e| e.kind) {
                 Some(EndKind::Error) => ("✕", "went wrong here"),
@@ -4423,6 +5728,9 @@ impl MacroApp {
                     .child(tag)
                     .child(why),
             );
+        }
+        if skipped && !active {
+            el = el.opacity(0.5);
         }
         el
     }
@@ -4674,6 +5982,16 @@ impl MacroApp {
             "Off: the mouse jumps straight to each spot. Turn this on for curved, natural-looking moves."
         })
         .into_any_element());
+        out.push(
+            chip("show-clicks", "Show a green dot where it clicks", self.doc.show_clicks)
+                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                    this.doc.show_clicks = !this.doc.show_clicks;
+                    this.dirty = true;
+                    cx.notify();
+                }))
+                .into_any_element(),
+        );
+        out.push(help("While it runs, a green dot appears where it's about to click (a ring for a plain mouse move, and where a drag lets go), with a ripple when it clicks. Clicks go straight through it, and it's hidden from MacroFlow's own screenshots, so Find image, Read text and Pixel colour never see it.").into_any_element());
 
         // Alerts and hotkeys.
         out.push(div().h(px(8.)).into_any_element());
@@ -4760,6 +6078,38 @@ impl MacroApp {
                 })
                 .into_any_element(),
         );
+        if let Some(p) = self.problems.get(&id) {
+            let mut items: Vec<(bool, String)> = p.texts.clone();
+            if p.inside > 0 {
+                items.push((
+                    p.inside_serious,
+                    format!(
+                        "{} problem{} with steps inside this group. Open it to see.",
+                        p.inside,
+                        if p.inside == 1 { "" } else { "s" }
+                    ),
+                ));
+            }
+            for (serious, text) in items {
+                let col = if serious { RED } else { VAR_WARN };
+                out.push(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .gap_2()
+                        .px_2()
+                        .py_1()
+                        .rounded_md()
+                        .bg(rgba((col << 8) | 0x18))
+                        .border_1()
+                        .border_color(rgba((col << 8) | 0x66))
+                        .text_xs()
+                        .child(div().flex_none().text_color(rgb(col)).child("⚠"))
+                        .child(div().flex_1().text_color(rgb(TEXT)).child(text))
+                        .into_any_element(),
+                );
+            }
+        }
         let groupable = !n.kind.is_fixed() && !matches!(n.kind, NodeKind::End) && self.doc.straight_run(id).len() >= 2;
         if groupable {
             let run = self.doc.straight_run(id).len();
@@ -4793,6 +6143,33 @@ impl MacroApp {
                     }))
                     .into_any_element(),
             );
+        }
+        if !n.kind.is_fixed() {
+            let label = if n.kind.is_group() {
+                "⊘ Disabled – skip this whole group"
+            } else {
+                "⊘ Disabled – skip this step"
+            };
+            out.push(
+                chip("n-disabled", label, n.disabled)
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        // Act on this step only, even if others are selected too.
+                        this.clear_selection();
+                        this.selected = Some(id);
+                        this.toggle_disabled();
+                        cx.notify();
+                    }))
+                    .into_any_element(),
+            );
+            if n.disabled {
+                let multi = n.kind.outputs().len() > 1;
+                out.push(help(if multi {
+                    "Runs skip it and carry on along its first output that's connected (normally the first one)."
+                } else {
+                    "Runs skip it and carry on with whatever its output is connected to."
+                })
+                .into_any_element());
+            }
         }
         out.push(div().h(px(6.)).into_any_element());
 
@@ -5317,6 +6694,10 @@ impl MacroApp {
         cx: &mut Context<Self>,
     ) -> Vec<AnyElement> {
         let mut out: Vec<AnyElement> = Vec::new();
+        let gone = matches!(
+            self.doc.node(id).map(|n| &n.kind),
+            Some(NodeKind::FindImage { until_gone: true, .. })
+        );
         // Hide the preview while searching, so the search can't find our own preview.
         let show_preview = matches!(self.mode, Mode::Idle | Mode::Snipping(_) | Mode::Picking(_));
         let preview: AnyElement = match (&template, show_preview) {
@@ -5443,8 +6824,27 @@ impl MacroApp {
         }
         out.push(div().h(px(4.)).into_any_element());
         out.push(self.num_field("Match threshold", Field::Threshold, 0.01, cx).into_any_element());
-        out.push(self.num_field("Keep looking for (ms)", Field::Timeout, 500.0, cx).into_any_element());
+        out.push(
+            self.num_field(if gone { "Wait up to (ms)" } else { "Keep looking for (ms)" }, Field::Timeout, 500.0, cx)
+                .into_any_element(),
+        );
         out.push(self.num_field("Check every (ms)", Field::Interval, 50.0, cx).into_any_element());
+        out.push(
+            chip("find-gone", "Wait until it's gone", gone)
+                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                    this.update_node(id, |k| {
+                        if let NodeKind::FindImage { until_gone, .. } = k {
+                            *until_gone = !*until_gone;
+                        }
+                    });
+                    cx.notify();
+                }))
+                .into_any_element(),
+        );
+        if gone {
+            out.push(help("Follows “gone” as soon as the image disappears (e.g. a loading screen), or “still there” if it's still showing when the time runs out.").into_any_element());
+            return out;
+        }
         out.push(
             chip("find-click", "Click it when found", click_when_found)
                 .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
@@ -6004,7 +7404,7 @@ impl MacroApp {
                 .child(if has_area { "Area set" } else { "No area yet" })
                 .into_any_element(),
         };
-        out.extend(self.picture_box(id, 80., preview_el, "When selected", cx));
+        out.extend(self.picture_box(id, if self.seen.contains_key(&id) { 150. } else { 80. }, preview_el, "When selected", cx));
         out.push(
             div()
                 .flex()
@@ -6025,6 +7425,25 @@ impl MacroApp {
                 .into_any_element(),
         );
         out.push(help("Shift-click “Select area” to get 3 seconds to switch to another window first.").into_any_element());
+        let gone = matches!(
+            self.doc.node(id).map(|n| &n.kind),
+            Some(NodeKind::ReadText { until_gone: true, .. })
+        );
+        out.push(
+            chip("read-gone", "Wait until it stops matching (gone)", gone)
+                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                    this.update_node(id, |k| {
+                        if let NodeKind::ReadText { until_gone, .. } = k {
+                            *until_gone = !*until_gone;
+                        }
+                    });
+                    cx.notify();
+                }))
+                .into_any_element(),
+        );
+        if gone {
+            out.push(help("Keeps reading until the comparison below is no longer true (e.g. until “Loading” disappears), then follows “gone”. If it's still true when the time runs out, it follows “still there”.").into_any_element());
+        }
         out.push(self.num_field("X", Field::X, 1.0, cx).into_any_element());
         out.push(self.num_field("Y", Field::Y, 1.0, cx).into_any_element());
         out.push(self.num_field("Width", Field::W, 1.0, cx).into_any_element());
@@ -6441,7 +7860,31 @@ impl Render for MacroApp {
         self.checkpoint();
         self.vars_known = self.doc.variables_set();
         self.vars_known.extend(BUILTIN_VARS.iter().map(|v| v.to_string()));
+        // What's wrong with each step (badges on the cards, notes in the Edit tab).
+        self.problems.clear();
+        for p in self.doc.problems() {
+            let e = self.problems.entry(p.step).or_default();
+            if p.serious {
+                e.serious += 1;
+            } else {
+                e.minor += 1;
+            }
+            e.texts.push((p.serious, p.text.clone()));
+            for g in self.doc.root.path_to(p.step).unwrap_or_default() {
+                let e = self.problems.entry(g).or_default();
+                e.inside += 1;
+                e.inside_serious |= p.serious;
+            }
+        }
+        // The start screen goes away once you start working.
+        if self.dirty || !self.idle() {
+            self.show_start = false;
+        }
         let menu = self.menu.clone().map(|m| self.render_menu(&m, window, cx));
+        let vp = window.viewport_size();
+        let (vw, vh) = (f32::from(vp.width), f32::from(vp.height));
+        let quick = self.quick.as_ref().map(|_| self.render_quick(vw, vh, cx));
+        let check = self.run_check.as_ref().map(|_| self.render_run_check(cx));
         div()
             .relative()
             .on_action(cx.listener(Self::on_quit))
@@ -6473,6 +7916,8 @@ impl Render for MacroApp {
             )
             .child(self.render_statusbar(cx))
             .children(menu)
+            .children(quick)
+            .children(check)
     }
 }
 
@@ -6637,6 +8082,44 @@ fn section_title(text: &'static str) -> Div {
 // ---------------------------------------------------------------------------
 // Variable pills: wherever a variable is used it's shown as a small tinted tag
 // ---------------------------------------------------------------------------
+
+/// What a step did the last time the macro ran (the tag under its card).
+struct CardResult {
+    text: String,
+    ok: bool,
+    /// How many times it ran.
+    count: u32,
+}
+
+/// The quick-add box (Ctrl/⌘ + K, or letting go of a line on empty canvas).
+struct QuickAdd {
+    query: String,
+    /// The highlighted match.
+    sel: usize,
+    /// Connect this output to the new step.
+    link: Option<(u64, usize)>,
+    /// Put the new step here (canvas coordinates) and show the box at `screen`.
+    at: Option<(f32, f32)>,
+    screen: Option<(f32, f32)>,
+}
+
+/// "Run anyway?" when the check before running found problems.
+struct RunCheck {
+    from: Option<u64>,
+    stepping: bool,
+    problems: Vec<Problem>,
+}
+
+/// What's wrong with one step (or, for a group, with the steps inside it).
+#[derive(Default, Clone)]
+struct StepProblems {
+    serious: usize,
+    minor: usize,
+    texts: Vec<(bool, String)>,
+    /// Problems with steps inside this group.
+    inside: usize,
+    inside_serious: bool,
+}
 
 /// What a Read text / Find image step saw when it last ran.
 struct SeenShot {
@@ -6804,6 +8287,7 @@ fn step_blurb(k: &NodeKind) -> &'static str {
         NodeKind::Scroll { .. } => "Scroll up, down or sideways",
         NodeKind::KeyPress { .. } => "Press a key or shortcut",
         NodeKind::TypeText { .. } => "Type some text",
+        NodeKind::FindImage { until_gone: true, .. } => "Wait until an image disappears",
         NodeKind::FindImage { .. } => "Branch on an image on screen",
         NodeKind::WindowCheck { .. } => "Branch on a window's title or app",
         NodeKind::ReadText { .. } => "Read text or a number and compare",

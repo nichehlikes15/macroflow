@@ -2,6 +2,7 @@
 //! Everything here runs on worker threads and reports back to the UI over a channel.
 
 use crate::keys;
+use crate::marker;
 use crate::model::*;
 use crate::vision;
 use device_query::{DeviceQuery, DeviceState, Keycode};
@@ -43,6 +44,12 @@ pub enum WorkerMsg {
     /// What a Read text / Find image step just looked at (a picture saved in
     /// `images/last-run/`), so the editor can show it in place of the original.
     Seen { step: u64, path: PathBuf, caption: String, ok: bool },
+    /// What a step just did, for the tag under its card (`ok` = it took its first output).
+    StepResult { step: u64, text: String, ok: bool },
+    /// Every variable and its value (sent whenever one changes during a run).
+    Vars(Vec<(String, String)>),
+    /// Something finished in the background (e.g. a log picture): redraw.
+    Refresh,
     /// The user finished (or cancelled) dragging a box on the screen.
     /// `sel` is (x0, y0, x1, y1) in the screenshot's display coordinates.
     AreaPicked {
@@ -213,7 +220,32 @@ pub struct LogEntry {
     pub step: Option<u64>,
     pub text: String,
     pub level: LogLevel,
+    /// A click, move, drag, scroll or key the macro did (for playing the log back).
+    pub action: Option<LogAction>,
 }
+
+/// Something the macro did with the mouse or keyboard, as shown in the log.
+#[derive(Clone, Debug)]
+pub struct LogAction {
+    pub mark: vision::Mark,
+    /// Where (global mouse coordinates), and for a drag where it let go.
+    pub at: Option<(i32, i32)>,
+    pub to: Option<(i32, i32)>,
+    /// The screen at that moment with the action drawn on. It's saved in the
+    /// background, so it may not exist yet (or at all, if the macro was very busy).
+    pub shot: Option<PathBuf>,
+}
+
+/// Where the log's playback pictures go (emptied at the start of every run).
+pub fn playback_dir() -> PathBuf {
+    seen_dir().join("playback")
+}
+
+/// Playback pictures being saved right now / saved this run.
+static SNAPS_BUSY: AtomicU64 = AtomicU64::new(0);
+static SNAPS_TAKEN: AtomicU64 = AtomicU64::new(0);
+/// At most this many pictures per run (the log still lists every action).
+const MAX_SNAPS: u64 = 400;
 
 /// Why a run of the macro ended, so the editor can highlight the step responsible.
 #[derive(Clone, Debug, PartialEq)]
@@ -275,6 +307,9 @@ pub fn run_macro(
     let spawned = thread::Builder::new().name(RUN_THREAD.into()).spawn(move || {
         let tx = thread_tx;
         let t0 = Instant::now();
+        // A fresh set of log pictures for this run.
+        let _ = std::fs::remove_dir_all(playback_dir());
+        SNAPS_TAKEN.store(0, Ordering::Relaxed);
         let last_step = Arc::new(AtomicU64::new(0));
         let tracked = last_step.clone();
         // Catch crashes inside playback, so they're reported instead of killing MacroFlow.
@@ -320,6 +355,7 @@ pub fn run_macro(
             WorkerMsg::Log(LogEntry {
                 ms,
                 step: end.step,
+                action: None,
                 text: end.message.clone(),
                 level: match end.kind {
                     EndKind::Error => LogLevel::Bad,
@@ -339,6 +375,23 @@ pub fn run_macro(
     });
     if let Err(e) = spawned {
         send(&tx, WorkerMsg::Failed(format!("Couldn't start the macro: {e}")));
+    }
+}
+
+fn button_name(b: MouseBtn) -> &'static str {
+    match b {
+        MouseBtn::Left => "Left",
+        MouseBtn::Right => "Right",
+        MouseBtn::Middle => "Middle",
+    }
+}
+
+/// "Left click", "Right double-click", "Left click ×3".
+fn click_words(b: MouseBtn, clicks: u32) -> String {
+    match clicks {
+        0 | 1 => format!("{} click", button_name(b)),
+        2 => format!("{} double-click", button_name(b)),
+        n => format!("{} click ×{n}", button_name(b)),
     }
 }
 
@@ -501,6 +554,10 @@ struct Runner<'a> {
     suppress_esc_until: Arc<AtomicU64>,
     watch_done: Arc<AtomicBool>,
     rng: u64,
+    /// What the step that just ran did, in a few words (shown under its card).
+    note: Option<String>,
+    /// The variables as last sent to the editor.
+    sent_vars: Vec<(String, String)>,
 }
 
 impl<'a> Runner<'a> {
@@ -513,6 +570,10 @@ impl<'a> Runner<'a> {
         last_step: Arc<AtomicU64>,
     ) -> Result<Self, String> {
         let enigo = Enigo::new(&Settings::default()).map_err(input_err)?;
+        if doc.show_clicks {
+            // Start the dot's helper now, so it's ready by the first click.
+            marker::prepare();
+        }
         let suppress_esc_until = Arc::new(AtomicU64::new(0));
         let watch_done = Arc::new(AtomicBool::new(false));
         let failsafe_hit = Arc::new(AtomicBool::new(false));
@@ -549,6 +610,8 @@ impl<'a> Runner<'a> {
             suppress_esc_until,
             watch_done,
             rng: now_ms() | 1,
+            note: None,
+            sent_vars: Vec::new(),
         })
     }
 
@@ -585,6 +648,42 @@ impl<'a> Runner<'a> {
                 step: self.current,
                 text,
                 level,
+                action: None,
+            }),
+        );
+    }
+
+    /// Log something the macro did with the mouse or keyboard, with a picture of the
+    /// screen at this moment (taken in the background, so the macro doesn't wait).
+    fn log_action(&self, text: String, mark: vision::Mark, at: Option<(i32, i32)>, to: Option<(i32, i32)>) {
+        let shot = if SNAPS_TAKEN.load(Ordering::Relaxed) < MAX_SNAPS && SNAPS_BUSY.load(Ordering::Relaxed) < 2 {
+            SNAPS_TAKEN.fetch_add(1, Ordering::Relaxed);
+            SNAPS_BUSY.fetch_add(1, Ordering::Relaxed);
+            let n = SNAPS_TAKEN.load(Ordering::Relaxed);
+            let path = playback_dir().join(format!("{}-{n}.png", now_ms()));
+            let (p, tx) = (path.clone(), self.tx.clone());
+            thread::spawn(move || {
+                let _ = std::fs::create_dir_all(playback_dir());
+                if let Ok(img) = vision::playback_shot(at, to, mark) {
+                    if img.save(&p).is_ok() {
+                        // Let the editor show it if that line is selected.
+                        send(&tx, WorkerMsg::Refresh);
+                    }
+                }
+                SNAPS_BUSY.fetch_sub(1, Ordering::Relaxed);
+            });
+            Some(path)
+        } else {
+            None
+        };
+        send(
+            self.tx,
+            WorkerMsg::Log(LogEntry {
+                ms: self.started.elapsed().as_millis() as u64,
+                step: self.current,
+                text,
+                level: LogLevel::Info,
+                action: Some(LogAction { mark, at, to, shot }),
             }),
         );
     }
@@ -785,6 +884,20 @@ impl<'a> Runner<'a> {
                 NodeKind::GroupOut => return Ok(Exit::LeftGroup),
                 _ => {}
             }
+            // A disabled step (or group) is skipped: carry on with what it's connected to.
+            if node.disabled && !node.kind.is_fixed() {
+                self.sleep(0)?;
+                self.current = Some(id);
+                let what = if node.kind.is_group() { "group" } else { "step" };
+                self.log(LogLevel::Info, format!("⊘ Skipped “{}” (disabled {what})", node.label()));
+                send(self.tx, WorkerMsg::StepResult { step: id, text: "⊘ skipped".into(), ok: true });
+                let (port, to) = self.doc.skip_target(id);
+                cur = to;
+                if cur.is_none() {
+                    self.ended_at = Some(EndAt::Dangling(id, port));
+                }
+                continue;
+            }
             // Hold here while paused.
             self.sleep(0)?;
             send(self.tx, WorkerMsg::Active(Some(id)));
@@ -866,13 +979,26 @@ impl<'a> Runner<'a> {
                     self.scale = m.scale();
                 }
             }
-            match self.exec(&node)? {
+            self.note = None;
+            let result = self.exec(&node)?;
+            self.send_vars();
+            match result {
                 Some(p) => {
                     let outputs = node.kind.outputs();
                     if outputs.len() > 1 {
                         let level = if p == 0 { LogLevel::Good } else { LogLevel::Warn };
                         self.log(level, format!("→ {}", outputs.get(p).copied().unwrap_or("?")));
                     }
+                    // A short tag for the step's card: what it did, and which way it went.
+                    let way = outputs.get(p).copied().filter(|_| outputs.len() > 1);
+                    let text = match (self.note.take(), way) {
+                        (Some(n), Some(w)) => format!("{n} → {w}"),
+                        (Some(n), None) => n,
+                        (None, Some(w)) => format!("→ {w}"),
+                        (None, None) => "✓".to_string(),
+                    };
+                    let ok = p == 0 || matches!(node.kind, NodeKind::Loop { .. });
+                    send(self.tx, WorkerMsg::StepResult { step: id, text, ok });
                     cur = self.doc.next(id, p);
                     if cur.is_none() {
                         self.ended_at = Some(EndAt::Dangling(id, p));
@@ -886,6 +1012,41 @@ impl<'a> Runner<'a> {
         }
         // Ran out of connections: inside a group that means "carry on after the group".
         Ok(Exit::LeftGroup)
+    }
+
+    /// Show the green dot at (x, y) if the macro has "show where it clicks" on:
+    /// filled for a click, a ring for a plain move.
+    fn mark(&self, x: i32, y: i32, click: bool) {
+        if self.doc.show_clicks {
+            marker::show(x, y, click);
+        }
+    }
+
+    /// The dot where the mouse already is (a click that doesn't move the mouse).
+    fn mark_here(&self) {
+        if self.doc.show_clicks {
+            if let Ok(d) = device() {
+                let (x, y) = d.get_mouse().coords;
+                marker::show(x, y, true);
+            }
+        }
+    }
+
+    /// The click happened: a quick ripple, then the dot goes.
+    fn mark_click(&self) {
+        if self.doc.show_clicks {
+            marker::pulse();
+        }
+    }
+
+    /// Tell the editor the variables, if any changed since last time.
+    fn send_vars(&mut self) {
+        let mut now: Vec<(String, String)> = self.vars.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        now.sort();
+        if now != self.sent_vars {
+            self.sent_vars = now.clone();
+            send(self.tx, WorkerMsg::Vars(now));
+        }
     }
 
     /// Put variables (and what the last Read text step read, as `{text}`) into text.
@@ -1072,9 +1233,20 @@ impl<'a> Runner<'a> {
                 if let Some((px, py)) =
                     self.resolve(node.id, *target, *x, *y, *offset_x, *offset_y, *area, *jitter_px)?
                 {
+                    // The green dot goes where it's about to click, then the mouse heads there.
+                    self.mark(px, py, true);
                     self.move_to(px, py)?;
                     self.sleep(25)?;
+                } else {
+                    self.mark_here();
                 }
+                let at = device().ok().map(|d| d.get_mouse().coords);
+                let words = click_words(*button, *clicks);
+                let text = match at {
+                    Some((x, y)) => format!("◉ {words} at ({x}, {y})"),
+                    None => format!("◉ {words}"),
+                };
+                self.log_action(text, vision::Mark::Click, at, None);
                 let b = to_button(*button);
                 for i in 0..(*clicks).max(1) {
                     if i > 0 {
@@ -1082,6 +1254,7 @@ impl<'a> Runner<'a> {
                     }
                     self.enigo.button(b, Direction::Click).map_err(input_err)?;
                 }
+                self.mark_click();
                 Ok(Some(0))
             }
 
@@ -1097,7 +1270,11 @@ impl<'a> Runner<'a> {
                 if let Some((px, py)) =
                     self.resolve(node.id, *target, *x, *y, *offset_x, *offset_y, *area, *jitter_px)?
                 {
+                    // A green ring where the mouse is going (no click).
+                    self.mark(px, py, false);
                     self.move_to(px, py)?;
+                    marker::hide();
+                    self.log_action(format!("➜ Moved to ({px}, {py})"), vision::Mark::Move, Some((px, py)), None);
                 }
                 Ok(Some(0))
             }
@@ -1111,10 +1288,13 @@ impl<'a> Runner<'a> {
                 duration_ms,
             } => {
                 let b = to_button(*button);
+                self.mark(*from_x, *from_y, true);
                 self.move_to(*from_x, *from_y)?;
                 self.sleep(40)?;
                 self.enigo.button(b, Direction::Press).map_err(input_err)?;
                 self.held_buttons.push(b);
+                // While dragging, a ring shows where it'll let go.
+                self.mark(*to_x, *to_y, false);
                 // A short hold so apps notice the press before the move starts.
                 self.sleep(80)?;
                 let ms = self.scaled(*duration_ms) as f64;
@@ -1123,12 +1303,20 @@ impl<'a> Runner<'a> {
                 self.sleep(80)?;
                 self.enigo.button(b, Direction::Release).map_err(input_err)?;
                 self.held_buttons.retain(|h| *h != b);
+                self.mark_click();
+                self.log_action(
+                    format!("⇢ {} drag ({from_x}, {from_y}) → ({to_x}, {to_y})", button_name(*button)),
+                    vision::Mark::Click,
+                    Some((*from_x, *from_y)),
+                    Some((*to_x, *to_y)),
+                );
                 Ok(Some(0))
             }
 
             NodeKind::KeyPress { key, mods } => {
                 let k = keys::to_enigo(key).ok_or_else(|| format!("This computer can't send the “{key}” key."))?;
                 let mod_keys = keys::modifier_keys(mods);
+                self.log_action(format!("⌨ Pressed {}", keys::combo_label(key, mods)), vision::Mark::None, None, None);
                 for m in &mod_keys {
                     self.send_key(*m, Direction::Press)?;
                     self.sleep(8)?;
@@ -1144,6 +1332,9 @@ impl<'a> Runner<'a> {
             NodeKind::TypeText { text, press_enter } => {
                 let text = self.fill_text(text);
                 if !text.is_empty() {
+                    let shown: String = text.chars().take(40).collect();
+                    let more = if text.chars().count() > 40 { "…" } else { "" };
+                    self.log_action(format!("T Typed “{shown}{more}”"), vision::Mark::None, None, None);
                     self.enigo.text(&text).map_err(input_err)?;
                 }
                 if *press_enter {
@@ -1163,6 +1354,14 @@ impl<'a> Runner<'a> {
                 // One wheel click at a time, like a finger on the wheel (a single big
                 // scroll counts as just one click in many apps and games).
                 let clicks = amount.unsigned_abs();
+                let at = device().ok().map(|d| d.get_mouse().coords);
+                let dir = match (*horizontal, *amount < 0) {
+                    (false, false) => "down",
+                    (false, true) => "up",
+                    (true, false) => "right",
+                    (true, true) => "left",
+                };
+                self.log_action(format!("⇵ Scrolled {dir} {clicks}×"), vision::Mark::Scroll, at, None);
                 for i in 0..clicks {
                     if i > 0 {
                         let gap = if self.doc.human_mouse { 30 + self.random(30) } else { 35 };
@@ -1181,10 +1380,18 @@ impl<'a> Runner<'a> {
                     match &ev.action {
                         RecAction::Move { x, y } => self.jump_to(*x, *y)?,
                         RecAction::Down { button, x, y } => {
+                            self.mark(*x, *y, true);
                             self.jump_to(*x, *y)?;
+                            self.log_action(
+                                format!("◉ {} press at ({x}, {y}) (recording)", button_name(*button)),
+                                vision::Mark::Click,
+                                Some((*x, *y)),
+                                None,
+                            );
                             let b = to_button(*button);
                             self.enigo.button(b, Direction::Press).map_err(input_err)?;
                             self.held_buttons.push(b);
+                            self.mark_click();
                         }
                         RecAction::Up { button, x, y } => {
                             self.jump_to(*x, *y)?;
@@ -1215,6 +1422,7 @@ impl<'a> Runner<'a> {
                 interval_ms,
                 click_when_found,
                 search_area,
+                until_gone,
             } => {
                 let area = search_area.map(|r| (r.x, r.y, r.w, r.h));
                 let path = template
@@ -1230,6 +1438,36 @@ impl<'a> Runner<'a> {
                     tpl
                 };
                 let t0 = Instant::now();
+                if *until_gone {
+                    // Wait for the image to go away.
+                    loop {
+                        if self.stop.load(Ordering::Relaxed) {
+                            return Err(STOPPED.into());
+                        }
+                        let (hit, view) = vision::locate_in_seen(&tpl, *threshold, area)?;
+                        let waited = t0.elapsed().as_millis() as u64;
+                        if !hit.found || waited >= *timeout_ms {
+                            let secs = waited as f32 / 1000.0;
+                            let caption = if hit.found {
+                                format!("Still there after {secs:.1}s ({:.0}% match)", hit.score * 100.0)
+                            } else {
+                                format!("Gone after {secs:.1}s")
+                            };
+                            if let Some(view) = view {
+                                send_seen(self.tx, node.id, view, caption.clone(), !hit.found);
+                            }
+                            self.status(format!("◎ {caption}"));
+                            self.log(LogLevel::Info, caption);
+                            if hit.found {
+                                self.note = Some("still there".into());
+                                return Ok(Some(1));
+                            }
+                            self.note = Some(format!("gone after {secs:.1}s"));
+                            return Ok(Some(0));
+                        }
+                        self.sleep((*interval_ms).max(50))?;
+                    }
+                }
                 loop {
                     if self.stop.load(Ordering::Relaxed) {
                         return Err(STOPPED.into());
@@ -1249,6 +1487,7 @@ impl<'a> Runner<'a> {
                         send_seen(self.tx, node.id, view, caption, hit.found);
                     }
                     if hit.found {
+                        self.note = Some(format!("found {:.0}%", hit.score * 100.0));
                         self.found = Some((hit.x, hit.y));
                         self.vars.insert("found_x".into(), hit.x.to_string());
                         self.vars.insert("found_y".into(), hit.y.to_string());
@@ -1263,15 +1502,24 @@ impl<'a> Runner<'a> {
                             format!("Found at ({}, {}), {:.0}% match", hit.x, hit.y, hit.score * 100.0),
                         );
                         if *click_when_found {
+                            self.mark(hit.x, hit.y, true);
                             self.move_to(hit.x, hit.y)?;
                             self.sleep(25)?;
+                            self.log_action(
+                                format!("◉ Left click on the found image at ({}, {})", hit.x, hit.y),
+                                vision::Mark::Click,
+                                Some((hit.x, hit.y)),
+                                None,
+                            );
                             self.enigo
                                 .button(Button::Left, Direction::Click)
                                 .map_err(input_err)?;
+                            self.mark_click();
                         }
                         return Ok(Some(0));
                     }
                     if t0.elapsed().as_millis() as u64 >= *timeout_ms {
+                        self.note = Some(format!("best {:.0}%", hit.score.max(0.0) * 100.0));
                         self.status(format!(
                             "◎ Image not found (best {:.0}% match) – taking the “not found” path",
                             hit.score.max(0.0) * 100.0
@@ -1350,6 +1598,7 @@ impl<'a> Runner<'a> {
                 interval_ms,
                 numbers_only,
                 save_to,
+                until_gone,
                 ..
             } => {
                 let save = save_to.trim();
@@ -1374,9 +1623,22 @@ impl<'a> Runner<'a> {
                     let read = result.text.clone();
                     // "Compare with" can use variables too, e.g. {gold_before}.
                     let value = self.fill_text(value);
-                    let ok = text_matches(&read, *compare, &value, *case_sensitive, baseline.as_deref())?;
-                    let verdict = if ok { "match" } else { "no match" };
-                    send_seen(self.tx, node.id, shot, format!("{} – {verdict}", read_caption(&result)), ok);
+                    let matched = text_matches(&read, *compare, &value, *case_sensitive, baseline.as_deref())?;
+                    // "Until gone": done once it stops matching.
+                    let ok = matched != *until_gone;
+                    let verdict = match (*until_gone, ok) {
+                        (false, true) => "match",
+                        (false, false) => "no match",
+                        (true, true) => "gone",
+                        (true, false) => "still there",
+                    };
+                    send_seen(
+                        self.tx,
+                        node.id,
+                        shot,
+                        format!("{} – {verdict} · underneath: what the reader was given", read_caption(&result)),
+                        ok,
+                    );
                     if baseline.is_none() {
                         baseline = Some(read.clone());
                     }
@@ -1387,14 +1649,18 @@ impl<'a> Runner<'a> {
                         self.vars.insert(save.to_string(), read.clone());
                     }
                     let shown: String = read.replace('\n', " ⏎ ").chars().take(60).collect();
+                    let short: String = read.replace('\n', " ").chars().take(18).collect();
+                    let short = if read.chars().count() > 18 { format!("{short}…") } else { short };
                     if ok {
-                        self.status(format!("Aa Read “{shown}” – match"));
+                        self.status(format!("Aa Read “{shown}” – {verdict}"));
                         self.log(LogLevel::Info, format!("Read “{shown}”"));
+                        self.note = Some(format!("read “{short}”"));
                         return Ok(Some(0));
                     }
                     if t0.elapsed().as_millis() as u64 >= *timeout_ms {
-                        self.status(format!("Aa Read “{shown}” – no match"));
+                        self.status(format!("Aa Read “{shown}” – {verdict}"));
                         self.log(LogLevel::Info, format!("Read “{shown}”"));
+                        self.note = Some(format!("read “{short}”"));
                         return Ok(Some(1));
                     }
                     self.sleep((*interval_ms).max(100))?;
@@ -1453,6 +1719,8 @@ impl<'a> Runner<'a> {
                 }
                 let value = eval_expr(expr, &self.vars)?.as_text();
                 self.log(LogLevel::Info, format!("{name} = {value}"));
+                let short: String = value.chars().take(18).collect();
+                self.note = Some(format!("= {short}"));
                 self.status(format!("x= {name} = {value}"));
                 self.vars.insert(name.to_string(), value);
                 Ok(Some(0))
@@ -1466,6 +1734,10 @@ impl<'a> Runner<'a> {
                     LogLevel::Info,
                     format!("“{}” {} “{}” → {}", a.as_text(), op.label(), b.as_text(), if yes { "yes" } else { "no" }),
                 );
+                let cut = |s: String| -> String {
+                    if s.chars().count() > 10 { format!("{}…", s.chars().take(10).collect::<String>()) } else { s }
+                };
+                self.note = Some(format!("{} {} {}", cut(a.as_text()), op.label(), cut(b.as_text())));
                 Ok(Some(if yes { 0 } else { 1 }))
             }
 
@@ -1503,6 +1775,8 @@ impl<'a> Runner<'a> {
                 let left = self.loops.entry(node.id).or_insert(*count);
                 if *left > 0 {
                     *left -= 1;
+                    let done = *count - *left;
+                    self.note = Some(format!("{done} of {count}"));
                     Ok(Some(0))
                 } else {
                     self.loops.remove(&node.id);
@@ -1515,6 +1789,7 @@ impl<'a> Runner<'a> {
 
 impl Drop for Runner<'_> {
     fn drop(&mut self) {
+        marker::hide();
         self.release_all();
         self.watch_done.store(true, Ordering::Relaxed);
     }
@@ -2013,7 +2288,13 @@ pub fn test_read(
             Ok((r, shot)) => {
                 let ok = compare != TextCompare::Changed
                     && text_matches(&r.text, compare, &value, case_sensitive, None).unwrap_or(false);
-                send_seen(&tx, step, shot, format!("Read now: {}", read_caption(&r)), ok);
+                send_seen(
+                    &tx,
+                    step,
+                    shot,
+                    format!("Read now: {} · underneath: what the reader was given", read_caption(&r)),
+                    ok,
+                );
                 let ms = t0.elapsed().as_millis();
                 let read = r.text.clone();
                 let shown = if read.is_empty() {

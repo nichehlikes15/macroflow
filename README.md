@@ -100,7 +100,7 @@ If you close the window or quit with unsaved changes, MacroFlow asks whether to 
 | **Recording** | next | A recorded sequence of raw events. Each event has its own delay, which you can edit, nudge with −/+ (Shift-click for ×10), or delete. You can also halve or double all delays, set them all to one value, remove mouse moves, or change the playback speed. |
 | **Find image** | **found** / **not found** | Looks for an image on every display until it appears or the timeout runs out. After it runs (or after **Test now**), the picture at the top shows **what it saw**: the search area (or the screen around the best match) with a green box round the match, or an amber box round the closest thing if it wasn't found. **Image to find** switches back to the picture it looks for. **Drag a box on screen** around what to find, snip the area around the pointer, or choose a PNG. **Look in → One area** limits the search to part of the screen you drag a box around: much faster, and it can't match the same picture somewhere else. "Test now" checks it straight away. You can make it click the image when found. Later Click / Move steps can target the found image. |
 | **Window check** | **yes** / **no** | Checks whether the **current window** (the front window of the app you're using) or **any open window** has a title / app name that contains, equals or starts with some text. Optional match case, "keep checking for N ms" (to wait for a window to open or come to the front) and "bring it to the front if found". **Show open windows** lists what's open right now. Click one to fill in the text. |
-| **Read text** | **match** / **no match** | Reads the text in a screen area using the OCR built into the system (Apple Vision on macOS, Windows OCR on Windows). After it runs (or after **Read now**), the picture at the top shows **what it actually read at that moment**, with what it read underneath (green border = match, amber = no match). Switch between **Last run** and **When selected** to compare it with the area as it looked when you selected it. Each read cleans the image up (enlarges it, boosts contrast, flips light-on-dark text, adds a margin), reads three versions at once and takes the answer they agree on, re-reading if they don't. Number comparisons (and **Only read a number**) fix common misreads (O→0, l→1, S→5), join split digits and handle thousands separators. Click **Select area (drag a box)**: MacroFlow minimises and you drag a box around the text or number anywhere on your screen. Compare as **text** (contains, is exactly, starts with, matches regex, has any text, has changed) or as a **number** (=, ≠, >, ≥, <, ≤, using the first number in the area). "Read now" shows what it reads. "Keep reading for N ms" waits for the condition. A Type text step can type what was read with `{text}`. |
+| **Read text** | **match** / **no match** | Reads the text in a screen area using the OCR built into the system (Apple Vision on macOS, Windows OCR on Windows). Numbers drawn the way games often do (a white or coloured fill with a thick dark outline, on a busy background) are handled by first keeping only the letters' fill colour and throwing away the outline and background, so they read as plain black digits. After it runs (or after **Read now**), the picture at the top shows **what it actually read at that moment**, with **what the reader was given** (the cleaned-up version) underneath, with what it read underneath (green border = match, amber = no match). Switch between **Last run** and **When selected** to compare it with the area as it looked when you selected it. Each read cleans the image up (enlarges it, boosts contrast, flips light-on-dark text, adds a margin), reads three versions at once and takes the answer they agree on, re-reading if they don't. Number comparisons (and **Only read a number**) fix common misreads (O→0, l→1, S→5), join split digits and handle thousands separators. Click **Select area (drag a box)**: MacroFlow minimises and you drag a box around the text or number anywhere on your screen. Compare as **text** (contains, is exactly, starts with, matches regex, has any text, has changed) or as a **number** (=, ≠, >, ≥, <, ≤, using the first number in the area). "Read now" shows what it reads. "Keep reading for N ms" waits for the condition. A Type text step can type what was read with `{text}`. |
 | **Set variable** | next | Stores a value in a named variable: a number (`0`), a sum (`gold + 1000`, `(a + b) / 2`, `count * 3`, `total % 10`), another variable, or text with `{name}` in it. Unset variables count as 0 in sums, so `count = count + 1` works straight away. Built-in variables: `text` (last Read text), `run` (which repeat this is), `found_x` / `found_y` (last found image). Use any variable as `{name}` in Type text and Pop-up steps. Read text can also **save what it reads into a variable**. Variables show up as purple **`# name` tags** wherever they're used: on the step cards and in text boxes. Typing the closing `}` of `{name}` turns it into a tag, which then moves and deletes as one piece. While you edit a box that takes variables, the variables you already have are listed under it, so a click puts one in. Read text's **Compare with** can use `{name}` too (e.g. `{gold_before}`). The **Macro** tab lists every variable. An **amber** tag is a variable that no step sets, which is usually a typo. |
 | **If** | **yes** / **no** | Compares two values (numbers, variables, sums or text) with =, ≠, >, ≥, <, ≤, contains or doesn't contain, e.g. `gold ≥ gold_before + 1000`. Numbers compare as numbers; text ignores case. |
 | **Pixel colour** | **match** / **no match** | Checks the colour of one spot, e.g. a health bar or a button turning green. **Pick spot & colour** samples it after 3 s; tolerance allows small differences; "Keep checking for" waits for the colour. Much faster than Find image. |
@@ -111,10 +111,66 @@ If you close the window or quit with unsaved changes, MacroFlow asks whether to 
 
 Every step also has a **Note** and a **Delay before** field.
 
+### Start screen, templates and autosave
+
+When MacroFlow opens (and after **New**) a start screen shows over the canvas with:
+
+- **Blank macro**, **Open a file…** and a few **templates**: *Click over and over*, *Find and click an image*, *Watch a number* and *Wait for loading to finish*. Template steps that still need setting up (an image to snip, an area to select) show a ⚠.
+- **Recent** macros you've opened or saved (kept in `Documents/MacroFlow Macros/recent.json`).
+- **Unsaved work** from last time. While a macro has unsaved changes it's copied to `Documents/MacroFlow Macros/autosave.json` every few seconds. If MacroFlow crashes or the computer turns off, **Restore** brings it back. Saving, or choosing **Don't Save** when you close, removes the copy.
+
+It goes away as soon as you change anything, or press ×.
+
+### Adding steps quickly
+
+- **⌘ / Ctrl + K** opens **quick add**: type part of a step's name ("read", "click", "gone"…), use ↑ ↓ and press **Enter**. The new step is added after the selected step, like clicking it in the Steps tab.
+- **Drag from an output dot and let go on empty canvas** to pick a step to add right there, already connected to that output.
+
+### Checking a macro, and seeing what happened
+
+- **⚠ badges.** A step that looks wrong gets a ⚠ in its corner: **red** if the run would certainly go wrong there (no image to find, no area to read, no key chosen, nothing connected to Start, an invalid variable name), **amber** if it's probably a mistake (an output that isn't connected, a step nothing leads to, a variable no step sets). A group shows a ⚠ if a step inside it has one. Select the step to read what's wrong in the Edit tab.
+- **Check before running.** If any step has a red problem, pressing Run lists them first. Click one to go to it, or choose **Run anyway**. With F8 from another app, a pop-up tells you why it didn't start.
+- **Results on the cards.** During and after a run, each step that ran has a small tag under it saying what it did: `read “18570671” → match`, `found 94%`, `best 61% → not found`, `= 1250`, `3 of 10`, `12 ≥ 10 → yes`, `gone after 2.3s`, or ✓. Green means it took its first output, amber the other one. **×5** means it ran five times. Steps with no tag didn't run.
+- **Variables panel.** While a macro runs (and at breakpoints), a panel at the bottom left of the canvas shows every variable and its current value. It stays showing the final values after the run. × hides it until the next run.
+
+### Waiting until something is gone
+
+The **Wait until gone** step (in the Steps tab, or a Find image step with **Wait until it's gone** turned on) waits for an image to *disappear*, such as a loading screen or a "Connecting…" box. It follows **gone** as soon as the image isn't on screen any more, or **still there** if it's still showing when the time runs out. **Read text** has the same option: **Wait until it stops matching** keeps reading until the comparison stops being true (e.g. until the area no longer contains "Loading").
+
+### Disabling steps and groups
+
+Turn a step or a whole group off without deleting it or rewiring anything: right-click it → **Disable step (skip it)** / **Disable group**, select it and press **⌘E / Ctrl+E**, or use **⊘ Disabled** in its Edit tab. Select several steps to disable them all at once; the same again turns them back on.
+
+- When a run reaches a disabled step it **skips it and carries on with whatever it's connected to**. A disabled group skips everything inside it.
+- A step with more than one output (Find image, If, Read text…) carries on along its **first output that's connected**, normally the first one ("found", "yes", "match").
+- Disabled steps look faded with a crossed-out name and **⊘ OFF**. Inside a disabled group, everything is faded and a note says the group is disabled.
+- The Log shows "⊘ Skipped …" and the card gets a "⊘ skipped" tag. Disabled steps never get ⚠ warnings, since they don't run.
+- It's saved with the macro (and undo works), and older macro files open as before.
+
 ### Debugging: step by step and breakpoints
 
 - **⏭ Step** in the title bar (or **F10**) starts the macro paused before its first step. Each further F10 / **Step** runs one step and pauses again. The step about to run is outlined in yellow, and the status bar and Log say which it is. **Resume** (F9) runs the rest normally.
 - **Breakpoints:** right-click a step → **Add breakpoint**, or tick **Breakpoint** in its Edit tab. A red dot appears on the step, and the macro pauses just before it runs. From there you can Step or Resume. Breakpoints are saved with the macro; older macros simply have none.
+
+### Playing a run back (Log tab)
+
+Every click, mouse move, drag, scroll, key press and bit of typing gets its own line in the **Log** tab (◉ Left click at (512, 300), ⇢ drag, ⇵ scroll, ⌨ key, T typed…), and MacroFlow keeps a picture of the screen at that moment with the action drawn on: a **green dot** where it clicked, a ring for a move, a line and ring for a drag.
+
+- **Click any line** to see it. A **Playback** card opens at the bottom right of the canvas with the picture and what happened, the step it belongs to is outlined on the canvas (opening its group if needed), and the green dot also flashes at that spot on your real screen (turn that off with **Show on screen**).
+- **▶ Play back** (in the Log tab, or on the card) goes through the whole run again at roughly the speed it ran, highlighting each step in turn. **1× / 2× / 4×** changes the speed.
+- Keys while the card is open: **Space** plays / pauses, **← →** go a line back / forward, **Esc** closes it.
+
+The pictures are taken in the background so they don't slow the macro down. Up to 400 are kept per run (in `Documents/MacroFlow Macros/images/last-run/playback/`, cleared at the start of each run and when MacroFlow opens). If the macro is very fast, an action may have no picture, but it's always listed.
+
+### Seeing where it clicks
+
+While a macro runs, a **green dot** appears where it's about to click, so you can see where the mouse is heading before it gets there. When it clicks, the dot ripples and disappears. A plain **Move mouse** shows a green ring instead, and a **Drag** shows a ring where it will let go.
+
+The dot can't get in the way:
+- Clicks and the mouse go straight through it, and it never takes focus.
+- It's hidden from screen capture (macOS: the window is excluded from sharing; Windows 10 2004+: excluded from capture). On top of that, MacroFlow takes it down before **every** screenshot it takes, so Find image, Read text, Pixel colour and failure screenshots never see it.
+
+Turn it off with **Show a green dot where it clicks** in the **Macro** tab.
 
 ### Human-like mouse movement and the failsafe
 
@@ -220,9 +276,12 @@ src/
   model.rs   macro document (steps, connections, delays), saved as JSON
   engine.rs  background threads: playback, recording, position picking, snipping
   vision.rs  screen capture, area selection, OCR, window list, template matching
+  marker.rs  the green dot showing where a running macro clicks
 helpers/
   notify.swift macOS pop-up helper, compiled by build.rs
   notify.ps1   Windows pop-up helper (WinForms), embedded into the app
+  marker.swift macOS green click-marker dot, compiled by build.rs
+  marker.ps1   Windows green click-marker dot (WinForms), embedded into the app
   ocr.swift  macOS OCR helper (Apple Vision), compiled by build.rs
   ocr.ps1    Windows OCR helper (Windows.Media.Ocr), embedded into the app
 build.rs     compiles the macOS OCR helper
