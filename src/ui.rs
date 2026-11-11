@@ -1866,6 +1866,34 @@ impl MacroApp {
             .top_0()
             .left_0()
             .size_full()
+            // This layer covers the whole window and blocks the window's own mouse
+            // tracking, so it follows drags itself (even outside the picture).
+            .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, _, cx| {
+                let dragging = this.shape_edit.as_ref().map_or(false, |ed| ed.drag != EditDrag::None);
+                if !dragging {
+                    return;
+                }
+                if ev.pressed_button == Some(MouseButton::Left) {
+                    this.edit_mouse_move(ev.position, ev.modifiers.shift);
+                } else {
+                    this.edit_mouse_up();
+                }
+                cx.notify();
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseUpEvent, _, cx| {
+                    this.edit_mouse_up();
+                    cx.notify();
+                }),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseUpEvent, _, cx| {
+                    this.edit_mouse_up();
+                    cx.notify();
+                }),
+            )
             .flex()
             .flex_col()
             .items_center()
@@ -9115,7 +9143,7 @@ impl ShapeEdit {
 
     /// How close (in screen points) counts as "on" a handle.
     fn tolerance(&self) -> f64 {
-        10.0 / self.k.max(0.05) as f64
+        14.0 / self.k.max(0.05) as f64
     }
 }
 
