@@ -10,7 +10,7 @@ use gpui::{
     Context, Div, ElementId, FocusHandle, FontWeight, Hsla, KeyDownEvent, MouseButton,
     MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit, PathBuilder, PathPromptOptions,
     Pixels, Point, PromptLevel, ScrollDelta, ScrollWheelEvent, SharedString, Stateful, Subscription,
-    Task, Window, WindowControlArea, ClipboardItem, Font, TextRun,
+    Task, Window, WindowControlArea, ClipboardItem, Font, TextRun, App, AnyView,
 };
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -26,7 +26,6 @@ use std::time::{Duration, Instant};
 // ---------------------------------------------------------------------------
 
 const BG: u32 = 0x0f1117;
-const PANEL: u32 = 0x161922;
 const PANEL2: u32 = 0x1d212c;
 const CANVAS_BG: u32 = 0x12141b;
 const GRID: u32 = 0x1a1d27;
@@ -41,14 +40,30 @@ const RED: u32 = 0xef5b5b;
 const GREEN: u32 = 0x34c77b;
 const YELLOW: u32 = 0xf5b84a;
 const PORT_BG: u32 = 0x0f1117;
-const TITLEBAR: u32 = 0x13151d;
+
+// Chrome (everything around the flowchart). The canvas and step cards keep the
+// colours above, so restyling the panels never changes how the flowchart looks.
+/// Title bar, status bar and sidebar background.
+const UI_BAR: u32 = 0x111319;
+/// Raised surfaces: cards, menus, popovers.
+const UI_RAISED: u32 = 0x1a1d26;
+/// Text boxes and wells.
+const UI_INPUT: u32 = 0x0c0e13;
+/// Hairlines between areas.
+const UI_LINE: u32 = 0x23262f;
+/// Borders of controls.
+const UI_EDGE: u32 = 0x2c303b;
+/// Hover fill for quiet controls.
+const UI_HOVER: u32 = 0x232733;
+/// Third-level text: hints, captions.
+const UI_FAINT: u32 = 0x666c7e;
 
 /// Height of the custom title bar (the system one is transparent, so we draw our own).
 pub const TITLEBAR_H: f32 = 40.0;
 const IS_MACOS: bool = cfg!(target_os = "macos");
 /// Room for the macOS traffic lights before the app name.
 const NAME_INSET: f32 = if IS_MACOS { 80.0 } else { 14.0 };
-const SIDEBAR_W: f32 = 320.0;
+const SIDEBAR_W: f32 = 340.0;
 
 fn hsla(hex: u32) -> Hsla {
     rgb(hex).into()
@@ -328,6 +343,8 @@ pub struct MacroApp {
     close_prompt_open: bool,
     side_tab: SideTab,
     sidebar_open: bool,
+    /// The Tips & shortcuts list at the bottom of the Steps tab is open.
+    tips_open: bool,
     /// The groups you've opened, outermost first. Empty = the top level of the macro.
     view: Vec<u64>,
     /// Extra steps selected with Shift-click (on top of `selected`).
@@ -448,7 +465,7 @@ impl MacroApp {
             last_autosave: Instant::now(),
             capturing_key: false,
             mode: Mode::Idle,
-            status: "Welcome! Add steps from the left, or record a macro. Drag from a step's right-hand dot to connect it.".into(),
+            status: "Ready.".into(),
             active_node: None,
             record_moves: true,
             bulk_delay: 100,
@@ -458,6 +475,7 @@ impl MacroApp {
             close_prompt_open: false,
             side_tab: SideTab::Steps,
             sidebar_open: true,
+            tips_open: false,
             view: Vec::new(),
             extra: Vec::new(),
             windows: Vec::new(),
@@ -970,7 +988,7 @@ impl MacroApp {
                 .items_center()
                 .justify_center()
                 .rounded_md()
-                .bg(rgb(BG))
+                .bg(rgb(UI_INPUT))
                 .border_1()
                 .border_color(rgb(border))
                 .p_1()
@@ -1924,7 +1942,7 @@ impl MacroApp {
                     .w(px(iw))
                     .h(px(ih))
                     .border_1()
-                    .border_color(rgb(BORDER))
+                    .border_color(rgb(UI_EDGE))
                     .cursor_crosshair()
                     .child(img(ed.shot.path.clone()).size_full())
                     .child(overlay)
@@ -2638,7 +2656,8 @@ impl MacroApp {
                 self.log.clear();
         self.reset_replay();
                 self.reset_history();
-                self.status = format!("Opened {}", path.display());
+                let file = path.file_name().map(|f| f.to_string_lossy().to_string());
+                self.status = format!("Opened {}", file.unwrap_or_else(|| path.display().to_string()));
             }
             Err(e) => self.status = format!("Couldn't open {}: {e}", path.display()),
         }
@@ -3622,9 +3641,9 @@ impl MacroApp {
             .flex()
             .flex_col()
             .rounded_lg()
-            .bg(rgb(PANEL2))
+            .bg(rgb(UI_RAISED))
             .border_1()
-            .border_color(rgb(BORDER))
+            .border_color(rgb(UI_EDGE))
             .shadow_lg()
             .text_sm()
             .text_color(rgb(TEXT))
@@ -3649,7 +3668,7 @@ impl MacroApp {
                             .items_center()
                             .text_xs()
                             .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(rgb(MUTED))
+                            .text_color(rgb(UI_FAINT))
                             .truncate()
                             .child(text),
                     );
@@ -3662,7 +3681,7 @@ impl MacroApp {
                             .px_1()
                             .flex()
                             .items_center()
-                            .child(div().w_full().h(px(1.)).bg(rgb(BORDER))),
+                            .child(div().w_full().h(px(1.)).bg(rgb(UI_LINE))),
                     );
                     cursor_y += MENU_SEP_H;
                 }
@@ -3677,8 +3696,8 @@ impl MacroApp {
                             .flex()
                             .items_center()
                             .rounded_md()
-                            .when(open, |d| d.bg(rgb(BTN_HOVER)))
-                            .hover(|s| s.bg(rgb(BTN_HOVER)))
+                            .when(open, |d| d.bg(rgb(UI_HOVER)))
+                            .hover(|s| s.bg(rgb(UI_HOVER)))
                             .child(div().flex_1().child("Add step here"))
                             .child(div().text_color(rgb(MUTED)).child("›"))
                             .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
@@ -3722,7 +3741,7 @@ impl MacroApp {
                         .rounded_md()
                         .text_color(rgb(color))
                         .child(div().flex_1().truncate().child(label))
-                        .child(div().flex_none().text_xs().text_color(rgb(MUTED)).child(hint))
+                        .child(div().flex_none().text_xs().text_color(rgb(UI_FAINT)).child(hint))
                         .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
                             if *hovered {
                                 if let Some(m) = this.menu.as_mut() {
@@ -3739,7 +3758,7 @@ impl MacroApp {
                                 if danger {
                                     s.bg(rgb(RED)).text_color(rgb(0xffffff))
                                 } else {
-                                    s.bg(rgb(ACCENT)).text_color(rgb(0xffffff))
+                                    s.bg(rgba((ACCENT << 8) | 0x3d)).text_color(rgb(0xffffff))
                                 }
                             })
                             .on_mouse_down(
@@ -3785,9 +3804,9 @@ impl MacroApp {
                 .flex()
                 .flex_col()
                 .rounded_lg()
-                .bg(rgb(PANEL2))
+                .bg(rgb(UI_RAISED))
                 .border_1()
-                .border_color(rgb(BORDER))
+                .border_color(rgb(UI_EDGE))
                 .shadow_lg()
                 .text_sm()
                 .text_color(rgb(TEXT))
@@ -3803,7 +3822,7 @@ impl MacroApp {
                         .items_center()
                         .gap_2()
                         .rounded_md()
-                        .hover(|s| s.bg(rgb(ACCENT)).text_color(rgb(0xffffff)))
+                        .hover(|s| s.bg(rgba((ACCENT << 8) | 0x3d)).text_color(rgb(0xffffff)))
                         .child(
                             div()
                                 .w(px(18.))
@@ -4024,24 +4043,34 @@ impl MacroApp {
         let name = self.doc.name.clone();
         let dirty = self.dirty;
         let sidebar_open = self.sidebar_open;
+        let m = SHORTCUT_KEY;
+        // Square icon button for the title bar.
+        let icon_btn = |id: &'static str, label: &'static str, enabled: bool| {
+            ghost_btn(id, label, enabled).w(px(28.)).justify_center().px_0()
+        };
+        // A solid button for Run / Stop / Pause.
+        let solid = |id: &'static str, label: &'static str, bg: u32, hover: u32, fg: u32| {
+            tool_btn_colored(id, label, true, bg, hover)
+                .h(px(28.))
+                .px_3()
+                .text_xs()
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(rgb(fg))
+        };
 
-        div()
+        let left = div()
             .flex()
             .flex_row()
             .flex_none()
             .items_center()
-            .w_full()
-            .h(px(TITLEBAR_H))
-            .bg(rgb(TITLEBAR))
-            .border_b_1()
-            .border_color(rgb(BORDER))
-            // App name, top left (beside the traffic lights on macOS).
+            .gap_0p5()
+            .h_full()
             .child(
                 div()
                     .h_full()
                     .flex_none()
                     .pl(px(NAME_INSET))
-                    .pr_3()
+                    .pr_2()
                     .flex()
                     .items_center()
                     .gap_2()
@@ -4049,7 +4078,8 @@ impl MacroApp {
                     .child(logo_mark())
                     .child(
                         div()
-                            .font_weight(FontWeight::BOLD)
+                            .text_sm()
+                            .font_weight(FontWeight::SEMIBOLD)
                             .text_color(rgb(TEXT))
                             .child("MacroFlow"),
                     ),
@@ -4064,8 +4094,9 @@ impl MacroApp {
                     .size(px(28.))
                     .rounded_md()
                     .cursor_pointer()
-                    .hover(|s| s.bg(rgb(BTN_HOVER)))
+                    .hover(|s| s.bg(rgb(UI_HOVER)))
                     .child(sidebar_icon(sidebar_open))
+                    .tooltip(tip_view(format!("Show / hide panel ({m}B)")))
                     .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                         this.sidebar_open = !this.sidebar_open;
                         cx.notify();
@@ -4073,163 +4104,227 @@ impl MacroApp {
             )
             .child(divider())
             .child(
-                ghost_btn("tb-new", "New", idle).on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                    this.new_doc();
-                    cx.notify();
-                })),
-            )
-            .child(
-                ghost_btn("tb-open", "Open", idle)
-                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.open(cx))),
-            )
-            .child(
-                ghost_btn("tb-save", "Save", idle).on_click(cx.listener(
-                    |this, ev: &ClickEvent, _, cx| {
-                        this.save(ev.modifiers().shift, cx);
-                        cx.notify();
-                    },
-                )),
-            )
-            .child(divider())
-            .child(
-                ghost_btn("tb-undo", "↶", idle && !self.undo.is_empty()).on_click(cx.listener(
-                    |this, _: &ClickEvent, _, cx| {
-                        this.undo();
-                        cx.notify();
-                    },
-                )),
-            )
-            .child(
-                ghost_btn("tb-redo", "↷", idle && !self.redo.is_empty()).on_click(cx.listener(
-                    |this, _: &ClickEvent, _, cx| {
-                        this.redo();
-                        cx.notify();
-                    },
-                )),
-            )
-            .child(divider())
-            // Current macro name (click to rename it in the Macro tab).
-            .child(
-                div()
-                    .id("tb-name")
-                    .flex()
-                    .flex_none()
-                    .items_center()
-                    .gap_1p5()
-                    .px_2()
-                    .h(px(26.))
-                    .max_w(px(260.))
-                    .rounded_md()
-                    .cursor_pointer()
-                    .hover(|s| s.bg(rgb(BTN_HOVER)))
-                    .child(div().text_color(rgb(MUTED)).truncate().child(name))
-                    .when(dirty, |d| {
-                        d.child(div().flex_none().size(px(6.)).rounded_full().bg(rgb(YELLOW)))
-                    })
+                ghost_btn("tb-new", "New", idle)
+                    .text_xs()
                     .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                        this.selected = None;
-                        this.side_tab = SideTab::Macro;
-                        this.sidebar_open = true;
+                        this.new_doc();
                         cx.notify();
                     })),
             )
-            // Empty space you can drag to move the window.
+            .child(
+                ghost_btn("tb-open", "Open", idle)
+                    .text_xs()
+                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.open(cx))),
+            )
+            .child(
+                ghost_btn("tb-save", "Save", idle)
+                    .text_xs()
+                    .tooltip(tip_view(format!("Save ({m}S). Shift-click to save as…")))
+                    .on_click(cx.listener(|this, ev: &ClickEvent, _, cx| {
+                        this.save(ev.modifiers().shift, cx);
+                        cx.notify();
+                    })),
+            )
+            .child(divider())
+            .child(
+                icon_btn("tb-undo", "↶", idle && !self.undo.is_empty())
+                    .tooltip(tip_view(format!("Undo ({m}Z)")))
+                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                        this.undo();
+                        cx.notify();
+                    })),
+            )
+            .child(
+                icon_btn("tb-redo", "↷", idle && !self.redo.is_empty())
+                    .tooltip(tip_view("Redo"))
+                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                        this.redo();
+                        cx.notify();
+                    })),
+            );
+
+        // The macro's name in the middle (click to rename it in the Macro tab).
+        let title = div()
+            .id("tb-name")
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap_1p5()
+            .px_2p5()
+            .h(px(26.))
+            .max_w(px(300.))
+            .rounded_md()
+            .cursor_pointer()
+            .text_xs()
+            .hover(|s| s.bg(rgb(UI_HOVER)))
+            .child(div().min_w(px(0.)).truncate().text_color(rgb(TEXT)).child(name))
+            .when(dirty, |d| {
+                d.child(div().flex_none().size(px(6.)).rounded_full().bg(rgb(YELLOW)))
+            })
+            .tooltip(tip_view(if dirty { "Unsaved changes. Click to rename." } else { "Click to rename" }))
+            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                this.selected = None;
+                this.side_tab = SideTab::Macro;
+                this.sidebar_open = true;
+                cx.notify();
+            }));
+
+        // Recording: Record, Record step, and whether to keep mouse moves.
+        let moves = self.record_moves;
+        let record = div()
+            .flex()
+            .flex_row()
+            .flex_none()
+            .items_center()
+            .h(px(28.))
+            .rounded_md()
+            .border_1()
+            .border_color(rgb(UI_EDGE))
+            .overflow_hidden()
             .child(
                 div()
-                    .flex_1()
+                    .id("tb-rec")
+                    .flex()
+                    .items_center()
+                    .gap_1p5()
+                    .px_2p5()
                     .h_full()
-                    .window_control_area(WindowControlArea::Drag),
-            )
-            .child(
-                chip("tb-moves", "Mouse moves", self.record_moves).on_click(cx.listener(
-                    |this, _: &ClickEvent, _, cx| {
-                        this.record_moves = !this.record_moves;
-                        cx.notify();
-                    },
-                )),
-            )
-            .child(div().w(px(6.)))
-            .child(
-                ghost_btn("tb-rec", "● Record", idle)
-                    .text_color(rgb(RED))
+                    .text_xs()
+                    .text_color(rgb(TEXT))
+                    .when(idle, |d| d.cursor_pointer().hover(|s| s.bg(rgb(UI_HOVER))))
+                    .when(!idle, |d| d.opacity(0.35))
+                    .child(div().size(px(8.)).rounded_full().bg(rgb(RED)))
+                    .child("Record")
+                    .tooltip(tip_view("Record a whole macro (Esc stops)"))
                     .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                         this.start_record();
                         cx.notify();
                     })),
             )
+            .child(div().w(px(1.)).h_full().bg(rgb(UI_EDGE)))
             .child(
-                ghost_btn("tb-step", "◎ Record step", idle).on_click(cx.listener(
-                    |this, _: &ClickEvent, _, cx| {
+                div()
+                    .id("tb-step")
+                    .flex()
+                    .items_center()
+                    .px_2p5()
+                    .h_full()
+                    .text_xs()
+                    .text_color(rgb(MUTED))
+                    .when(idle, |d| d.cursor_pointer().hover(|s| s.bg(rgb(UI_HOVER)).text_color(rgb(TEXT))))
+                    .when(!idle, |d| d.opacity(0.35))
+                    .child("One step")
+                    .tooltip(tip_view("Record a single click or key press as a new step"))
+                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                         this.start_record_step();
                         cx.notify();
-                    },
-                )),
+                    })),
             )
-            .child(divider())
-            .when(self.mode == Mode::Running, |d| {
-                let paused = self.paused.load(Ordering::Relaxed);
-                d.child(
-                    tool_btn_colored(
-                        "tb-pause",
-                        if paused { "▶ Resume" } else { "❚❚ Pause" },
-                        true,
-                        if paused { GREEN } else { BTN },
-                        if paused { 0x45d98c } else { BTN_HOVER },
-                    )
-                    .h(px(26.))
-                    .when(paused, |b| b.text_color(rgb(0x0b1a10)))
+            .child(div().w(px(1.)).h_full().bg(rgb(UI_EDGE)))
+            .child(
+                div()
+                    .id("tb-moves")
+                    .flex()
+                    .items_center()
+                    .gap_1p5()
+                    .px_2()
+                    .h_full()
+                    .text_xs()
+                    .text_color(rgb(if moves { TEXT } else { UI_FAINT }))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(rgb(UI_HOVER)))
+                    .child(switch_sized(moves, 22.0, 13.0))
+                    .child("Moves")
+                    .tooltip(tip_view(if moves {
+                        "Recording keeps mouse movements. Click to record clicks and keys only."
+                    } else {
+                        "Recording keeps clicks and keys only. Click to also record mouse movements."
+                    }))
                     .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                        this.toggle_pause();
+                        this.record_moves = !this.record_moves;
                         cx.notify();
                     })),
-                )
-                .child(div().w(px(6.)))
-                .when(paused, |d| {
-                    d.child(
-                        tool_btn("tb-step-next", "⏭ Step", true)
-                            .h(px(26.))
-                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                                this.step_once();
-                                cx.notify();
-                            })),
-                    )
-                    .child(div().w(px(6.)))
-                })
-            })
-            .when(busy, |d| {
-                d.child(
-                    tool_btn_colored("tb-stop", "■ Stop", true, RED, 0xf47373)
-                        .h(px(26.))
-                        .text_color(rgb(0xffffff))
+            );
+
+        // Run controls.
+        let mut run = div().flex().flex_row().flex_none().items_center().gap_1p5();
+        if self.mode == Mode::Running {
+            let paused = self.paused.load(Ordering::Relaxed);
+            run = run.child(
+                if paused {
+                    solid("tb-pause", "▶  Resume", GREEN, 0x45d98c, 0x0b1a10)
+                } else {
+                    solid("tb-pause", "❚❚  Pause", UI_RAISED, UI_HOVER, TEXT).border_1().border_color(rgb(UI_EDGE))
+                }
+                .tooltip(tip_view("Pause / resume (F9)"))
+                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                    this.toggle_pause();
+                    cx.notify();
+                })),
+            );
+            if paused {
+                run = run.child(
+                    solid("tb-step-next", "Step", UI_RAISED, UI_HOVER, TEXT)
+                        .border_1()
+                        .border_color(rgb(UI_EDGE))
+                        .tooltip(tip_view("Run the next step (F10)"))
                         .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                            this.stop_worker();
+                            this.step_once();
+                            cx.notify();
+                        })),
+                );
+            }
+        }
+        if busy {
+            run = run.child(
+                solid("tb-stop", "■  Stop", RED, 0xf47373, 0xffffff)
+                    .tooltip(tip_view("Stop (Esc or F8)"))
+                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                        this.stop_worker();
+                        cx.notify();
+                    })),
+            );
+        } else {
+            run = run
+                .child(
+                    ghost_btn("tb-step-through", "Step", true)
+                        .text_xs()
+                        .tooltip(tip_view("Run the macro one step at a time (F10)"))
+                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                            this.step_once();
                             cx.notify();
                         })),
                 )
-            })
-            .when(idle, |d| {
-                d.child(
-                    ghost_btn("tb-step-through", "⏭ Step", true).on_click(cx.listener(
-                        |this, _: &ClickEvent, _, cx| {
-                            this.step_once();
-                            cx.notify();
-                        },
-                    )),
-                )
-                .child(div().w(px(4.)))
-            })
-            .when(idle, |d| {
-                d.child(
-                    tool_btn_colored("tb-run", "▶ Run", true, GREEN, 0x45d98c)
-                        .h(px(26.))
-                        .text_color(rgb(0x0b1a10))
-                        .font_weight(FontWeight::BOLD)
+                .child(
+                    solid("tb-run", "▶  Run", GREEN, 0x45d98c, 0x0b1a10)
+                        .tooltip(tip_view("Run the macro (F8)"))
                         .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                             this.start_run();
                             cx.notify();
                         })),
-                )
-            })
+                );
+        }
+
+        let drag_space = || div().flex_1().min_w(px(8.)).h_full().window_control_area(WindowControlArea::Drag);
+        div()
+            .flex()
+            .flex_row()
+            .flex_none()
+            .items_center()
+            .w_full()
+            .h(px(TITLEBAR_H))
+            .bg(rgb(UI_BAR))
+            .border_b_1()
+            .border_color(rgb(UI_LINE))
+            .child(left)
+            .child(drag_space())
+            .child(title)
+            .child(drag_space())
+            .child(record)
+            .child(div().w(px(6.)))
+            .child(divider())
+            .child(div().w(px(4.)))
+            .child(run)
             .child(div().w(px(if IS_MACOS { 12. } else { 8. })))
             // Windows draws no title bar for us, so add minimise / maximise / close.
             .when(!IS_MACOS, |d| d.child(self.render_window_controls(is_max, cx)))
@@ -4269,7 +4364,7 @@ impl MacroApp {
                         .left_0()
                         .top(px(2.))
                         .size(px(8.))
-                        .bg(rgb(TITLEBAR))
+                        .bg(rgb(UI_BAR))
                         .border_1()
                         .border_color(rgb(TEXT)),
                 )
@@ -4301,13 +4396,13 @@ impl MacroApp {
             .h_full()
             .child(
                 cell("win-min")
-                    .hover(|s| s.bg(rgb(BTN_HOVER)))
+                    .hover(|s| s.bg(rgb(UI_HOVER)))
                     .child(div().w(px(10.)).h(px(1.)).bg(rgb(TEXT)))
                     .on_click(cx.listener(|_, _: &ClickEvent, window, _| window.minimize_window())),
             )
             .child(
                 cell("win-max")
-                    .hover(|s| s.bg(rgb(BTN_HOVER)))
+                    .hover(|s| s.bg(rgb(UI_HOVER)))
                     .child(max_icon)
                     .on_click(cx.listener(|_, _: &ClickEvent, window, _| toggle_maximize(window))),
             )
@@ -4344,11 +4439,13 @@ impl MacroApp {
             .flex_1()
             .min_h_0()
             .overflow_y_scroll()
-            .px_3()
-            .pb_4()
+            .overflow_x_hidden()
+            .px_4()
+            .pt_1()
+            .pb_6()
             .flex()
             .flex_col()
-            .gap_2();
+            .gap_2p5();
         for el in items {
             content = content.child(el);
         }
@@ -4358,9 +4455,9 @@ impl MacroApp {
             .h_full()
             .flex()
             .flex_col()
-            .bg(rgb(PANEL))
+            .bg(rgb(UI_BAR))
             .border_r_1()
-            .border_color(rgb(BORDER))
+            .border_color(rgb(UI_LINE))
             .child(self.render_tabs(cx))
             .child(content)
     }
@@ -4375,15 +4472,16 @@ impl MacroApp {
             (SideTab::Log, "Log"),
         ];
         let current = self.side_tab;
-        div().flex_none().px_3().pt_3().pb_3().child(
+        div().flex_none().px_4().pt_3().pb_3().child(
             div()
                 .flex()
-                .gap_1()
+                .gap_0p5()
                 .p(px(3.))
                 .rounded_lg()
-                .bg(rgb(BG))
+                .bg(rgb(UI_INPUT))
                 .border_1()
-                .border_color(rgb(BORDER))
+                .border_color(rgb(UI_LINE))
+                .text_xs()
                 .children(tabs.into_iter().map(|(tab, label)| {
                     let active = tab == current;
                     div()
@@ -4393,17 +4491,18 @@ impl MacroApp {
                         .items_center()
                         .justify_center()
                         .gap_1p5()
-                        .h(px(28.))
+                        .h(px(26.))
                         .rounded_md()
                         .cursor_pointer()
                         .when(active, |d| {
-                            d.bg(rgb(BTN))
+                            d.bg(rgb(UI_RAISED))
+                                .border_1()
+                                .border_color(rgb(UI_EDGE))
                                 .text_color(rgb(TEXT))
                                 .font_weight(FontWeight::SEMIBOLD)
-                                .shadow_sm()
                         })
                         .when(!active, |d| {
-                            d.text_color(rgb(MUTED)).hover(|s| s.text_color(rgb(TEXT)).bg(rgb(PANEL2)))
+                            d.text_color(rgb(MUTED)).hover(|s| s.text_color(rgb(TEXT)))
                         })
                         .when_some(
                             selected_kind.filter(|_| tab == SideTab::Edit),
@@ -4422,23 +4521,59 @@ impl MacroApp {
 
     fn steps_tab(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let mut out: Vec<AnyElement> = Vec::new();
-        let hint = match self.selected.and_then(|id| self.doc.node(id)) {
-            Some(n) if !n.kind.outputs().is_empty() => {
-                format!("New steps attach after the selected “{}” step.", n.kind.title())
-            }
-            _ => "Select a step on the canvas to chain new steps after it.".to_string(),
+        // Looks like a search box; opens the quick-add finder (⌘K / Ctrl+K).
+        out.push(
+            div()
+                .id("steps-search")
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .h(px(32.))
+                .px_2p5()
+                .rounded_md()
+                .bg(rgb(UI_INPUT))
+                .border_1()
+                .border_color(rgb(UI_EDGE))
+                .cursor_pointer()
+                .hover(|s| s.border_color(rgba((ACCENT << 8) | 0x99)))
+                .child(div().flex_none().text_color(rgb(UI_FAINT)).child("⌕"))
+                .child(div().flex_1().text_xs().text_color(rgb(UI_FAINT)).child("Find a step…"))
+                .child(kbd(format!("{SHORTCUT_KEY}K")))
+                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                    this.open_quick(None, None, None);
+                    cx.notify();
+                }))
+                .into_any_element(),
+        );
+        // Where a new step will go, in one short line.
+        let after = match self.selected.and_then(|id| self.doc.node(id)) {
+            Some(n) if !n.kind.outputs().is_empty() => Some(n.label()),
+            _ => None,
         };
         out.push(
             div()
-                .px_2()
-                .py_1p5()
-                .rounded_md()
-                .bg(rgba((ACCENT << 8) | 0x1a))
-                .border_1()
-                .border_color(rgba((ACCENT << 8) | 0x40))
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_1p5()
                 .text_xs()
-                .text_color(rgb(TEXT))
-                .child(hint)
+                .text_color(rgb(UI_FAINT))
+                .child(
+                    div()
+                        .flex_none()
+                        .size(px(6.))
+                        .rounded_full()
+                        .bg(rgb(if after.is_some() { ACCENT } else { UI_EDGE })),
+                )
+                .child(match after {
+                    Some(name) => div()
+                        .flex_1()
+                        .min_w(px(0.))
+                        .truncate()
+                        .child(format!("Adds after “{name}”")),
+                    None => div().flex_1().child("Select a step to chain new ones after it"),
+                })
                 .into_any_element(),
         );
 
@@ -4452,36 +4587,37 @@ impl MacroApp {
             ("Recording", 4),
         ];
         let palette: Vec<(usize, NodeKind)> = NodeKind::palette().into_iter().enumerate().collect();
-        for (title, g) in groups {
-            out.push(div().h(px(2.)).into_any_element());
-            out.push(section_title(title).into_any_element());
+        for (gi, (title, g)) in groups.into_iter().enumerate() {
+            out.push(
+                if gi == 0 { section_head(title).mt_2() } else { section_title(title) }.into_any_element(),
+            );
+            let mut list = div().flex().flex_col().gap_0p5().mx(px(-6.));
             for (i, kind) in palette.iter().filter(|(_, k)| step_group(k) == g) {
                 let i = *i;
                 let kind = kind.clone();
                 let color = kind.color();
-                out.push(
+                list = list.child(
                     div()
                         .id(("pal", i))
                         .group(SharedString::from(format!("pal-{i}")))
                         .flex()
                         .items_center()
-                        .gap_3()
-                        .px_2()
-                        .py_1p5()
-                        .rounded_lg()
+                        .gap_2p5()
+                        .px_1p5()
+                        .h(px(40.))
+                        .rounded_md()
                         .cursor_pointer()
-                        .hover(|s| s.bg(rgb(PANEL2)))
+                        .hover(|s| s.bg(rgb(UI_HOVER)))
                         .child(
                             div()
-                                .size(px(30.))
+                                .size(px(26.))
                                 .flex_none()
                                 .flex()
                                 .items_center()
                                 .justify_center()
                                 .rounded_md()
-                                .bg(rgba((color << 8) | 0x24))
-                                .border_1()
-                                .border_color(rgba((color << 8) | 0x55))
+                                .bg(rgba((color << 8) | 0x1f))
+                                .text_size(px(12.))
                                 .text_color(rgb(color))
                                 .font_weight(FontWeight::BOLD)
                                 .child(kind.icon()),
@@ -4492,11 +4628,12 @@ impl MacroApp {
                                 .min_w(px(0.))
                                 .flex()
                                 .flex_col()
-                                .child(div().text_color(rgb(TEXT)).child(kind.title()))
+                                .child(div().text_sm().line_height(px(17.)).text_color(rgb(TEXT)).child(kind.title()))
                                 .child(
                                     div()
                                         .text_xs()
-                                        .text_color(rgb(MUTED))
+                                        .line_height(px(15.))
+                                        .text_color(rgb(UI_FAINT))
                                         .truncate()
                                         .child(step_blurb(&kind)),
                                 ),
@@ -4504,15 +4641,16 @@ impl MacroApp {
                         .child(
                             div()
                                 .flex_none()
-                                .px_1p5()
-                                .rounded_sm()
-                                .text_xs()
-                                .text_color(rgb(MUTED))
+                                .size(px(22.))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .rounded_md()
+                                .text_color(rgb(TEXT))
+                                .bg(rgb(UI_EDGE))
                                 .invisible()
-                                .group_hover(SharedString::from(format!("pal-{i}")), |s| {
-                                    s.visible().text_color(rgb(TEXT)).bg(rgb(BTN_HOVER))
-                                })
-                                .child("Add"),
+                                .group_hover(SharedString::from(format!("pal-{i}")), |s| s.visible())
+                                .child("+"),
                         )
                         .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                             if this.idle() {
@@ -4523,21 +4661,74 @@ impl MacroApp {
                         .into_any_element(),
                 );
             }
+            out.push(list.into_any_element());
         }
 
-        out.push(div().h(px(10.)).into_any_element());
-        out.push(section_title("Tips").into_any_element());
-        for t in [
-            "Drag from a dot on the right of a step to another step to connect them.",
-            "Right-click a dot, or click the × on a line, to remove a connection.",
-            "Drag the empty grid (or scroll) to move around. Ctrl + scroll zooms (⌘ + scroll works too on a Mac).",
-            "Right-click a step or the empty canvas for more: rename, run from here, group, add a step there…",
-            "Esc stops a recording or a running macro from anywhere.",
-            "Groups: select a step and click ▤ Group at the bottom of the canvas. Shift-click or Shift-drag to pick several steps. Double-click a group to open it; Esc goes back out.",
-            "“Select area” minimises MacroFlow so you can drag a box anywhere on your screen. Shift-click it for a 3 s countdown first.",
-            SHORTCUT_TIP,
-        ] {
-            out.push(tip(t).into_any_element());
+        // Tips & shortcuts, folded away until you want them.
+        let open = self.tips_open;
+        out.push(
+            div()
+                .id("tips-toggle")
+                .mt_2()
+                .pt_3()
+                .border_t_1()
+                .border_color(rgb(UI_LINE))
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_1p5()
+                .cursor_pointer()
+                .text_size(px(11.))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(rgb(UI_FAINT))
+                .hover(|s| s.text_color(rgb(MUTED)))
+                .child(div().flex_1().child("TIPS & SHORTCUTS"))
+                .child(div().flex_none().child(if open { "▾" } else { "▸" }))
+                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                    this.tips_open = !this.tips_open;
+                    cx.notify();
+                }))
+                .into_any_element(),
+        );
+        if open {
+            for t in [
+                "Drag from a step's right-hand dot to another step to connect them. Click the × on a line to remove it.",
+                "Drag the empty grid or scroll to move around. Ctrl + scroll zooms.",
+                "Right-click a step or the canvas to rename, run from here, group, or add a step there.",
+                "Shift-click or Shift-drag to select several steps. Double-click a group to open it; Esc goes back out.",
+                "Shift-click “Select area” for a 3 s countdown first.",
+            ] {
+                out.push(tip(t).into_any_element());
+            }
+            let m = SHORTCUT_KEY;
+            let keys: [(String, &'static str); 10] = [
+                ("F8".into(), "Start / stop"),
+                ("F9".into(), "Pause / resume"),
+                ("F10".into(), "Run one step"),
+                ("Esc".into(), "Stop"),
+                (format!("{m}K"), "Find a step"),
+                (format!("{m}Z"), "Undo"),
+                (format!("{m}S"), "Save"),
+                (format!("{m}D"), "Duplicate"),
+                (format!("{m}G"), "Group"),
+                (format!("{m}B"), "Toggle panel"),
+            ];
+            let mut grid = div().flex().flex_row().flex_wrap().gap_y_1p5().pt_1();
+            for (k, what) in keys {
+                grid = grid.child(
+                    div()
+                        .w(px(150.))
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_2()
+                        .text_xs()
+                        .text_color(rgb(MUTED))
+                        .child(div().w(px(36.)).flex().child(kbd(k)))
+                        .child(what),
+                );
+            }
+            out.push(grid.into_any_element());
         }
         out
     }
@@ -4549,7 +4740,7 @@ impl MacroApp {
                 .flex()
                 .items_center()
                 .gap_1()
-                .child(div().flex_1().child(section_title("Run log")))
+                .child(div().flex_1().child(section_head("Run log")))
                 .when(!self.log.is_empty() && self.idle(), |d| {
                     d.child(
                         small_btn("log-play", if self.replay_playing { "❚❚ Pause" } else { "▶ Play back" })
@@ -4583,7 +4774,7 @@ impl MacroApp {
                     .h(px(150.))
                     .w_full()
                     .rounded_md()
-                    .bg(rgb(BG))
+                    .bg(rgb(UI_INPUT))
                     .border_1()
                     .border_color(rgb(RED))
                     .p_1()
@@ -4593,7 +4784,29 @@ impl MacroApp {
             out.push(help(&shot.display().to_string()).into_any_element());
         }
         if self.log.is_empty() {
-            out.push(help("Run the macro to see every step it ran here, with timings, what Read text saw, which way each branch went and why it stopped. Click a line to jump to its step.").into_any_element());
+            out.push(
+                div()
+                    .mt_2()
+                    .p_4()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .gap_1p5()
+                    .rounded_lg()
+                    .border_1()
+                    .border_dashed()
+                    .border_color(rgb(UI_EDGE))
+                    .child(div().text_sm().text_color(rgb(TEXT)).font_weight(FontWeight::MEDIUM).child("No runs yet"))
+                    .child(
+                        div()
+                            .text_xs()
+                            .line_height(px(17.))
+                            .text_color(rgb(UI_FAINT))
+                            .text_center()
+                            .child("Each run lists the steps it took, with timings and which way each branch went. Click a line to jump to its step."),
+                    )
+                    .into_any_element(),
+            );
             return out;
         }
         if self.log_sel.is_none() {
@@ -4644,7 +4857,7 @@ impl MacroApp {
             if step.is_some() || e.action.is_some() {
                 row = row
                     .cursor_pointer()
-                    .when(!picked, |d| d.hover(|s| s.bg(rgb(PANEL2))))
+                    .when(!picked, |d| d.hover(|s| s.bg(rgb(UI_RAISED))))
                     .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                         this.replay_playing = false;
                         this.select_log(i, true);
@@ -4667,7 +4880,7 @@ impl MacroApp {
             .rounded_lg()
             .border_1()
             .border_dashed()
-            .border_color(rgb(BORDER))
+            .border_color(rgb(UI_EDGE))
             .child(div().text_color(rgb(TEXT)).font_weight(FontWeight::SEMIBOLD).child("No step selected"))
             .child(
                 div()
@@ -4716,19 +4929,26 @@ impl MacroApp {
             .items_center()
             .gap_3()
             .px_3()
-            .h(px(30.))
-            .bg(rgb(PANEL))
+            .h(px(28.))
+            .bg(rgb(UI_BAR))
             .border_t_1()
-            .border_color(rgb(BORDER))
+            .border_color(rgb(UI_LINE))
             .text_xs()
             .child(
                 div()
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .gap_1p5()
                     .px_2()
-                    .rounded_sm()
-                    .bg(rgba((color << 8) | 0x33))
+                    .h(px(18.))
+                    .rounded_full()
+                    .bg(rgba((color << 8) | 0x1f))
+                    .text_size(px(10.5))
                     .text_color(rgb(color))
-                    .font_weight(FontWeight::BOLD)
-                    .child(badge),
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(div().size(px(6.)).rounded_full().bg(rgb(color)))
+                    .child(badge.trim_start_matches(['●', '◎', ' '])),
             )
             .child(
                 div()
@@ -4753,8 +4973,8 @@ impl MacroApp {
                                 .px_1p5()
                                 .rounded_sm()
                                 .text_color(rgb(TEXT))
-                                .bg(rgb(BTN))
-                                .hover(|s| s.bg(rgb(BTN_HOVER)))
+                                .bg(rgb(UI_RAISED))
+                                .hover(|s| s.bg(rgb(UI_HOVER)))
                                 .cursor_pointer()
                                 .child("Show step")
                                 .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
@@ -4771,8 +4991,8 @@ impl MacroApp {
                                 .px_1p5()
                                 .rounded_sm()
                                 .text_color(rgb(TEXT))
-                                .bg(rgb(BTN))
-                                .hover(|s| s.bg(rgb(BTN_HOVER)))
+                                .bg(rgb(UI_RAISED))
+                                .hover(|s| s.bg(rgb(UI_HOVER)))
                                 .cursor_pointer()
                                 .child("Log")
                                 .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
@@ -4790,7 +5010,7 @@ impl MacroApp {
                                 .px_1()
                                 .rounded_sm()
                                 .text_color(rgb(MUTED))
-                                .hover(|s| s.bg(rgb(BTN_HOVER)).text_color(rgb(TEXT)))
+                                .hover(|s| s.bg(rgb(UI_HOVER)).text_color(rgb(TEXT)))
                                 .cursor_pointer()
                                 .child("✕")
                                 .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
@@ -5084,20 +5304,33 @@ impl MacroApp {
         }
         graph = graph.child(self.render_zoom_controls(cx));
 
-        if !inside && view.nodes.len() <= 1 {
+        if !inside && view.nodes.len() <= 1 && !self.show_start {
             graph = graph.child(
                 div()
                     .absolute()
-                    .bottom(px(18.))
-                    .left(px(18.))
-                    .max_w(px(460.))
-                    .p_3()
-                    .rounded_lg()
-                    .bg(rgba(0x1d212cdd))
-                    .border_1()
-                    .border_color(rgb(BORDER))
-                    .text_color(rgb(MUTED))
-                    .child("Build a macro like a flowchart: add steps from the left (they chain after the selected step), record a whole macro with ● Record macro, or capture one click or key with ◎ Record one step. Find image steps branch into “found” and “not found”."),
+                    .bottom(px(16.))
+                    .left_0()
+                    .w_full()
+                    .flex()
+                    .justify_center()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_2()
+                            .px_3()
+                            .h(px(32.))
+                            .rounded_lg()
+                            .bg(rgba((UI_RAISED << 8) | 0xf2))
+                            .border_1()
+                            .border_color(rgb(UI_EDGE))
+                            .text_xs()
+                            .text_color(rgb(MUTED))
+                            .child("Add steps from the panel, press")
+                            .child(kbd(format!("{SHORTCUT_KEY}K")))
+                            .child("to search, or hit Record."),
+                    ),
             );
         }
         if !self.live_vars.is_empty() && self.show_vars && !self.show_start {
@@ -5161,10 +5394,10 @@ impl MacroApp {
                 .min_w(px(30.))
                 .px_2()
                 .rounded_md()
-                .bg(rgb(BTN))
+                .bg(rgb(UI_RAISED))
                 .text_color(rgb(TEXT))
                 .cursor_pointer()
-                .hover(|s| s.bg(rgb(BTN_HOVER)))
+                .hover(|s| s.bg(rgb(UI_HOVER)))
                 .child(label)
         };
         div()
@@ -5193,7 +5426,7 @@ impl MacroApp {
                     .pr_1()
                     .h(px(28.))
                     .border_b_1()
-                    .border_color(rgb(BORDER))
+                    .border_color(rgb(UI_EDGE))
                     .child(div().font_weight(FontWeight::SEMIBOLD).child("Playback"))
                     .child(
                         div()
@@ -5208,7 +5441,7 @@ impl MacroApp {
                             .rounded_md()
                             .cursor_pointer()
                             .text_color(rgb(MUTED))
-                            .hover(|s| s.bg(rgb(BTN_HOVER)).text_color(rgb(TEXT)))
+                            .hover(|s| s.bg(rgb(UI_HOVER)).text_color(rgb(TEXT)))
                             .child("×")
                             .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                                 this.reset_replay();
@@ -5224,9 +5457,9 @@ impl MacroApp {
                     .items_center()
                     .justify_center()
                     .rounded_md()
-                    .bg(rgb(BG))
+                    .bg(rgb(UI_INPUT))
                     .border_1()
-                    .border_color(rgb(BORDER))
+                    .border_color(rgb(UI_EDGE))
                     .p_1()
                     .child(content),
             )
@@ -5329,7 +5562,7 @@ impl MacroApp {
             .flex()
             .flex_col()
             .rounded_lg()
-            .bg(rgba(0x161922f2))
+            .bg(rgba((UI_RAISED << 8) | 0xf2))
             .border_1()
             .border_color(rgb(if live { ACCENT } else { BORDER }))
             .shadow_md()
@@ -5346,7 +5579,7 @@ impl MacroApp {
                     .pr_1()
                     .h(px(28.))
                     .border_b_1()
-                    .border_color(rgb(BORDER))
+                    .border_color(rgb(UI_EDGE))
                     .child(div().font_weight(FontWeight::SEMIBOLD).child("Variables"))
                     .child(div().flex_1().text_color(rgb(MUTED)).child(if live { "· live" } else { "· last run" }))
                     .child(
@@ -5356,7 +5589,7 @@ impl MacroApp {
                             .rounded_md()
                             .cursor_pointer()
                             .text_color(rgb(MUTED))
-                            .hover(|s| s.bg(rgb(BTN_HOVER)).text_color(rgb(TEXT)))
+                            .hover(|s| s.bg(rgb(UI_HOVER)).text_color(rgb(TEXT)))
                             .child("×")
                             .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                                 this.show_vars = false;
@@ -5372,22 +5605,40 @@ impl MacroApp {
         let tile = |id: SharedString, title: String, text: String| {
             div()
                 .id(id)
-                .w(px(184.))
-                .h(px(86.))
-                .p_3()
+                .w(px(190.))
+                .h(px(96.))
+                .px_3()
+                .py_2p5()
                 .flex()
                 .flex_col()
                 .gap_1()
+                .overflow_hidden()
                 .rounded_lg()
-                .bg(rgb(PANEL))
+                .bg(rgb(UI_INPUT))
                 .border_1()
-                .border_color(rgb(BORDER))
+                .border_color(rgb(UI_EDGE))
                 .cursor_pointer()
-                .hover(|s| s.border_color(rgb(ACCENT)).bg(rgb(NODE_BG)))
-                .child(div().font_weight(FontWeight::SEMIBOLD).text_color(rgb(TEXT)).child(title))
-                .child(div().text_xs().text_color(rgb(MUTED)).child(text))
+                .hover(|s| s.border_color(rgba((ACCENT << 8) | 0xcc)).bg(rgb(UI_HOVER)))
+                .child(
+                    div()
+                        .text_sm()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(rgb(TEXT))
+                        .truncate()
+                        .child(title),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .line_height(px(16.))
+                        .text_color(rgb(UI_FAINT))
+                        .line_clamp(3)
+                        .text_ellipsis()
+                        .child(text.clone()),
+                )
+                .tooltip(tip_view(text))
         };
-        let mut tiles = div().flex().flex_row().flex_wrap().gap_2();
+        let mut tiles = div().flex().flex_row().flex_wrap().gap_2p5();
         tiles = tiles.child(
             tile("start-blank".into(), "Blank macro".into(), "Just a Start step. Add steps from the left.".into())
                 .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
@@ -5415,15 +5666,17 @@ impl MacroApp {
         );
 
         let mut card = div()
-            .w(px(616.))
-            .p_4()
+            .w(px(640.))
+            .px_5()
+            .pt_5()
+            .pb_4()
             .flex()
             .flex_col()
             .gap_3()
             .rounded_xl()
-            .bg(rgb(PANEL2))
+            .bg(rgb(UI_RAISED))
             .border_1()
-            .border_color(rgb(BORDER))
+            .border_color(rgb(UI_EDGE))
             .shadow_lg()
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .child(
@@ -5433,7 +5686,18 @@ impl MacroApp {
                     .items_center()
                     .gap_2()
                     .child(logo_mark())
-                    .child(div().text_base().font_weight(FontWeight::BOLD).child("Welcome to MacroFlow"))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .child(div().text_base().font_weight(FontWeight::SEMIBOLD).child("Welcome to MacroFlow"))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(UI_FAINT))
+                                    .child("Start from a template, or pick up where you left off."),
+                            ),
+                    )
                     .child(div().flex_1())
                     .child(
                         div()
@@ -5443,7 +5707,7 @@ impl MacroApp {
                             .rounded_md()
                             .cursor_pointer()
                             .text_color(rgb(MUTED))
-                            .hover(|s| s.bg(rgb(BTN_HOVER)).text_color(rgb(TEXT)))
+                            .hover(|s| s.bg(rgb(UI_HOVER)).text_color(rgb(TEXT)))
                             .child("×")
                             .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                                 this.show_start = false;
@@ -5507,7 +5771,7 @@ impl MacroApp {
             );
         }
 
-        card = card.child(section_title("Start from")).child(tiles);
+        card = card.child(section_head("Start from").mt_1()).child(tiles);
         card = card.child(section_title("Recent"));
         if self.recent.is_empty() {
             card = card.child(help("Macros you open or save show up here."));
@@ -5519,6 +5783,11 @@ impl MacroApp {
                     .map(|n| n.to_string_lossy().to_string())
                     .unwrap_or_else(|| p.display().to_string());
                 let folder = p.parent().map(|d| d.display().to_string()).unwrap_or_default();
+                // Show the home folder as ~ so the path fits.
+                let folder = match std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) {
+                    Ok(home) if !home.is_empty() && folder.starts_with(&home) => format!("~{}", &folder[home.len()..]),
+                    _ => folder,
+                };
                 let path = p.clone();
                 list = list.child(
                     div()
@@ -5527,14 +5796,15 @@ impl MacroApp {
                         .flex_row()
                         .items_center()
                         .gap_2()
+                        .mx(px(-8.))
                         .px_2()
-                        .h(px(28.))
+                        .h(px(30.))
                         .rounded_md()
                         .cursor_pointer()
-                        .hover(|s| s.bg(rgb(BTN_HOVER)))
-                        .child(div().flex_none().text_color(rgb(ACCENT)).child("▤"))
-                        .child(div().flex_none().text_color(rgb(TEXT)).child(name))
-                        .child(div().flex_1().min_w(px(0.)).truncate().text_xs().text_color(rgb(MUTED)).child(folder))
+                        .hover(|s| s.bg(rgb(UI_HOVER)))
+                        .child(div().flex_none().size(px(6.)).rounded_sm().bg(rgb(ACCENT)))
+                        .child(div().flex_none().max_w(px(260.)).truncate().text_sm().text_color(rgb(TEXT)).child(name))
+                        .child(div().flex_1().min_w(px(0.)).truncate().text_xs().text_color(rgb(UI_FAINT)).child(folder))
                         .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                             this.load(path.clone());
                             cx.notify();
@@ -5543,10 +5813,27 @@ impl MacroApp {
             }
             card = card.child(list);
         }
-        card = card.child(help(&format!(
-            "Tip: {} + K adds a step by typing its name. Drag from a step's output dot into empty space to add a step that's already connected.",
-            SHORTCUT_KEY
-        )));
+        card = card.child(
+            div()
+                .mt_1()
+                .pt_3()
+                .border_t_1()
+                .border_color(rgb(UI_LINE))
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_1p5()
+                .text_xs()
+                .text_color(rgb(UI_FAINT))
+                .child(kbd(format!("{SHORTCUT_KEY}K")))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.))
+                        .truncate()
+                        .child("finds and adds a step by name. Drag from a dot into empty space to add a connected one."),
+                ),
+        );
 
         div()
             .id("start-screen")
@@ -5568,9 +5855,9 @@ impl MacroApp {
         let Some(q) = &self.quick else { return div().id("quick-add") };
         let matches = self.quick_matches();
         let palette = NodeKind::palette();
-        let w = 360.0;
+        let w = 400.0;
         let shown = matches.len().min(8);
-        let h = 40.0 + shown.max(1) as f32 * 40.0 + 34.0;
+        let h = 44.0 + shown.max(1) as f32 * 46.0 + 8.0 + 30.0;
         let (x, y) = match q.screen {
             Some((sx, sy)) => ((sx + 8.0).min(vw - w - 8.0).max(8.0), (sy - 20.0).min(vh - h - 8.0).max(8.0)),
             None => (((vw - w) / 2.0).max(8.0), 72.0),
@@ -5585,15 +5872,16 @@ impl MacroApp {
         } else {
             div().flex().items_center().child(q.query.clone()).child(caret)
         };
-        let mut list = div().flex().flex_col().p_1();
+        let mut list = div().flex().flex_col().p_1().gap_0p5();
         if matches.is_empty() {
             list = list.child(
                 div()
-                    .h(px(40.))
+                    .h(px(44.))
                     .px_2()
                     .flex()
                     .items_center()
-                    .text_color(rgb(MUTED))
+                    .text_xs()
+                    .text_color(rgb(UI_FAINT))
                     .child(format!("No steps match “{}”", q.query)),
             );
         }
@@ -5604,20 +5892,26 @@ impl MacroApp {
             list = list.child(
                 div()
                     .id(("quick-item", pi))
-                    .h(px(40.))
+                    .h(px(44.))
                     .px_2()
                     .flex()
                     .flex_row()
                     .items_center()
-                    .gap_2()
+                    .gap_2p5()
                     .rounded_md()
                     .cursor_pointer()
-                    .when(on, |d| d.bg(rgba((ACCENT << 8) | 0x55)))
-                    .when(!on, |d| d.hover(|s| s.bg(rgb(BTN_HOVER))))
+                    .when(on, |d| d.bg(rgba((ACCENT << 8) | 0x33)))
+                    .when(!on, |d| d.hover(|s| s.bg(rgb(UI_HOVER))))
                     .child(
                         div()
-                            .w(px(20.))
+                            .size(px(26.))
                             .flex_none()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded_md()
+                            .bg(rgba((k.color() << 8) | 0x1f))
+                            .text_size(px(12.))
                             .text_color(rgb(k.color()))
                             .font_weight(FontWeight::BOLD)
                             .child(k.icon()),
@@ -5628,8 +5922,15 @@ impl MacroApp {
                             .min_w(px(0.))
                             .flex()
                             .flex_col()
-                            .child(div().text_color(rgb(TEXT)).child(k.title()))
-                            .child(div().text_xs().text_color(rgb(MUTED)).truncate().child(step_blurb(k))),
+                            .child(div().line_height(px(17.)).text_color(rgb(TEXT)).child(k.title()))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .line_height(px(15.))
+                                    .text_color(rgb(UI_FAINT))
+                                    .truncate()
+                                    .child(step_blurb(k)),
+                            ),
                     )
                     .on_mouse_down(
                         MouseButton::Left,
@@ -5650,10 +5951,11 @@ impl MacroApp {
             .w(px(w))
             .flex()
             .flex_col()
-            .rounded_lg()
-            .bg(rgb(PANEL2))
+            .rounded_xl()
+            .overflow_hidden()
+            .bg(rgb(UI_RAISED))
             .border_1()
-            .border_color(rgb(ACCENT))
+            .border_color(rgb(UI_EDGE))
             .shadow_lg()
             .text_sm()
             .text_color(rgb(TEXT))
@@ -5665,32 +5967,40 @@ impl MacroApp {
             }))
             .child(
                 div()
-                    .h(px(40.))
+                    .h(px(44.))
                     .px_3()
                     .flex()
                     .flex_row()
                     .items_center()
                     .gap_2()
                     .border_b_1()
-                    .border_color(rgb(BORDER))
-                    .child(div().flex_none().text_color(rgb(ACCENT)).child(if q.link.is_some() {
-                        "＋ Add & connect"
-                    } else {
-                        "＋ Add step"
-                    }))
+                    .border_color(rgb(UI_LINE))
+                    .child(
+                        div()
+                            .flex_none()
+                            .px_1p5()
+                            .h(px(20.))
+                            .flex()
+                            .items_center()
+                            .rounded_sm()
+                            .bg(rgba((ACCENT << 8) | 0x2e))
+                            .text_xs()
+                            .text_color(rgb(0xc9bdff))
+                            .child(if q.link.is_some() { "Add & connect" } else { "Add step" }),
+                    )
                     .child(input),
             )
             .child(list)
             .child(
                 div()
-                    .h(px(28.))
+                    .h(px(30.))
                     .px_3()
                     .flex()
                     .items_center()
                     .border_t_1()
-                    .border_color(rgb(BORDER))
+                    .border_color(rgb(UI_LINE))
                     .text_xs()
-                    .text_color(rgb(MUTED))
+                    .text_color(rgb(UI_FAINT))
                     .child("↑ ↓ choose · Enter adds · Esc closes"),
             )
     }
@@ -5757,9 +6067,9 @@ impl MacroApp {
                     .flex_col()
                     .gap_3()
                     .rounded_xl()
-                    .bg(rgb(PANEL2))
+                    .bg(rgb(UI_RAISED))
                     .border_1()
-                    .border_color(rgb(BORDER))
+                    .border_color(rgb(UI_EDGE))
                     .shadow_lg()
                     .text_sm()
                     .text_color(rgb(TEXT))
@@ -5809,9 +6119,9 @@ impl MacroApp {
             .gap_0p5()
             .p(px(3.))
             .rounded_lg()
-            .bg(rgba(0x161922f2))
+            .bg(rgba((UI_RAISED << 8) | 0xf2))
             .border_1()
-            .border_color(rgb(BORDER))
+            .border_color(rgb(UI_EDGE))
             .shadow_md()
             .text_xs()
             .child(zoom_btn("zoom-out", "−").on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
@@ -5831,7 +6141,7 @@ impl MacroApp {
                 this.zoom_by(1.2);
                 cx.notify();
             })))
-            .child(div().w(px(1.)).h(px(16.)).mx_0p5().bg(rgb(BORDER)))
+            .child(div().w(px(1.)).h(px(16.)).mx_0p5().bg(rgb(UI_EDGE)))
             .child(zoom_btn("zoom-fit", "Fit").on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                 this.zoom_fit();
                 cx.notify();
@@ -5908,9 +6218,9 @@ impl MacroApp {
             .pr_1()
             .py_1()
             .rounded_lg()
-            .bg(rgba(0x161922f2))
+            .bg(rgba((UI_RAISED << 8) | 0xf2))
             .border_1()
-            .border_color(rgb(BORDER))
+            .border_color(rgb(UI_EDGE))
             .shadow_lg()
             .child(div().pr_2().text_xs().text_color(rgb(MUTED)).child(label));
         for a in actions {
@@ -5984,7 +6294,7 @@ impl MacroApp {
             .pr_2()
             .py_1()
             .rounded_lg()
-            .bg(rgba(0x161922f0))
+            .bg(rgba((UI_RAISED << 8) | 0xf0))
             .border_1()
             .border_color(rgba((GROUP_COLOR << 8) | 0xaa))
             .shadow_md()
@@ -6024,7 +6334,7 @@ impl MacroApp {
                     .when(!is_last, |d| {
                         d.text_color(rgb(MUTED))
                             .cursor_pointer()
-                            .hover(|s| s.bg(rgb(BTN_HOVER)).text_color(rgb(TEXT)))
+                            .hover(|s| s.bg(rgb(UI_HOVER)).text_color(rgb(TEXT)))
                     })
                     .child(label)
                     .on_mouse_down(
@@ -6360,14 +6670,13 @@ impl MacroApp {
 
     fn macro_settings(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let mut out = vec![
-            section_title("Macro").into_any_element(),
+            section_head("Macro").into_any_element(),
             self.text_field("Name", Field::MacroName, cx).into_any_element(),
             self.num_field("Start delay (ms)", Field::StartDelay, 250.0, cx).into_any_element(),
             self.num_field("Gap between steps (ms)", Field::StepDelay, 10.0, cx).into_any_element(),
             self.num_field("Speed (%)", Field::Speed, 10.0, cx).into_any_element(),
             self.num_field("Repeat whole macro", Field::Repeat, 1.0, cx).into_any_element(),
             help("Repeat 0 = keep going until you press Esc. Speed 200% halves every delay.").into_any_element(),
-            div().h(px(8.)).into_any_element(),
             section_title("Change every delay at once").into_any_element(),
             div()
                 .flex()
@@ -6420,7 +6729,6 @@ impl MacroApp {
         ];
 
         // Variables.
-        out.push(div().h(px(8.)).into_any_element());
         out.push(section_title("Variables").into_any_element());
         {
             let set = self.doc.variables_set();
@@ -6471,11 +6779,10 @@ impl MacroApp {
         }
 
         // Scaling to the screen size.
-        out.push(div().h(px(8.)).into_any_element());
         out.push(section_title("Screen size").into_any_element());
         let scaled = self.doc.reference.is_some();
         out.push(
-            chip("scale-positions", "Scale positions to the screen size", scaled)
+            toggle("scale-positions", "Scale positions to the screen size", scaled)
                 .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                     this.set_scaling(!scaled);
                     cx.notify();
@@ -6498,7 +6805,6 @@ impl MacroApp {
         );
 
         // Following a window.
-        out.push(div().h(px(8.)).into_any_element());
         out.push(section_title("Positions follow a window").into_any_element());
         match &self.doc.anchor {
             Some(a) => {
@@ -6566,8 +6872,8 @@ impl MacroApp {
                         .rounded_md()
                         .text_xs()
                         .truncate()
-                        .bg(rgb(PANEL2))
-                        .hover(|s| s.bg(rgb(BTN_HOVER)))
+                        .bg(rgb(UI_RAISED))
+                        .hover(|s| s.bg(rgb(UI_HOVER)))
                         .cursor_pointer()
                         .child(label)
                         .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
@@ -6581,10 +6887,9 @@ impl MacroApp {
         out.push(help("When followed, every saved position is relative to that window: if it moves (or you use a different monitor), clicks, read areas, search areas and colour checks move with it. The window is found by app name (and title if it matches).").into_any_element());
 
         // Mouse movement.
-        out.push(div().h(px(8.)).into_any_element());
         out.push(section_title("Mouse movement").into_any_element());
         out.push(
-            chip("human-mouse", "Human-like mouse movement", self.doc.human_mouse)
+            toggle("human-mouse", "Human-like mouse movement", self.doc.human_mouse)
                 .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                     this.doc.human_mouse = !this.doc.human_mouse;
                     this.dirty = true;
@@ -6602,7 +6907,7 @@ impl MacroApp {
         })
         .into_any_element());
         out.push(
-            chip("show-clicks", "Show a green dot where it clicks", self.doc.show_clicks)
+            toggle("show-clicks", "Show a green dot where it clicks", self.doc.show_clicks)
                 .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                     this.doc.show_clicks = !this.doc.show_clicks;
                     this.dirty = true;
@@ -6613,10 +6918,9 @@ impl MacroApp {
         out.push(help("While it runs, a green dot appears where it's about to click (a ring for a plain mouse move, and where a drag lets go), with a ripple when it clicks. Clicks go straight through it, and it's hidden from MacroFlow's own screenshots, so Find image, Read text and Pixel colour never see it.").into_any_element());
 
         // Alerts and hotkeys.
-        out.push(div().h(px(8.)).into_any_element());
         out.push(section_title("When it stops").into_any_element());
         out.push(
-            chip("alert-on-stop", "Red pop-up if it stops unexpectedly", self.doc.alert_on_stop)
+            toggle("alert-on-stop", "Red pop-up if it stops unexpectedly", self.doc.alert_on_stop)
                 .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                     this.doc.alert_on_stop = !this.doc.alert_on_stop;
                     this.dirty = true;
@@ -6626,7 +6930,7 @@ impl MacroApp {
         );
         out.push(help("Shows when a step goes wrong (including an internal crash) or the macro runs into a path with nothing connected.").into_any_element());
         out.push(
-            chip("alert-on-finish", "Green pop-up when it finishes", self.doc.alert_on_finish)
+            toggle("alert-on-finish", "Green pop-up when it finishes", self.doc.alert_on_finish)
                 .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                     this.doc.alert_on_finish = !this.doc.alert_on_finish;
                     this.dirty = true;
@@ -6636,7 +6940,7 @@ impl MacroApp {
         );
         out.push(help("Shows when it reaches an End step or has done every repeat. Pressing Stop / Esc never shows a pop-up.").into_any_element());
         out.push(
-            chip("alert-on-breakpoint", "Pop-up when it pauses at a breakpoint", self.doc.alert_on_breakpoint)
+            toggle("alert-on-breakpoint", "Pop-up when it pauses at a breakpoint", self.doc.alert_on_breakpoint)
                 .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                     this.doc.alert_on_breakpoint = !this.doc.alert_on_breakpoint;
                     this.dirty = true;
@@ -6645,7 +6949,7 @@ impl MacroApp {
                 .into_any_element(),
         );
         out.push(
-            chip("failsafe", "Failsafe: stop when the mouse hits a screen corner", self.doc.failsafe)
+            toggle("failsafe", "Failsafe: stop when the mouse hits a screen corner", self.doc.failsafe)
                 .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                     this.doc.failsafe = !this.doc.failsafe;
                     this.dirty = true;
@@ -6654,12 +6958,26 @@ impl MacroApp {
                 .into_any_element(),
         );
         out.push(help("Throw the mouse into any outer corner of the screen to stop the macro instantly, even if keys aren't getting through. Corners where two monitors meet don't count, and the macro moving the mouse there itself doesn't either.").into_any_element());
-        out.push(div().h(px(8.)).into_any_element());
         out.push(section_title("Hotkeys (work in any app)").into_any_element());
-        out.push(help("F8 – start the macro, or stop it while it runs").into_any_element());
-        out.push(help("F9 – pause / resume").into_any_element());
-        out.push(help("F10 – run the next step (or start the macro step by step)").into_any_element());
-        out.push(help("Esc – stop").into_any_element());
+        for (k, what) in [
+            ("F8", "Start, or stop while it runs"),
+            ("F9", "Pause / resume"),
+            ("F10", "Run the next step"),
+            ("Esc", "Stop"),
+        ] {
+            out.push(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .text_xs()
+                    .text_color(rgb(MUTED))
+                    .child(div().w(px(40.)).flex().child(kbd(k)))
+                    .child(what)
+                    .into_any_element(),
+            );
+        }
         out
     }
 
@@ -6724,15 +7042,20 @@ impl MacroApp {
                         .border_color(rgba((col << 8) | 0x66))
                         .text_xs()
                         .child(div().flex_none().text_color(rgb(col)).child("⚠"))
-                        .child(div().flex_1().text_color(rgb(TEXT)).child(text))
+                        .child(div().flex_1().min_w(px(0.)).line_height(px(17.)).text_color(rgb(TEXT)).child(text))
                         .into_any_element(),
                 );
             }
         }
+        if !matches!(n.kind, NodeKind::GroupIn | NodeKind::GroupOut | NodeKind::Group { .. }) {
+            out.push(self.text_field("Name (shown on the step)", Field::StepName, cx).into_any_element());
+        }
+        // Options every step has go last, under their own heading.
+        let mut general: Vec<AnyElement> = Vec::new();
         let groupable = !n.kind.is_fixed() && !matches!(n.kind, NodeKind::End) && self.doc.straight_run(id).len() >= 2;
         if groupable {
             let run = self.doc.straight_run(id).len();
-            out.push(
+            general.push(
                 small_btn("n-group-run", "Group the straight line from here")
                     .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                         this.group_selection();
@@ -6740,7 +7063,7 @@ impl MacroApp {
                     }))
                     .into_any_element(),
             );
-            out.push(
+            general.push(
                 help(&format!(
                     "Turns this step and the {} after it into one Group step. Shift-click steps to pick exactly which ones.",
                     run - 1
@@ -6748,14 +7071,11 @@ impl MacroApp {
                 .into_any_element(),
             );
         }
-        if !matches!(n.kind, NodeKind::GroupIn | NodeKind::GroupOut | NodeKind::Group { .. }) {
-            out.push(self.text_field("Name (optional – shown on the step)", Field::StepName, cx).into_any_element());
-        }
         if !matches!(n.kind, NodeKind::GroupIn | NodeKind::GroupOut) {
-            out.push(self.text_field("Note", Field::Note, cx).into_any_element());
-            out.push(self.num_field("Delay before (ms)", Field::Delay, 50.0, cx).into_any_element());
-            out.push(
-                chip("n-breakpoint", "● Breakpoint – pause before this step", n.breakpoint)
+            general.push(self.text_field("Note", Field::Note, cx).into_any_element());
+            general.push(self.num_field("Delay before (ms)", Field::Delay, 50.0, cx).into_any_element());
+            general.push(
+                toggle("n-breakpoint", "Breakpoint: pause before this step", n.breakpoint)
                     .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                         this.toggle_breakpoint(id);
                         cx.notify();
@@ -6765,12 +7085,12 @@ impl MacroApp {
         }
         if !n.kind.is_fixed() {
             let label = if n.kind.is_group() {
-                "⊘ Disabled – skip this whole group"
+                "Disabled: runs skip this whole group"
             } else {
-                "⊘ Disabled – skip this step"
+                "Disabled: runs skip this step"
             };
-            out.push(
-                chip("n-disabled", label, n.disabled)
+            general.push(
+                toggle("n-disabled", label, n.disabled)
                     .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                         // Act on this step only, even if others are selected too.
                         this.clear_selection();
@@ -6782,7 +7102,7 @@ impl MacroApp {
             );
             if n.disabled {
                 let multi = n.kind.outputs().len() > 1;
-                out.push(help(if multi {
+                general.push(help(if multi {
                     "Runs skip it and carry on along its first output that's connected (normally the first one)."
                 } else {
                     "Runs skip it and carry on with whatever its output is connected to."
@@ -6790,7 +7110,6 @@ impl MacroApp {
                 .into_any_element());
             }
         }
-        out.push(div().h(px(6.)).into_any_element());
 
         match &n.kind {
             NodeKind::Start => {
@@ -6950,9 +7269,9 @@ impl MacroApp {
                             .px_2()
                             .py_1()
                             .rounded_md()
-                            .bg(rgb(BG))
+                            .bg(rgb(UI_INPUT))
                             .border_1()
-                            .border_color(if capturing { rgb(ACCENT) } else { rgb(BORDER) })
+                            .border_color(if capturing { rgb(ACCENT) } else { rgb(UI_EDGE) })
                             .child(if capturing {
                                 "Press a key combination…".to_string()
                             } else {
@@ -7015,7 +7334,7 @@ impl MacroApp {
                 out.push(self.text_field("Text to type", Field::Text, cx).into_any_element());
                 out.push(help("Put {text} anywhere to type what the last Read text step read.").into_any_element());
                 out.push(
-                    chip("type-enter", "Press Return afterwards", *press_enter)
+                    toggle("type-enter", "Press Return afterwards", *press_enter)
                         .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                             this.update_node(id, |k| {
                                 if let NodeKind::TypeText { press_enter, .. } = k {
@@ -7036,7 +7355,7 @@ impl MacroApp {
                 out.push(self.num_field("Wheel clicks", Field::ScrollAmt, 1.0, cx).into_any_element());
                 out.push(self.num_field("Strength (× per click)", Field::ScrollStrength, 1.0, cx).into_any_element());
                 out.push(
-                    chip("scroll-h", "Sideways", *horizontal)
+                    toggle("scroll-h", "Sideways", *horizontal)
                         .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                             this.update_node(id, |k| {
                                 if let NodeKind::Scroll { horizontal, .. } = k {
@@ -7127,6 +7446,10 @@ impl MacroApp {
             } => {
                 out.extend(self.notify_settings(id, *style, *position, *wait_for_click, *sound, cx));
             }
+        }
+        if !general.is_empty() {
+            out.push(section_title("Step options").into_any_element());
+            out.extend(general);
         }
         out
     }
@@ -7561,9 +7884,9 @@ impl MacroApp {
                     .items_center()
                     .justify_center()
                     .rounded_md()
-                    .bg(rgb(BG))
+                    .bg(rgb(UI_INPUT))
                     .border_1()
-                    .border_color(rgb(BORDER))
+                    .border_color(rgb(UI_EDGE))
                     .p_1()
                     .child(preview)
                     .into_any_element(),
@@ -7665,7 +7988,7 @@ impl MacroApp {
         );
         out.push(self.num_field("Check every (ms)", Field::Interval, 50.0, cx).into_any_element());
         out.push(
-            chip("find-gone", "Wait until it's gone", gone)
+            toggle("find-gone", "Wait until it's gone", gone)
                 .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                     this.update_node(id, |k| {
                         if let NodeKind::FindImage { until_gone, .. } = k {
@@ -7681,7 +8004,7 @@ impl MacroApp {
             return out;
         }
         out.push(
-            chip("find-click", "Click it when found", click_when_found)
+            toggle("find-click", "Click it when found", click_when_found)
                 .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                     this.update_node(id, |k| {
                         if let NodeKind::FindImage { click_when_found, .. } = k {
@@ -7751,7 +8074,7 @@ impl MacroApp {
                             .flex_none()
                             .rounded_md()
                             .border_1()
-                            .border_color(rgb(BORDER))
+                            .border_color(rgb(UI_EDGE))
                             .bg(rgb(color)),
                     )
                     .child(div().flex_1().child(self.value_box(Field::PixelHex, 0.0, cx))),
@@ -7840,9 +8163,9 @@ impl MacroApp {
         out.push(
             div()
                 .flex()
-                .flex_wrap()
+                .flex_col()
                 .gap_1()
-                .child(chip("n-wait", "Pause until I click it", wait_for_click).on_click(cx.listener(
+                .child(toggle("n-wait", "Pause until I click it", wait_for_click).on_click(cx.listener(
                     move |this, _: &ClickEvent, _, cx| {
                         this.update_node(id, |k| {
                             if let NodeKind::Notify { wait_for_click, .. } = k {
@@ -7852,7 +8175,7 @@ impl MacroApp {
                         cx.notify();
                     },
                 )))
-                .child(chip("n-sound", "Play a sound", sound).on_click(cx.listener(
+                .child(toggle("n-sound", "Play a sound", sound).on_click(cx.listener(
                     move |this, _: &ClickEvent, _, cx| {
                         this.update_node(id, |k| {
                             if let NodeKind::Notify { sound, .. } = k {
@@ -8133,9 +8456,9 @@ impl MacroApp {
         out.push(
             div()
                 .flex()
-                .flex_wrap()
+                .flex_col()
                 .gap_1()
-                .child(chip("win-case", "Match case", case_sensitive).on_click(cx.listener(
+                .child(toggle("win-case", "Match case", case_sensitive).on_click(cx.listener(
                     move |this, _: &ClickEvent, _, cx| {
                         this.update_node(id, |k| {
                             if let NodeKind::WindowCheck { case_sensitive, .. } = k {
@@ -8145,7 +8468,7 @@ impl MacroApp {
                         cx.notify();
                     },
                 )))
-                .child(chip("win-front", "Bring it to the front if found", bring_to_front).on_click(
+                .child(toggle("win-front", "Bring it to the front if found", bring_to_front).on_click(
                     cx.listener(move |this, _: &ClickEvent, _, cx| {
                         this.update_node(id, |k| {
                             if let NodeKind::WindowCheck { bring_to_front, .. } = k {
@@ -8186,8 +8509,8 @@ impl MacroApp {
                     .rounded_md()
                     .text_xs()
                     .truncate()
-                    .bg(rgb(PANEL2))
-                    .hover(|s| s.bg(rgb(BTN_HOVER)))
+                    .bg(rgb(UI_RAISED))
+                    .hover(|s| s.bg(rgb(UI_HOVER)))
                     .cursor_pointer()
                     .child(label)
                     .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
@@ -8265,7 +8588,7 @@ impl MacroApp {
             Some(NodeKind::ReadText { until_gone: true, .. })
         );
         out.push(
-            chip("read-gone", "Wait until it stops matching (gone)", gone)
+            toggle("read-gone", "Wait until it stops matching (gone)", gone)
                 .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                     this.update_node(id, |k| {
                         if let NodeKind::ReadText { until_gone, .. } = k {
@@ -8316,7 +8639,7 @@ impl MacroApp {
             );
         } else {
             out.push(
-                chip("rt-numbers", "Only read a number", numbers_only)
+                toggle("rt-numbers", "Only read a number", numbers_only)
                     .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                         this.update_node(id, |k| {
                             if let NodeKind::ReadText { numbers_only, .. } = k {
@@ -8330,7 +8653,7 @@ impl MacroApp {
         }
         if !compare.is_number() && compare.needs_value() {
             out.push(
-                chip("rt-case", "Match case", case_sensitive)
+                toggle("rt-case", "Match case", case_sensitive)
                     .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                         this.update_node(id, |k| {
                             if let NodeKind::ReadText { case_sensitive, .. } = k {
@@ -8387,13 +8710,15 @@ impl MacroApp {
         let mut base = div()
             .id(SharedString::from(format!("val-{field:?}")))
             .relative()
-            .min_h(px(22.))
+            .flex()
+            .items_center()
+            .min_w(px(0.))
+            .min_h(px(28.))
             .px_2()
-            .py_0p5()
             .rounded_md()
-            .bg(rgb(BG))
+            .bg(rgb(UI_INPUT))
             .border_1()
-            .border_color(if editing { rgb(ACCENT) } else { rgb(BORDER) })
+            .border_color(if editing { rgb(ACCENT) } else { rgb(UI_EDGE) })
             .cursor_text()
             .overflow_hidden()
             .whitespace_nowrap()
@@ -8610,30 +8935,76 @@ impl MacroApp {
     }
 
     fn num_field(&self, label: &str, field: Field, step: f64, cx: &mut Context<Self>) -> Div {
-        let minus = small_btn(SharedString::from(format!("minus-{field:?}")), "−").on_click(
-            cx.listener(move |this, ev: &ClickEvent, _, cx| {
+        // − and + sit inside one joined control with the value between them.
+        let step_btn = |id: String, text: &'static str| {
+            div()
+                .id(SharedString::from(id))
+                .flex_none()
+                .w(px(24.))
+                .h_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_color(rgb(MUTED))
+                .cursor_pointer()
+                .hover(|s| s.bg(rgb(UI_HOVER)).text_color(rgb(TEXT)))
+                .child(text)
+        };
+        let minus = step_btn(format!("minus-{field:?}"), "−").on_click(cx.listener(
+            move |this, ev: &ClickEvent, _, cx| {
                 let mult = if ev.modifiers().shift { 10.0 } else { 1.0 };
                 this.bump(field, -step * mult);
                 cx.notify();
-            }),
-        );
-        let plus = small_btn(SharedString::from(format!("plus-{field:?}")), "+").on_click(
-            cx.listener(move |this, ev: &ClickEvent, _, cx| {
+            },
+        ));
+        let plus = step_btn(format!("plus-{field:?}"), "+").on_click(cx.listener(
+            move |this, ev: &ClickEvent, _, cx| {
                 let mult = if ev.modifiers().shift { 10.0 } else { 1.0 };
                 this.bump(field, step * mult);
                 cx.notify();
-            }),
-        );
-        labeled(
-            label,
-            div()
-                .flex()
-                .items_center()
-                .gap_1()
-                .child(minus)
-                .child(self.value_box(field, 0.0, cx))
-                .child(plus),
-        )
+            },
+        ));
+        let editing = matches!(&self.editing, Some((f, _)) if *f == field);
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_3()
+            .min_h(px(28.))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .text_xs()
+                    .text_color(rgb(MUTED))
+                    .child(label.to_string()),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .w(px(132.))
+                    .h(px(28.))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .rounded_md()
+                    .overflow_hidden()
+                    .bg(rgb(UI_INPUT))
+                    .border_1()
+                    .border_color(rgb(if editing { ACCENT } else { UI_EDGE }))
+                    .child(minus)
+                    .child(
+                        self.value_box(field, 0.0, cx)
+                            .h_full()
+                            .rounded_none()
+                            .border_0()
+                            .border_l_1()
+                            .border_r_1()
+                            .border_color(rgb(UI_LINE))
+                            .bg(rgb(UI_INPUT)),
+                    )
+                    .child(plus),
+            )
     }
 
     fn text_field(&self, label: &str, field: Field, cx: &mut Context<Self>) -> Div {
@@ -8642,8 +9013,8 @@ impl MacroApp {
         div()
             .flex()
             .flex_col()
-            .gap_1()
-            .child(div().text_xs().text_color(rgb(MUTED)).child(label.to_string()))
+            .gap_1p5()
+            .child(field_label(label))
             .child(div().flex().child(self.value_box(field, 0.0, cx)))
             .when(editing && field.var_mode().is_some(), |d| d.child(self.var_picker(field, cx)))
     }
@@ -8738,7 +9109,7 @@ impl Render for MacroApp {
             .size_full()
             .flex()
             .flex_col()
-            .bg(rgb(BG))
+            .bg(rgb(UI_INPUT))
             .text_color(rgb(TEXT))
             .text_sm()
             .child(self.render_titlebar(window, cx))
@@ -8840,14 +9211,10 @@ fn zoom_btn(id: &'static str, label: impl Into<SharedString>) -> Stateful<Div> {
         .px_2()
         .h(px(24.))
         .rounded_md()
-        .text_color(rgb(TEXT))
+        .text_color(rgb(MUTED))
         .cursor_pointer()
-        .hover(|s| s.bg(rgb(BTN_HOVER)))
+        .hover(|s| s.bg(rgb(UI_HOVER)).text_color(rgb(TEXT)))
         .child(label)
-}
-
-fn tool_btn(id: impl Into<ElementId>, label: &'static str, enabled: bool) -> Stateful<Div> {
-    tool_btn_colored(id, label, enabled, BTN, BTN_HOVER)
 }
 
 /// A solid button. (GPUI only allows one hover style per element, so the hover
@@ -8873,6 +9240,7 @@ fn tool_btn_colored(
         .child(label)
 }
 
+/// A secondary button: quiet fill, hairline border.
 fn small_btn(id: impl Into<ElementId>, label: &'static str) -> Stateful<Div> {
     div()
         .id(id)
@@ -8880,66 +9248,188 @@ fn small_btn(id: impl Into<ElementId>, label: &'static str) -> Stateful<Div> {
         .flex_none()
         .items_center()
         .justify_center()
-        .px_2()
-        .py_0p5()
+        .px_2p5()
+        .h(px(26.))
         .rounded_md()
-        .bg(rgb(BTN))
+        .bg(rgb(UI_RAISED))
+        .border_1()
+        .border_color(rgb(UI_EDGE))
         .text_xs()
         .text_color(rgb(TEXT))
-        .hover(|s| s.bg(rgb(BTN_HOVER)))
+        .whitespace_nowrap()
+        .hover(|s| s.bg(rgb(UI_HOVER)))
         .cursor_pointer()
         .child(label)
 }
 
+/// One option in a set (Left / Right / Middle, Whole screen / One area …).
 fn chip(id: impl Into<ElementId>, label: &'static str, on: bool) -> Stateful<Div> {
     div()
         .id(id)
         .flex()
         .flex_none()
         .items_center()
-        .px_2()
-        .py_0p5()
+        .justify_center()
+        .px_2p5()
+        .h(px(26.))
         .rounded_md()
         .text_xs()
         .border_1()
+        .whitespace_nowrap()
         .cursor_pointer()
         .when(on, |d| {
-            d.bg(rgba((ACCENT << 8) | 0x40))
-                .border_color(rgb(ACCENT))
+            d.bg(rgba((ACCENT << 8) | 0x2e))
+                .border_color(rgba((ACCENT << 8) | 0xcc))
                 .text_color(rgb(0xffffff))
+                .font_weight(FontWeight::MEDIUM)
         })
         .when(!on, |d| {
-            d.bg(rgb(BTN))
-                .border_color(rgb(BORDER))
+            d.bg(rgb(UI_INPUT))
+                .border_color(rgb(UI_EDGE))
                 .text_color(rgb(MUTED))
-                .hover(|s| s.bg(rgb(BTN_HOVER)))
+                .hover(|s| s.bg(rgb(UI_HOVER)).text_color(rgb(TEXT)))
         })
         .child(label)
 }
 
+/// An on/off setting: the label on the left, a switch on the right. The whole row
+/// is clickable.
+fn toggle(id: impl Into<ElementId>, label: &'static str, on: bool) -> Stateful<Div> {
+    div()
+        .id(id)
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap_3()
+        // Bleeds into the panel padding so the label lines up with other labels
+        // while the hover fill still has room around it.
+        .mx(px(-8.))
+        .px_2()
+        .py(px(6.))
+        .rounded_md()
+        .cursor_pointer()
+        .hover(|s| s.bg(rgb(UI_HOVER)))
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(0.))
+                .text_xs()
+                .text_color(rgb(if on { TEXT } else { MUTED }))
+                .child(label),
+        )
+        .child(switch(on))
+}
+
+/// The little pill switch used by [`toggle`].
+fn switch(on: bool) -> Div {
+    switch_sized(on, 28.0, 16.0)
+}
+
+fn switch_sized(on: bool, w: f32, h: f32) -> Div {
+    let knob = h - 4.0;
+    div()
+        .flex_none()
+        .relative()
+        .w(px(w))
+        .h(px(h))
+        .rounded_full()
+        .bg(rgb(if on { ACCENT } else { UI_EDGE }))
+        .child(
+            div()
+                .absolute()
+                .top(px(2.))
+                .left(px(if on { w - knob - 2.0 } else { 2. }))
+                .size(px(knob))
+                .rounded_full()
+                .bg(rgb(if on { 0xffffff } else { 0x9aa0b0 })),
+        )
+}
+
+/// A label above its control (option sets need the full width).
 fn labeled(label: &str, content: impl IntoElement) -> Div {
     div()
         .flex()
-        .items_center()
-        .gap_2()
-        .child(
-            div()
-                .w(px(118.))
-                .flex_none()
-                .text_xs()
-                .text_color(rgb(MUTED))
-                .child(label.to_string()),
-        )
-        .child(div().flex_1().child(content))
+        .flex_col()
+        .gap_1p5()
+        .child(field_label(label))
+        .child(div().w_full().child(content))
 }
 
+fn field_label(label: &str) -> Div {
+    div()
+        .text_xs()
+        .text_color(rgb(MUTED))
+        .child(label.to_string())
+}
+
+/// A section heading. Sections after the first get a hairline above them.
 fn section_title(text: &'static str) -> Div {
     div()
-        .pt_1()
-        .text_xs()
-        .font_weight(FontWeight::BOLD)
-        .text_color(rgb(MUTED))
+        .mt_2()
+        .pt_3()
+        .border_t_1()
+        .border_color(rgb(UI_LINE))
+        .text_size(px(11.))
+        .font_weight(FontWeight::SEMIBOLD)
+        .text_color(rgb(UI_FAINT))
         .child(text.to_uppercase())
+}
+
+/// A section heading with no line above it (the first one in a panel).
+fn section_head(text: &'static str) -> Div {
+    div()
+        .pt_1()
+        .text_size(px(11.))
+        .font_weight(FontWeight::SEMIBOLD)
+        .text_color(rgb(UI_FAINT))
+        .child(text.to_uppercase())
+}
+
+/// A keyboard key, e.g. in the shortcut list.
+fn kbd(text: impl Into<SharedString>) -> Div {
+    div()
+        .flex_none()
+        .px_1p5()
+        .min_w(px(20.))
+        .h(px(18.))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded_sm()
+        .bg(rgb(UI_INPUT))
+        .border_1()
+        .border_color(rgb(UI_EDGE))
+        .text_size(px(10.5))
+        .text_color(rgb(MUTED))
+        .child(text.into())
+}
+
+/// The hover pop-up behind [`help`] and title-bar buttons.
+struct TipView {
+    text: SharedString,
+}
+
+impl Render for TipView {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .max_w(px(320.))
+            .px_2p5()
+            .py_1p5()
+            .rounded_md()
+            .bg(rgb(UI_RAISED))
+            .border_1()
+            .border_color(rgb(UI_EDGE))
+            .shadow_lg()
+            .text_xs()
+            .text_color(rgb(TEXT))
+            .child(self.text.clone())
+    }
+}
+
+/// Builds a tooltip for `.tooltip(...)`.
+fn tip_view(text: impl Into<SharedString>) -> impl Fn(&mut Window, &mut App) -> AnyView + 'static {
+    let text: SharedString = text.into();
+    move |_, cx| cx.new(|_| TipView { text: text.clone() }).into()
 }
 
 // ---------------------------------------------------------------------------
@@ -9466,16 +9956,66 @@ impl Field {
     }
 }
 
-fn help(text: &str) -> Div {
-    div().text_xs().text_color(rgb(MUTED)).child(text.to_string())
+/// Longer explanations are cut to this many characters' worth of lines (two lines in
+/// the sidebar); hovering shows the whole text.
+const HELP_SHORT: usize = 96;
+
+/// A quiet explanation under a setting. Short ones show in full. Long ones show
+/// their first two lines with an ⓘ, and the full text appears on hover, so the
+/// panel stays readable without losing anything.
+fn help(text: &str) -> Stateful<Div> {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    text.hash(&mut h);
+    let id = ElementId::Name(SharedString::from(format!("help-{:x}", h.finish())));
+    let long = text.chars().count() > HELP_SHORT;
+    let base = div()
+        .id(id)
+        .text_xs()
+        .line_height(px(17.))
+        .text_color(rgb(UI_FAINT));
+    if !long {
+        return base.child(text.to_string());
+    }
+    base.flex()
+        .flex_row()
+        .items_start()
+        .gap_1p5()
+        .hover(|s| s.text_color(rgb(MUTED)))
+        .child(div().flex_1().min_w(px(0.)).line_clamp(2).text_ellipsis().child(text.to_string()))
+        .child(
+            div()
+                .flex_none()
+                .mt(px(1.))
+                .size(px(14.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded_full()
+                .border_1()
+                .border_color(rgb(UI_EDGE))
+                .text_size(px(9.))
+                .text_color(rgb(MUTED))
+                .child("i"),
+        )
+        .tooltip(tip_view(text.to_string()))
 }
 
+/// One line in the Tips list.
 fn tip(text: &'static str) -> Div {
-    div().text_xs().text_color(rgb(MUTED)).pb_1().child(text)
+    div()
+        .flex()
+        .flex_row()
+        .gap_2()
+        .text_xs()
+        .line_height(px(17.))
+        .text_color(rgb(MUTED))
+        .child(div().flex_none().text_color(rgb(UI_FAINT)).child("•"))
+        .child(div().flex_1().min_w(px(0.)).child(text))
 }
 
 fn divider() -> Div {
-    div().w(px(1.)).h(px(22.)).bg(rgb(BORDER)).mx_1()
+    div().flex_none().w(px(1.)).h(px(18.)).bg(rgb(UI_LINE)).mx_1p5()
 }
 
 #[cfg(target_os = "macos")]
@@ -9483,10 +10023,6 @@ const SHORTCUT_KEY: &str = "⌘";
 #[cfg(not(target_os = "macos"))]
 const SHORTCUT_KEY: &str = "Ctrl+";
 
-#[cfg(target_os = "macos")]
-const SHORTCUT_TIP: &str = "F8 start/stop · F9 pause · F10 step · ⌘Z undo · ⌘C/⌘V copy/paste · ⌘S save · ⌘D duplicate · ⌫ delete · ⌘G group · ⌘B panel";
-#[cfg(not(target_os = "macos"))]
-const SHORTCUT_TIP: &str = "F8 start/stop · F9 pause · F10 step · Ctrl+Z undo · Ctrl+C/Ctrl+V copy/paste · Ctrl+S save · Ctrl+D duplicate · Delete removes · Ctrl+G group · Ctrl+B panel";
 
 /// Bring MacroFlow back (un-minimise it) after selecting an area.
 fn show_again(window: &mut Window, cx: &mut Context<MacroApp>) {
@@ -9644,11 +10180,12 @@ fn ghost_btn(id: impl Into<ElementId>, label: &'static str, enabled: bool) -> St
         .flex_none()
         .items_center()
         .px_2()
-        .h(px(26.))
+        .h(px(28.))
         .rounded_md()
-        .text_color(rgb(TEXT))
-        .when(enabled, |d| d.hover(|s| s.bg(rgb(BTN_HOVER))).cursor_pointer())
-        .when(!enabled, |d| d.opacity(0.4))
+        .whitespace_nowrap()
+        .text_color(rgb(MUTED))
+        .when(enabled, |d| d.hover(|s| s.bg(rgb(UI_HOVER)).text_color(rgb(TEXT))).cursor_pointer())
+        .when(!enabled, |d| d.opacity(0.35))
         .child(label)
 }
 
