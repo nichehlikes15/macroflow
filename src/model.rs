@@ -878,6 +878,11 @@ pub enum NodeKind {
         /// Optional, so older macros still open (and save as before).
         #[serde(default, skip_serializing_if = "AreaShape::is_plain")]
         area_shape: AreaShape,
+        /// How fast the mouse moves there in this step, in percent, when human-like
+        /// mouse movement is on (0 = the macro's mouse speed). Optional, so older
+        /// macros still open (and save as before).
+        #[serde(default, skip_serializing_if = "is_zero")]
+        move_speed: u32,
     },
     MoveMouse {
         target: Target,
@@ -891,6 +896,8 @@ pub enum NodeKind {
         jitter_px: i32,
         #[serde(default, skip_serializing_if = "AreaShape::is_plain")]
         area_shape: AreaShape,
+        #[serde(default, skip_serializing_if = "is_zero")]
+        move_speed: u32,
     },
     KeyPress {
         key: String,
@@ -1084,6 +1091,7 @@ impl NodeKind {
                 area: None,
                 jitter_px: 0,
                 area_shape: AreaShape::default(),
+                move_speed: 0,
             },
             NodeKind::MoveMouse {
                 target: Target::Fixed,
@@ -1094,6 +1102,7 @@ impl NodeKind {
                 area: None,
                 jitter_px: 0,
                 area_shape: AreaShape::default(),
+                move_speed: 0,
             },
             NodeKind::Drag {
                 from_x: 400,
@@ -1393,14 +1402,16 @@ impl NodeKind {
                 area,
                 jitter_px,
                 area_shape,
+                move_speed,
             } => {
                 let times = if *clicks > 1 {
                     format!(" ×{clicks}")
                 } else {
                     String::new()
                 };
+                let speed = if *move_speed > 0 { format!(" · {move_speed}% speed") } else { String::new() };
                 format!(
-                    "{}{times} {}",
+                    "{}{times} {}{speed}",
                     button.label(),
                     place(target, *x, *y, *offset_x, *offset_y, area, *jitter_px, area_shape)
                 )
@@ -1414,7 +1425,11 @@ impl NodeKind {
                 area,
                 jitter_px,
                 area_shape,
-            } => format!("Move {}", place(target, *x, *y, *offset_x, *offset_y, area, *jitter_px, area_shape)),
+                move_speed,
+            } => {
+                let speed = if *move_speed > 0 { format!(" · {move_speed}% speed") } else { String::new() };
+                format!("Move {}{speed}", place(target, *x, *y, *offset_x, *offset_y, area, *jitter_px, area_shape))
+            }
             NodeKind::KeyPress { key, mods } => crate::keys::combo_label(key, mods),
             NodeKind::TypeText { text, press_enter } => {
                 let short: String = text.chars().take(28).collect();
@@ -4006,6 +4021,21 @@ mod tests {
         }
         let back: NodeKind = serde_json::from_str(&serde_json::to_string(&k2).unwrap()).unwrap();
         assert_eq!(back, k2);
+    }
+
+    #[test]
+    fn per_step_mouse_speed_is_optional() {
+        let old = r#"{"type":"Click","target":"Fixed","x":10,"y":20,"offset_x":0,"offset_y":0,"button":"Left","clicks":1}"#;
+        let k: NodeKind = serde_json::from_str(old).unwrap();
+        assert!(matches!(k, NodeKind::Click { move_speed: 0, .. }));
+        assert!(!serde_json::to_string(&k).unwrap().contains("move_speed"));
+        let mut fast = k.clone();
+        if let NodeKind::Click { move_speed, .. } = &mut fast {
+            *move_speed = 300;
+        }
+        let back: NodeKind = serde_json::from_str(&serde_json::to_string(&fast).unwrap()).unwrap();
+        assert_eq!(back, fast);
+        assert!(fast.summary().contains("300% speed"));
     }
 
     #[test]

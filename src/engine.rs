@@ -1124,13 +1124,19 @@ impl<'a> Runner<'a> {
     /// Move the mouse to (x, y): along a curved, human-like path if that's turned
     /// on, otherwise straight there.
     fn move_to(&mut self, x: i32, y: i32) -> Result<(), String> {
+        self.move_to_at(x, y, 0)
+    }
+
+    /// `move_to` at this step's own speed (percent; 0 = the macro's mouse speed).
+    fn move_to_at(&mut self, x: i32, y: i32, step_speed: u32) -> Result<(), String> {
         if self.doc.human_mouse {
             if let Ok(from) = self.enigo.location() {
                 let (dx, dy) = ((x - from.0) as f64, (y - from.1) as f64);
                 let dist = (dx * dx + dy * dy).sqrt();
                 if dist >= 3.0 {
                     // Longer moves take longer, like a real hand, with some variation.
-                    let speed = self.doc.mouse_speed.clamp(10, 1000) as f64 / 100.0;
+                    let pct = if step_speed > 0 { step_speed } else { self.doc.mouse_speed };
+                    let speed = pct.clamp(10, 1000) as f64 / 100.0;
                     let ms = (120.0 + dist * 0.35).min(1200.0) * (0.8 + 0.4 * self.unit()) / speed;
                     self.glide(from, (x, y), ms, true)?;
                 }
@@ -1230,13 +1236,14 @@ impl<'a> Runner<'a> {
                 area,
                 jitter_px,
                 area_shape,
+                move_speed,
             } => {
                 if let Some((px, py)) =
                     self.resolve(node.id, *target, *x, *y, *offset_x, *offset_y, *area, area_shape, *jitter_px)?
                 {
                     // The green dot goes where it's about to click, then the mouse heads there.
                     self.mark(px, py, true);
-                    self.move_to(px, py)?;
+                    self.move_to_at(px, py, *move_speed)?;
                     self.sleep(25)?;
                 } else {
                     self.mark_here();
@@ -1268,13 +1275,14 @@ impl<'a> Runner<'a> {
                 area,
                 jitter_px,
                 area_shape,
+                move_speed,
             } => {
                 if let Some((px, py)) =
                     self.resolve(node.id, *target, *x, *y, *offset_x, *offset_y, *area, area_shape, *jitter_px)?
                 {
                     // A green ring where the mouse is going (no click).
                     self.mark(px, py, false);
-                    self.move_to(px, py)?;
+                    self.move_to_at(px, py, *move_speed)?;
                     marker::hide();
                     self.log_action(format!("➜ Moved to ({px}, {py})"), vision::Mark::Move, Some((px, py)), None);
                 }
@@ -2076,6 +2084,7 @@ pub fn record_step(tx: Tx, stop: Arc<AtomicBool>) {
                             area: None,
                             jitter_px: 0,
                             area_shape: AreaShape::default(),
+                            move_speed: 0,
                         }),
                     );
                 }

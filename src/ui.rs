@@ -219,6 +219,7 @@ enum Field {
     AreaRotation,
     AreaHollow,
     DragHold,
+    StepMouseSpeed,
     MouseSpeed,
     ScrollStrength,
 }
@@ -2797,6 +2798,10 @@ impl MacroApp {
             }
             (Field::DragHold, NodeKind::Drag { hold_ms, .. }) => hold_ms.to_string(),
             (
+                Field::StepMouseSpeed,
+                NodeKind::Click { move_speed, .. } | NodeKind::MoveMouse { move_speed, .. },
+            ) => move_speed.to_string(),
+            (
                 Field::OffX,
                 NodeKind::Click { offset_x, .. } | NodeKind::MoveMouse { offset_x, .. },
             ) => offset_x.to_string(),
@@ -2959,6 +2964,14 @@ impl MacroApp {
                 }
             }
             (Field::DragHold, NodeKind::Drag { hold_ms, .. }) => *hold_ms = int()?.clamp(0, 10_000) as u64,
+            (
+                Field::StepMouseSpeed,
+                NodeKind::Click { move_speed, .. } | NodeKind::MoveMouse { move_speed, .. },
+            ) => {
+                // 0 = use the macro's speed; otherwise 10–1000 %.
+                let v = int()?.max(0) as u32;
+                *move_speed = if v == 0 { 0 } else { v.clamp(10, 1000) };
+            }
             (
                 Field::OffX,
                 NodeKind::Click { offset_x, .. } | NodeKind::MoveMouse { offset_x, .. },
@@ -7316,6 +7329,45 @@ impl MacroApp {
         out.push(
             help("0 = exactly on the spot. Otherwise it moves up to this many pixels in a random direction each time, and never lands on exactly the same spot twice in a row.")
                 .into_any_element(),
+        );
+        // How fast the mouse gets there in this step (human-like movement only).
+        let step_speed = match self.doc.node(id).map(|n| &n.kind) {
+            Some(NodeKind::Click { move_speed, .. } | NodeKind::MoveMouse { move_speed, .. }) => *move_speed,
+            _ => 0,
+        };
+        out.push(self.num_field("Mouse speed for this step (%, 0 = macro's)", Field::StepMouseSpeed, 25.0, cx).into_any_element());
+        out.push(
+            div()
+                .flex()
+                .flex_wrap()
+                .gap_1()
+                .children([(0u32, "Macro's"), (50, "50%"), (100, "100%"), (200, "200%"), (400, "400%")].into_iter().map(
+                    |(pct, label)| {
+                        chip(("step-speed", pct as usize), label, step_speed == pct).on_click(cx.listener(
+                            move |this, _: &ClickEvent, _, cx| {
+                                this.update_node(id, |k| match k {
+                                    NodeKind::Click { move_speed, .. } | NodeKind::MoveMouse { move_speed, .. } => {
+                                        *move_speed = pct
+                                    }
+                                    _ => {}
+                                });
+                                cx.notify();
+                            },
+                        ))
+                    },
+                ))
+                .into_any_element(),
+        );
+        let macro_speed = self.doc.mouse_speed;
+        out.push(
+            help(&if !self.doc.human_mouse {
+                "Only used when “Human-like mouse movement” is on in the Macro tab. Right now the mouse jumps straight there.".to_string()
+            } else if step_speed == 0 {
+                format!("Uses the macro's mouse speed ({macro_speed}%). Set a number to make just this step faster (e.g. 300) or slower (e.g. 50).")
+            } else {
+                format!("This step moves at {step_speed}% instead of the macro's {macro_speed}%. 200% gets there in half the time.")
+            })
+            .into_any_element(),
         );
         out
     }
