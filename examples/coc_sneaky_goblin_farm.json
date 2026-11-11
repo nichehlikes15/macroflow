@@ -1,0 +1,2320 @@
+{
+  "name": "CoC – Sneaky Goblin farm",
+  "nodes": [
+    {
+      "id": 1,
+      "kind": {
+        "type": "Start"
+      },
+      "x": 60.0,
+      "y": 180.0,
+      "delay_ms": 0,
+      "note": ""
+    },
+    {
+      "id": 2,
+      "kind": {
+        "type": "Group",
+        "name": "Settings – change these",
+        "graph": {
+          "nodes": [
+            {
+              "id": 3,
+              "kind": {
+                "type": "GroupIn"
+              },
+              "x": 60.0,
+              "y": 180.0,
+              "delay_ms": 0,
+              "note": ""
+            },
+            {
+              "id": 4,
+              "kind": {
+                "type": "SetVar",
+                "name": "min_gold",
+                "expr": "800000"
+              },
+              "x": 340.0,
+              "y": 180.0,
+              "delay_ms": 0,
+              "note": "Attack if gold is at least this"
+            },
+            {
+              "id": 5,
+              "kind": {
+                "type": "SetVar",
+                "name": "min_elixir",
+                "expr": "800000"
+              },
+              "x": 620.0,
+              "y": 180.0,
+              "delay_ms": 0,
+              "note": "…or elixir is at least this"
+            },
+            {
+              "id": 6,
+              "kind": {
+                "type": "SetVar",
+                "name": "min_total",
+                "expr": "1400000"
+              },
+              "x": 900.0,
+              "y": 180.0,
+              "delay_ms": 0,
+              "note": "…or gold + elixir together"
+            },
+            {
+              "id": 7,
+              "kind": {
+                "type": "SetVar",
+                "name": "max_skips",
+                "expr": "60"
+              },
+              "x": 1180.0,
+              "y": 180.0,
+              "delay_ms": 0,
+              "note": "Pause after this many Nexts in a row"
+            },
+            {
+              "id": 8,
+              "kind": {
+                "type": "SetVar",
+                "name": "skips",
+                "expr": "0"
+              },
+              "x": 1460.0,
+              "y": 180.0,
+              "delay_ms": 0,
+              "note": ""
+            },
+            {
+              "id": 9,
+              "kind": {
+                "type": "SetVar",
+                "name": "attacks",
+                "expr": "attacks + 0"
+              },
+              "x": 1740.0,
+              "y": 180.0,
+              "delay_ms": 0,
+              "note": "Counts attacks across repeats"
+            },
+            {
+              "id": 10,
+              "kind": {
+                "type": "GroupOut"
+              },
+              "x": 2020.0,
+              "y": 180.0,
+              "delay_ms": 0,
+              "note": ""
+            }
+          ],
+          "edges": [
+            {
+              "from": 3,
+              "port": 0,
+              "to": 4
+            },
+            {
+              "from": 4,
+              "port": 0,
+              "to": 5
+            },
+            {
+              "from": 5,
+              "port": 0,
+              "to": 6
+            },
+            {
+              "from": 6,
+              "port": 0,
+              "to": 7
+            },
+            {
+              "from": 7,
+              "port": 0,
+              "to": 8
+            },
+            {
+              "from": 8,
+              "port": 0,
+              "to": 9
+            },
+            {
+              "from": 9,
+              "port": 0,
+              "to": 10
+            }
+          ]
+        }
+      },
+      "x": 340.0,
+      "y": 180.0,
+      "delay_ms": 0,
+      "note": "Loot you need to attack, and limits"
+    },
+    {
+      "id": 11,
+      "kind": {
+        "type": "WindowCheck",
+        "scope": "AnyOpen",
+        "field": "Either",
+        "mode": "Contains",
+        "text": "Clash of Clans",
+        "case_sensitive": false,
+        "timeout_ms": 3000,
+        "interval_ms": 250,
+        "bring_to_front": true
+      },
+      "x": 620.0,
+      "y": 180.0,
+      "delay_ms": 0,
+      "note": "Brings the game to the front"
+    },
+    {
+      "id": 12,
+      "kind": {
+        "type": "Notify",
+        "title": "Clash of Clans isn't open",
+        "message": "Open it in Google Play Games (full screen), then click here to carry on.",
+        "style": "Error",
+        "position": "TopCenter",
+        "duration_ms": 6000,
+        "wait_for_click": true,
+        "sound": true
+      },
+      "x": 620.0,
+      "y": 360.0,
+      "delay_ms": 0,
+      "note": ""
+    },
+    {
+      "id": 13,
+      "kind": {
+        "type": "Group",
+        "name": "Stop when my storages are full",
+        "graph": {
+          "nodes": [
+            {
+              "id": 14,
+              "kind": {
+                "type": "GroupIn"
+              },
+              "x": 60.0,
+              "y": 180.0,
+              "delay_ms": 0,
+              "note": ""
+            },
+            {
+              "id": 15,
+              "kind": {
+                "type": "ReadText",
+                "x": 1500,
+                "y": 25,
+                "w": 240,
+                "h": 40,
+                "compare": "NotEmpty",
+                "value": "",
+                "case_sensitive": false,
+                "timeout_ms": 3000,
+                "interval_ms": 400,
+                "preview": null,
+                "numbers_only": true,
+                "save_to": "home_gold"
+              },
+              "x": 340.0,
+              "y": 180.0,
+              "delay_ms": 0,
+              "note": "Your gold, top right of the home screen"
+            },
+            {
+              "id": 16,
+              "kind": {
+                "type": "IfCompare",
+                "left": "home_gold",
+                "op": "Ge",
+                "right": "24000000"
+              },
+              "x": 620.0,
+              "y": 180.0,
+              "delay_ms": 0,
+              "note": "Your storage capacity (change it)"
+            },
+            {
+              "id": 17,
+              "kind": {
+                "type": "Notify",
+                "title": "Storages are full",
+                "message": "Gold is {home_gold}. Spend it, then click here to carry on.",
+                "style": "Success",
+                "position": "TopCenter",
+                "duration_ms": 6000,
+                "wait_for_click": true,
+                "sound": true
+              },
+              "x": 900.0,
+              "y": 60.0,
+              "delay_ms": 0,
+              "note": ""
+            },
+            {
+              "id": 18,
+              "kind": {
+                "type": "GroupOut"
+              },
+              "x": 1180.0,
+              "y": 180.0,
+              "delay_ms": 0,
+              "note": ""
+            }
+          ],
+          "edges": [
+            {
+              "from": 14,
+              "port": 0,
+              "to": 15
+            },
+            {
+              "from": 15,
+              "port": 0,
+              "to": 16
+            },
+            {
+              "from": 15,
+              "port": 1,
+              "to": 18
+            },
+            {
+              "from": 16,
+              "port": 0,
+              "to": 17
+            },
+            {
+              "from": 16,
+              "port": 1,
+              "to": 18
+            },
+            {
+              "from": 17,
+              "port": 0,
+              "to": 18
+            }
+          ]
+        }
+      },
+      "x": 900.0,
+      "y": 180.0,
+      "delay_ms": 0,
+      "note": "Optional – enable it and select the area",
+      "disabled": true
+    },
+    {
+      "id": 19,
+      "kind": {
+        "type": "Group",
+        "name": "Home: refill the army",
+        "graph": {
+          "nodes": [
+            {
+              "id": 20,
+              "kind": {
+                "type": "GroupIn"
+              },
+              "x": 60.0,
+              "y": 180.0,
+              "delay_ms": 0,
+              "note": ""
+            },
+            {
+              "id": 21,
+              "kind": {
+                "type": "Click",
+                "target": "Fixed",
+                "x": 90,
+                "y": 880,
+                "offset_x": 0,
+                "offset_y": 0,
+                "button": "Left",
+                "clicks": 1,
+                "area": null,
+                "jitter_px": 5
+              },
+              "x": 340.0,
+              "y": 180.0,
+              "delay_ms": 0,
+              "note": "Army / Train button (bottom left) – Pick it",
+              "name": "Open Army"
+            },
+            {
+              "id": 22,
+              "kind": {
+                "type": "Wait",
+                "ms": 900,
+                "jitter_ms": 300
+              },
+              "x": 620.0,
+              "y": 180.0,
+              "delay_ms": 0,
+              "note": ""
+            },
+            {
+              "id": 23,
+              "kind": {
+                "type": "Click",
+                "target": "Fixed",
+                "x": 1500,
+                "y": 180,
+                "offset_x": 0,
+                "offset_y": 0,
+                "button": "Left",
+                "clicks": 1,
+                "area": null,
+                "jitter_px": 5
+              },
+              "x": 900.0,
+              "y": 180.0,
+              "delay_ms": 0,
+              "note": "Quick Train / Saved Recipes tab – Pick it",
+              "name": "Recipes tab"
+            },
+            {
+              "id": 24,
+              "kind": {
+                "type": "Wait",
+                "ms": 700,
+                "jitter_ms": 250
+              },
+              "x": 1180.0,
+              "y": 180.0,
+              "delay_ms": 0,
+              "note": ""
+            },
+            {
+              "id": 25,
+              "kind": {
+                "type": "Click",
+                "target": "Fixed",
+                "x": 1650,
+                "y": 420,
+                "offset_x": 0,
+                "offset_y": 0,
+                "button": "Left",
+                "clicks": 1,
+                "area": null,
+                "jitter_px": 5
+              },
+              "x": 1460.0,
+              "y": 180.0,
+              "delay_ms": 0,
+              "note": "“Use” / “Train” on your Sneaky Goblin recipe – Pick it",
+              "name": "Use recipe"
+            },
+            {
+              "id": 26,
+              "kind": {
+                "type": "Wait",
+                "ms": 700,
+                "jitter_ms": 250
+              },
+              "x": 1740.0,
+              "y": 180.0,
+              "delay_ms": 0,
+              "note": ""
+            },
+            {
+              "id": 27,
+              "kind": {
+                "type": "FindImage",
+                "template": null,
+                "threshold": 0.85,
+                "timeout_ms": 2500,
+                "interval_ms": 250,
+                "click_when_found": false,
+                "search_area": null
+              },
+              "x": 2020.0,
+              "y": 180.0,
+              "delay_ms": 0,
+              "note": "Snip a Sneaky Goblin icon in the army list",
+              "name": "Sneaky Goblins in army?"
+            },
+            {
+              "id": 28,
+              "kind": {
+                "type": "Notify",
+                "title": "No Sneaky Goblins in the army",
+                "message": "The Super Troop boost may have run out. Boost them in the Super Sauna, then click here.",
+                "style": "Error",
+                "position": "TopCenter",
+                "duration_ms": 6000,
+                "wait_for_click": true,
+                "sound": true
+              },
+              "x": 2020.0,
+              "y": 360.0,
+              "delay_ms": 0,
+              "note": ""
+            },
+            {
+              "id": 29,
+              "kind": {
+                "type": "KeyPress",
+                "key": "escape",
+                "mods": {
+                  "cmd": false,
+                  "shift": false,
+                  "alt": false,
+                  "ctrl": false
+                }
+              },
+              "x": 2300.0,
+              "y": 180.0,
+              "delay_ms": 0,
+              "note": "Close the army window"
+            },
+            {
+              "id": 30,
+              "kind": {
+                "type": "Wait",
+                "ms": 600,
+                "jitter_ms": 200
+              },
+              "x": 2580.0,
+              "y": 180.0,
+              "delay_ms": 0,
+              "note": ""
+            },
+            {
+              "id": 31,
+              "kind": {
+                "type": "GroupOut"
+              },
+              "x": 2860.0,
+              "y": 180.0,
+              "delay_ms": 0,
+              "note": ""
+            }
+          ],
+          "edges": [
+            {
+              "from": 20,
+              "port": 0,
+              "to": 21
+            },
+            {
+              "from": 21,
+              "port": 0,
+              "to": 22
+            },
+            {
+              "from": 22,
+              "port": 0,
+              "to": 23
+            },
+            {
+              "from": 23,
+              "port": 0,
+              "to": 24
+            },
+            {
+              "from": 24,
+              "port": 0,
+              "to": 25
+            },
+            {
+              "from": 25,
+              "port": 0,
+              "to": 26
+            },
+            {
+              "from": 26,
+              "port": 0,
+              "to": 27
+            },
+            {
+              "from": 27,
+              "port": 0,
+              "to": 29
+            },
+            {
+              "from": 27,
+              "port": 1,
+              "to": 28
+            },
+            {
+              "from": 28,
+              "port": 0,
+              "to": 29
+            },
+            {
+              "from": 29,
+              "port": 0,
+              "to": 30
+            },
+            {
+              "from": 30,
+              "port": 0,
+              "to": 31
+            }
+          ]
+        }
+      },
+      "x": 1180.0,
+      "y": 180.0,
+      "delay_ms": 0,
+      "note": "Army button → Use your saved Sneaky Goblin recipe"
+    },
+    {
+      "id": 32,
+      "kind": {
+        "type": "Group",
+        "name": "Find a match",
+        "graph": {
+          "nodes": [
+            {
+              "id": 33,
+              "kind": {
+                "type": "GroupIn"
+              },
+              "x": 60.0,
+              "y": 180.0,
+              "delay_ms": 0,
+              "note": ""
+            },
+            {
+              "id": 34,
+              "kind": {
+                "type": "Click",
+                "target": "Fixed",
+                "x": 110,
+                "y": 980,
+                "offset_x": 0,
+                "offset_y": 0,
+                "button": "Left",
+                "clicks": 1,
+                "area": null,
+                "jitter_px": 5
+              },
+              "x": 340.0,
+              "y": 180.0,
+              "delay_ms": 0,
+              "note": "Attack! button (bottom left) – Pick it",
+              "name": "Attack button"
+            },
+            {
+              "id": 35,
+              "kind": {
+                "type": "Wait",
+                "ms": 1200,
+                "jitter_ms": 400
+              },
+              "x": 620.0,
+              "y": 180.0,
+              "delay_ms": 0,
+              "note": ""
+            },
+            {
+              "id": 36,
+              "kind": {
+                "type": "Click",
+                "target": "Fixed",
+                "x": 560,
+                "y": 640,
+                "offset_x": 0,
+                "offset_y": 0,
+                "button": "Left",
+                "clicks": 1,
+                "area": null,
+                "jitter_px": 5
+              },
+              "x": 900.0,
+              "y": 180.0,
+              "delay_ms": 0,
+              "note": "Regular “Battles” / Find a Match (NOT Ranked) – Pick it",
+              "name": "Battles"
+            },
+            {
+              "id": 37,
+              "kind": {
+                "type": "Wait",
+                "ms": 900,
+                "jitter_ms": 300
+              },
+              "x": 1180.0,
+              "y": 180.0,
+              "delay_ms": 0,
+              "note": ""
+            },
+            {
+              "id": 38,
+              "kind": {
+                "type": "Click",
+                "target": "Fixed",
+                "x": 1600,
+                "y": 930,
+                "offset_x": 0,
+                "offset_y": 0,
+                "button": "Left",
+                "clicks": 1,
+                "area": null,
+                "jitter_px": 5
+              },
+              "x": 1460.0,
+              "y": 180.0,
+              "delay_ms": 0,
+              "note": "Army confirm “Attack!” – disable this step if your game has no confirm screen",
+              "name": "Confirm attack"
+            },
+            {
+              "id": 39,
+              "kind": {
+                "type": "GroupOut"
+              },
+              "x": 1740.0,
+              "y": 180.0,
+              "delay_ms": 0,
+              "note": ""
+            }
+          ],
+          "edges": [
+            {
+              "from": 33,
+              "port": 0,
+              "to": 34
+            },
+            {
+              "from": 34,
+              "port": 0,
+              "to": 35
+            },
+            {
+              "from": 35,
+              "port": 0,
+              "to": 36
+            },
+            {
+              "from": 36,
+              "port": 0,
+              "to": 37
+            },
+            {
+              "from": 37,
+              "port": 0,
+              "to": 38
+            },
+            {
+              "from": 38,
+              "port": 0,
+              "to": 39
+            }
+          ]
+        }
+      },
+      "x": 1460.0,
+      "y": 180.0,
+      "delay_ms": 0,
+      "note": "Attack → Battles (not Ranked)"
+    },
+    {
+      "id": 40,
+      "kind": {
+        "type": "FindImage",
+        "template": null,
+        "threshold": 0.85,
+        "timeout_ms": 15000,
+        "interval_ms": 400,
+        "click_when_found": false,
+        "search_area": null
+      },
+      "x": 1740.0,
+      "y": 180.0,
+      "delay_ms": 0,
+      "note": "Snip the Next button. Waits for the clouds to clear",
+      "name": "Base loaded?"
+    },
+    {
+      "id": 41,
+      "kind": {
+        "type": "Notify",
+        "title": "No base appeared",
+        "message": "Couldn't see the Next button after 15 s (out of gold, or a pop-up?). Fix it, then click here.",
+        "style": "Error",
+        "position": "TopCenter",
+        "duration_ms": 6000,
+        "wait_for_click": true,
+        "sound": true
+      },
+      "x": 1740.0,
+      "y": 360.0,
+      "delay_ms": 0,
+      "note": ""
+    },
+    {
+      "id": 42,
+      "kind": {
+        "type": "Group",
+        "name": "Read the loot",
+        "graph": {
+          "nodes": [
+            {
+              "id": 43,
+              "kind": {
+                "type": "GroupIn"
+              },
+              "x": 60.0,
+              "y": 180.0,
+              "delay_ms": 0,
+              "note": ""
+            },
+            {
+              "id": 44,
+              "kind": {
+                "type": "Wait",
+                "ms": 500,
+                "jitter_ms": 200
+              },
+              "x": 340.0,
+              "y": 180.0,
+              "delay_ms": 0,
+              "note": "Let the numbers settle"
+            },
+            {
+              "id": 45,
+              "kind": {
+                "type": "ReadText",
+                "x": 40,
+                "y": 135,
+                "w": 260,
+                "h": 42,
+                "compare": "NotEmpty",
+                "value": "",
+                "case_sensitive": false,
+                "timeout_ms": 3000,
+                "interval_ms": 400,
+                "preview": null,
+                "numbers_only": true,
+                "save_to": "gold"
+              },
+              "x": 620.0,
+              "y": 180.0,
+              "delay_ms": 0,
+              "note": "Select the gold number (top left)",
+              "name": "Read gold"
+            },
+            {
+              "id": 46,
+              "kind": {
+                "type": "SetVar",
+                "name": "gold",
+                "expr": "0"
+              },
+              "x": 620.0,
+              "y": 360.0,
+              "delay_ms": 0,
+              "note": "Couldn't read it"
+            },
+            {
+              "id": 47,
+              "kind": {
+                "type": "ReadText",
+                "x": 40,
+                "y": 185,
+                "w": 260,
+                "h": 42,
+                "compare": "NotEmpty",
+                "value": "",
+                "case_sensitive": false,
+                "timeout_ms": 3000,
+                "interval_ms": 400,
+                "preview": null,
+                "numbers_only": true,
+                "save_to": "elixir"
+              },
+              "x": 900.0,
+              "y": 180.0,
+              "delay_ms": 0,
+              "note": "Select the elixir number",
+              "name": "Read elixir"
+            },
+            {
+              "id": 48,
+              "kind": {
+                "type": "SetVar",
+                "name": "elixir",
+                "expr": "0"
+              },
+              "x": 900.0,
+              "y": 360.0,
+              "delay_ms": 0,
+              "note": "Couldn't read it"
+            },
+            {
+              "id": 49,
+              "kind": {
+                "type": "SetVar",
+                "name": "total",
+                "expr": "gold + elixir"
+              },
+              "x": 1180.0,
+              "y": 180.0,
+              "delay_ms": 0,
+              "note": ""
+            },
+            {
+              "id": 50,
+              "kind": {
+                "type": "GroupOut"
+              },
+              "x": 1460.0,
+              "y": 180.0,
+              "delay_ms": 0,
+              "note": ""
+            }
+          ],
+          "edges": [
+            {
+              "from": 43,
+              "port": 0,
+              "to": 44
+            },
+            {
+              "from": 44,
+              "port": 0,
+              "to": 45
+            },
+            {
+              "from": 45,
+              "port": 0,
+              "to": 47
+            },
+            {
+              "from": 45,
+              "port": 1,
+              "to": 46
+            },
+            {
+              "from": 46,
+              "port": 0,
+              "to": 47
+            },
+            {
+              "from": 47,
+              "port": 0,
+              "to": 49
+            },
+            {
+              "from": 47,
+              "port": 1,
+              "to": 48
+            },
+            {
+              "from": 48,
+              "port": 0,
+              "to": 49
+            },
+            {
+              "from": 49,
+              "port": 0,
+              "to": 50
+            }
+          ]
+        }
+      },
+      "x": 2020.0,
+      "y": 180.0,
+      "delay_ms": 0,
+      "note": "Top-left “Available loot” numbers"
+    },
+    {
+      "id": 51,
+      "kind": {
+        "type": "IfCompare",
+        "left": "gold",
+        "op": "Ge",
+        "right": "min_gold"
+      },
+      "x": 2300.0,
+      "y": 180.0,
+      "delay_ms": 0,
+      "note": "Enough gold?"
+    },
+    {
+      "id": 52,
+      "kind": {
+        "type": "IfCompare",
+        "left": "elixir",
+        "op": "Ge",
+        "right": "min_elixir"
+      },
+      "x": 2300.0,
+      "y": 360.0,
+      "delay_ms": 0,
+      "note": "Enough elixir?"
+    },
+    {
+      "id": 53,
+      "kind": {
+        "type": "IfCompare",
+        "left": "total",
+        "op": "Ge",
+        "right": "min_total"
+      },
+      "x": 2300.0,
+      "y": 540.0,
+      "delay_ms": 0,
+      "note": "Enough together?"
+    },
+    {
+      "id": 54,
+      "kind": {
+        "type": "SetVar",
+        "name": "skips",
+        "expr": "skips + 1"
+      },
+      "x": 2300.0,
+      "y": 720.0,
+      "delay_ms": 0,
+      "note": "Not worth it"
+    },
+    {
+      "id": 55,
+      "kind": {
+        "type": "IfCompare",
+        "left": "skips",
+        "op": "Ge",
+        "right": "max_skips"
+      },
+      "x": 2580.0,
+      "y": 720.0,
+      "delay_ms": 0,
+      "note": "Skipped too many?"
+    },
+    {
+      "id": 56,
+      "kind": {
+        "type": "Notify",
+        "title": "Skipped {skips} bases",
+        "message": "Still no base with enough loot. Check the thresholds in Settings (and your gold for Next), then click here.",
+        "style": "Warning",
+        "position": "TopCenter",
+        "duration_ms": 6000,
+        "wait_for_click": true,
+        "sound": true
+      },
+      "x": 2860.0,
+      "y": 900.0,
+      "delay_ms": 0,
+      "note": ""
+    },
+    {
+      "id": 57,
+      "kind": {
+        "type": "SetVar",
+        "name": "skips",
+        "expr": "0"
+      },
+      "x": 3140.0,
+      "y": 900.0,
+      "delay_ms": 0,
+      "note": ""
+    },
+    {
+      "id": 58,
+      "kind": {
+        "type": "Click",
+        "target": "Fixed",
+        "x": 1770,
+        "y": 860,
+        "offset_x": 0,
+        "offset_y": 0,
+        "button": "Left",
+        "clicks": 1,
+        "area": null,
+        "jitter_px": 6
+      },
+      "x": 2860.0,
+      "y": 720.0,
+      "delay_ms": 0,
+      "note": "Next button (bottom right) – Pick it",
+      "name": "Next"
+    },
+    {
+      "id": 59,
+      "kind": {
+        "type": "Wait",
+        "ms": 1500,
+        "jitter_ms": 600
+      },
+      "x": 3140.0,
+      "y": 720.0,
+      "delay_ms": 0,
+      "note": "Clouds"
+    },
+    {
+      "id": 60,
+      "kind": {
+        "type": "Group",
+        "name": "Attack with Sneaky Goblins",
+        "graph": {
+          "nodes": [
+            {
+              "id": 61,
+              "kind": {
+                "type": "GroupIn"
+              },
+              "x": 60.0,
+              "y": 180.0,
+              "delay_ms": 0,
+              "note": ""
+            },
+            {
+              "id": 62,
+              "kind": {
+                "type": "SetVar",
+                "name": "skips",
+                "expr": "0"
+              },
+              "x": 340.0,
+              "y": 180.0,
+              "delay_ms": 0,
+              "note": ""
+            },
+            {
+              "id": 63,
+              "kind": {
+                "type": "MoveMouse",
+                "target": "Fixed",
+                "x": 960,
+                "y": 520,
+                "offset_x": 0,
+                "offset_y": 0,
+                "area": null,
+                "jitter_px": 20
+              },
+              "x": 620.0,
+              "y": 180.0,
+              "delay_ms": 0,
+              "note": "Middle of the base"
+            },
+            {
+              "id": 64,
+              "kind": {
+                "type": "Scroll",
+                "amount": 6,
+                "horizontal": false
+              },
+              "x": 900.0,
+              "y": 180.0,
+              "delay_ms": 0,
+              "note": "Zoom right out (check: down = out)",
+              "name": "Zoom out"
+            },
+            {
+              "id": 65,
+              "kind": {
+                "type": "Wait",
+                "ms": 500,
+                "jitter_ms": 200
+              },
+              "x": 1180.0,
+              "y": 180.0,
+              "delay_ms": 0,
+              "note": ""
+            },
+            {
+              "id": 66,
+              "kind": {
+                "type": "FindImage",
+                "template": null,
+                "threshold": 0.85,
+                "timeout_ms": 2500,
+                "interval_ms": 250,
+                "click_when_found": true,
+                "search_area": null
+              },
+              "x": 1460.0,
+              "y": 180.0,
+              "delay_ms": 0,
+              "note": "Snip the Sneaky Goblin card in the troop bar",
+              "name": "Select goblins"
+            },
+            {
+              "id": 67,
+              "kind": {
+                "type": "Notify",
+                "title": "No Sneaky Goblin card",
+                "message": "Couldn't find the goblins in the troop bar. Surrendering this one.",
+                "style": "Error",
+                "position": "TopCenter",
+                "duration_ms": 6000,
+                "wait_for_click": false,
+                "sound": true
+              },
+              "x": 1460.0,
+              "y": 360.0,
+              "delay_ms": 0,
+              "note": ""
+            },
+            {
+              "id": 68,
+              "kind": {
+                "type": "Drag",
+                "from_x": 150,
+                "from_y": 520,
+                "to_x": 960,
+                "to_y": 60,
+                "button": "Left",
+                "duration_ms": 1400
+              },
+              "x": 1740.0,
+              "y": 180.0,
+              "delay_ms": 0,
+              "note": "Left corner → top corner, just outside the red line",
+              "name": "Goblins: left→top"
+            },
+            {
+              "id": 69,
+              "kind": {
+                "type": "Drag",
+                "from_x": 960,
+                "from_y": 60,
+                "to_x": 1770,
+                "to_y": 520,
+                "button": "Left",
+                "duration_ms": 1400
+              },
+              "x": 2020.0,
+              "y": 180.0,
+              "delay_ms": 0,
+              "note": "Top → right",
+              "name": "Goblins: top→right"
+            },
+            {
+              "id": 70,
+              "kind": {
+                "type": "Drag",
+                "from_x": 1770,
+                "from_y": 520,
+                "to_x": 960,
+                "to_y": 900,
+                "button": "Left",
+                "duration_ms": 1200
+              },
+              "x": 2300.0,
+              "y": 180.0,
+              "delay_ms": 0,
+              "note": "Right → bottom (keep above the troop bar)",
+              "name": "Goblins: right→bottom"
+            },
+            {
+              "id": 71,
+              "kind": {
+                "type": "Drag",
+                "from_x": 960,
+                "from_y": 900,
+                "to_x": 150,
+                "to_y": 520,
+                "button": "Left",
+                "duration_ms": 1200
+              },
+              "x": 2580.0,
+              "y": 180.0,
+              "delay_ms": 0,
+              "note": "Bottom → left",
+              "name": "Goblins: bottom→left"
+            },
+            {
+              "id": 72,
+              "kind": {
+                "type": "Wait",
+                "ms": 1200,
+                "jitter_ms": 400
+              },
+              "x": 2860.0,
+              "y": 180.0,
+              "delay_ms": 0,
+              "note": "Let them run in (cloaked ~5 s)"
+            },
+            {
+              "id": 73,
+              "kind": {
+                "type": "FindImage",
+                "template": null,
+                "threshold": 0.85,
+                "timeout_ms": 1500,
+                "interval_ms": 250,
+                "click_when_found": true,
+                "search_area": null
+              },
+              "x": 3140.0,
+              "y": 180.0,
+              "delay_ms": 0,
+              "note": "Snip the Jump spell card",
+              "name": "Select Jump spell"
+            },
+            {
+              "id": 74,
+              "kind": {
+                "type": "FindImage",
+                "template": null,
+                "threshold": 0.75,
+                "timeout_ms": 1200,
+                "interval_ms": 250,
+                "click_when_found": false,
+                "search_area": null
+              },
+              "x": 3420.0,
+              "y": 180.0,
+              "delay_ms": 0,
+              "note": "Snip a gold storage (seen from fully zoomed out)",
+              "name": "Find gold storage"
+            },
+            {
+              "id": 75,
+              "kind": {
+                "type": "Click",
+                "target": "FoundImage",
+                "x": 0,
+                "y": 0,
+                "offset_x": 0,
+                "offset_y": 0,
+                "button": "Left",
+                "clicks": 1,
+                "area": null,
+                "jitter_px": 12
+              },
+              "x": 3700.0,
+              "y": 180.0,
+              "delay_ms": 0,
+              "note": "Jump spell on it",
+              "name": "Jump → gold storage"
+            },
+            {
+              "id": 76,
+              "kind": {
+                "type": "FindImage",
+                "template": null,
+                "threshold": 0.85,
+                "timeout_ms": 1500,
+                "interval_ms": 250,
+                "click_when_found": true,
+                "search_area": null
+              },
+              "x": 3980.0,
+              "y": 180.0,
+              "delay_ms": 0,
+              "note": "Same Jump spell card",
+              "name": "Select Jump spell (2)"
+            },
+            {
+              "id": 77,
+              "kind": {
+                "type": "FindImage",
+                "template": null,
+                "threshold": 0.75,
+                "timeout_ms": 1200,
+                "interval_ms": 250,
+                "click_when_found": false,
+                "search_area": null
+              },
+              "x": 4260.0,
+              "y": 180.0,
+              "delay_ms": 0,
+              "note": "Snip an elixir storage",
+              "name": "Find elixir storage"
+            },
+            {
+              "id": 78,
+              "kind": {
+                "type": "Click",
+                "target": "FoundImage",
+                "x": 0,
+                "y": 0,
+                "offset_x": 0,
+                "offset_y": 0,
+                "button": "Left",
+                "clicks": 1,
+                "area": null,
+                "jitter_px": 12
+              },
+              "x": 4540.0,
+              "y": 180.0,
+              "delay_ms": 0,
+              "note": "Second Jump spell on it",
+              "name": "Jump → elixir storage"
+            },
+            {
+              "id": 79,
+              "kind": {
+                "type": "FindImage",
+                "template": null,
+                "threshold": 0.85,
+                "timeout_ms": 1500,
+                "interval_ms": 250,
+                "click_when_found": true,
+                "search_area": null
+              },
+              "x": 4820.0,
+              "y": 180.0,
+              "delay_ms": 0,
+              "note": "Snip the Haste (or Rage) spell card",
+              "name": "Select Haste"
+            },
+            {
+              "id": 80,
+              "kind": {
+                "type": "FindImage",
+                "template": null,
+                "threshold": 0.75,
+                "timeout_ms": 1200,
+                "interval_ms": 250,
+                "click_when_found": false,
+                "search_area": null
+              },
+              "x": 5100.0,
+              "y": 180.0,
+              "delay_ms": 0,
+              "note": "Gold storage again",
+              "name": "Find gold storage (2)"
+            },
+            {
+              "id": 81,
+              "kind": {
+                "type": "Click",
+                "target": "FoundImage",
+                "x": 0,
+                "y": 0,
+                "offset_x": 0,
+                "offset_y": 0,
+                "button": "Left",
+                "clicks": 1,
+                "area": null,
+                "jitter_px": 12
+              },
+              "x": 5380.0,
+              "y": 180.0,
+              "delay_ms": 0,
+              "note": "Haste on the goblins' path",
+              "name": "Haste → storage"
+            },
+            {
+              "id": 82,
+              "kind": {
+                "type": "GroupOut"
+              },
+              "x": 5660.0,
+              "y": 180.0,
+              "delay_ms": 0,
+              "note": ""
+            },
+            {
+              "id": 83,
+              "kind": {
+                "type": "GroupOut"
+              },
+              "x": 1740.0,
+              "y": 360.0,
+              "delay_ms": 0,
+              "note": ""
+            }
+          ],
+          "edges": [
+            {
+              "from": 61,
+              "port": 0,
+              "to": 62
+            },
+            {
+              "from": 62,
+              "port": 0,
+              "to": 63
+            },
+            {
+              "from": 63,
+              "port": 0,
+              "to": 64
+            },
+            {
+              "from": 64,
+              "port": 0,
+              "to": 65
+            },
+            {
+              "from": 65,
+              "port": 0,
+              "to": 66
+            },
+            {
+              "from": 66,
+              "port": 0,
+              "to": 68
+            },
+            {
+              "from": 68,
+              "port": 0,
+              "to": 69
+            },
+            {
+              "from": 69,
+              "port": 0,
+              "to": 70
+            },
+            {
+              "from": 70,
+              "port": 0,
+              "to": 71
+            },
+            {
+              "from": 71,
+              "port": 0,
+              "to": 72
+            },
+            {
+              "from": 72,
+              "port": 0,
+              "to": 73
+            },
+            {
+              "from": 73,
+              "port": 0,
+              "to": 74
+            },
+            {
+              "from": 73,
+              "port": 1,
+              "to": 79
+            },
+            {
+              "from": 74,
+              "port": 0,
+              "to": 75
+            },
+            {
+              "from": 74,
+              "port": 1,
+              "to": 76
+            },
+            {
+              "from": 75,
+              "port": 0,
+              "to": 76
+            },
+            {
+              "from": 76,
+              "port": 0,
+              "to": 77
+            },
+            {
+              "from": 76,
+              "port": 1,
+              "to": 79
+            },
+            {
+              "from": 77,
+              "port": 0,
+              "to": 78
+            },
+            {
+              "from": 77,
+              "port": 1,
+              "to": 79
+            },
+            {
+              "from": 78,
+              "port": 0,
+              "to": 79
+            },
+            {
+              "from": 79,
+              "port": 0,
+              "to": 80
+            },
+            {
+              "from": 79,
+              "port": 1,
+              "to": 82
+            },
+            {
+              "from": 80,
+              "port": 0,
+              "to": 81
+            },
+            {
+              "from": 80,
+              "port": 1,
+              "to": 82
+            },
+            {
+              "from": 81,
+              "port": 0,
+              "to": 82
+            },
+            {
+              "from": 66,
+              "port": 1,
+              "to": 67
+            },
+            {
+              "from": 67,
+              "port": 0,
+              "to": 83
+            }
+          ]
+        }
+      },
+      "x": 2580.0,
+      "y": 180.0,
+      "delay_ms": 0,
+      "note": "Zoom out, goblins round the edge, Jump spells on the storages"
+    },
+    {
+      "id": 84,
+      "kind": {
+        "type": "Group",
+        "name": "Clan Castle + heroes (optional)",
+        "graph": {
+          "nodes": [
+            {
+              "id": 85,
+              "kind": {
+                "type": "GroupIn"
+              },
+              "x": 60.0,
+              "y": 180.0,
+              "delay_ms": 0,
+              "note": ""
+            },
+            {
+              "id": 86,
+              "kind": {
+                "type": "FindImage",
+                "template": null,
+                "threshold": 0.85,
+                "timeout_ms": 1500,
+                "interval_ms": 250,
+                "click_when_found": true,
+                "search_area": null
+              },
+              "x": 340.0,
+              "y": 180.0,
+              "delay_ms": 0,
+              "note": "Snip the Clan Castle card",
+              "name": "Select Clan Castle"
+            },
+            {
+              "id": 87,
+              "kind": {
+                "type": "Click",
+                "target": "Fixed",
+                "x": 560,
+                "y": 280,
+                "offset_x": 0,
+                "offset_y": 0,
+                "button": "Left",
+                "clicks": 1,
+                "area": null,
+                "jitter_px": 15
+              },
+              "x": 620.0,
+              "y": 180.0,
+              "delay_ms": 0,
+              "note": "Drop point on the edge – Pick it"
+            },
+            {
+              "id": 88,
+              "kind": {
+                "type": "FindImage",
+                "template": null,
+                "threshold": 0.85,
+                "timeout_ms": 1500,
+                "interval_ms": 250,
+                "click_when_found": true,
+                "search_area": null
+              },
+              "x": 900.0,
+              "y": 180.0,
+              "delay_ms": 0,
+              "note": "Snip a hero card",
+              "name": "Select hero"
+            },
+            {
+              "id": 89,
+              "kind": {
+                "type": "Click",
+                "target": "Fixed",
+                "x": 1360,
+                "y": 280,
+                "offset_x": 0,
+                "offset_y": 0,
+                "button": "Left",
+                "clicks": 1,
+                "area": null,
+                "jitter_px": 15
+              },
+              "x": 1180.0,
+              "y": 180.0,
+              "delay_ms": 0,
+              "note": "Drop point on the edge – Pick it"
+            },
+            {
+              "id": 90,
+              "kind": {
+                "type": "GroupOut"
+              },
+              "x": 1460.0,
+              "y": 180.0,
+              "delay_ms": 0,
+              "note": ""
+            }
+          ],
+          "edges": [
+            {
+              "from": 85,
+              "port": 0,
+              "to": 86
+            },
+            {
+              "from": 86,
+              "port": 0,
+              "to": 87
+            },
+            {
+              "from": 86,
+              "port": 1,
+              "to": 88
+            },
+            {
+              "from": 87,
+              "port": 0,
+              "to": 88
+            },
+            {
+              "from": 88,
+              "port": 0,
+              "to": 89
+            },
+            {
+              "from": 88,
+              "port": 1,
+              "to": 90
+            },
+            {
+              "from": 89,
+              "port": 0,
+              "to": 90
+            }
+          ]
+        }
+      },
+      "x": 2860.0,
+      "y": 180.0,
+      "delay_ms": 0,
+      "note": "Enable after snipping the cards",
+      "disabled": true
+    },
+    {
+      "id": 91,
+      "kind": {
+        "type": "Group",
+        "name": "Watch the raid",
+        "graph": {
+          "nodes": [
+            {
+              "id": 92,
+              "kind": {
+                "type": "GroupIn"
+              },
+              "x": 60.0,
+              "y": 180.0,
+              "delay_ms": 0,
+              "note": ""
+            },
+            {
+              "id": 93,
+              "kind": {
+                "type": "Wait",
+                "ms": 8000,
+                "jitter_ms": 2000
+              },
+              "x": 340.0,
+              "y": 180.0,
+              "delay_ms": 0,
+              "note": "Give them time to loot"
+            },
+            {
+              "id": 94,
+              "kind": {
+                "type": "Loop",
+                "count": 30
+              },
+              "x": 620.0,
+              "y": 180.0,
+              "delay_ms": 0,
+              "note": "Up to ~3 minutes"
+            },
+            {
+              "id": 95,
+              "kind": {
+                "type": "FindImage",
+                "template": null,
+                "threshold": 0.85,
+                "timeout_ms": 600,
+                "interval_ms": 250,
+                "click_when_found": false,
+                "search_area": null
+              },
+              "x": 900.0,
+              "y": 180.0,
+              "delay_ms": 0,
+              "note": "Same Return Home picture as below",
+              "name": "Battle over?"
+            },
+            {
+              "id": 96,
+              "kind": {
+                "type": "ReadText",
+                "x": 40,
+                "y": 135,
+                "w": 260,
+                "h": 42,
+                "compare": "Changed",
+                "value": "",
+                "case_sensitive": false,
+                "timeout_ms": 6000,
+                "interval_ms": 1000,
+                "preview": null,
+                "numbers_only": true,
+                "save_to": ""
+              },
+              "x": 1180.0,
+              "y": 360.0,
+              "delay_ms": 0,
+              "note": "Same gold area as “Read gold”",
+              "name": "Still looting?"
+            },
+            {
+              "id": 97,
+              "kind": {
+                "type": "SetVar",
+                "name": "finished",
+                "expr": "1"
+              },
+              "x": 1180.0,
+              "y": 60.0,
+              "delay_ms": 0,
+              "note": ""
+            },
+            {
+              "id": 98,
+              "kind": {
+                "type": "SetVar",
+                "name": "finished",
+                "expr": "0"
+              },
+              "x": 1460.0,
+              "y": 360.0,
+              "delay_ms": 0,
+              "note": "Loot stopped – surrender"
+            },
+            {
+              "id": 99,
+              "kind": {
+                "type": "GroupOut"
+              },
+              "x": 1740.0,
+              "y": 180.0,
+              "delay_ms": 0,
+              "note": ""
+            }
+          ],
+          "edges": [
+            {
+              "from": 92,
+              "port": 0,
+              "to": 93
+            },
+            {
+              "from": 93,
+              "port": 0,
+              "to": 94
+            },
+            {
+              "from": 94,
+              "port": 0,
+              "to": 95
+            },
+            {
+              "from": 94,
+              "port": 1,
+              "to": 98
+            },
+            {
+              "from": 95,
+              "port": 0,
+              "to": 97
+            },
+            {
+              "from": 95,
+              "port": 1,
+              "to": 96
+            },
+            {
+              "from": 97,
+              "port": 0,
+              "to": 99
+            },
+            {
+              "from": 96,
+              "port": 0,
+              "to": 94
+            },
+            {
+              "from": 96,
+              "port": 1,
+              "to": 98
+            },
+            {
+              "from": 98,
+              "port": 0,
+              "to": 99
+            }
+          ]
+        }
+      },
+      "x": 3140.0,
+      "y": 180.0,
+      "delay_ms": 0,
+      "note": "Leave when the loot stops going down"
+    },
+    {
+      "id": 100,
+      "kind": {
+        "type": "IfCompare",
+        "left": "finished",
+        "op": "Eq",
+        "right": "1"
+      },
+      "x": 3420.0,
+      "y": 180.0,
+      "delay_ms": 0,
+      "note": "Did the battle end by itself?"
+    },
+    {
+      "id": 101,
+      "kind": {
+        "type": "Group",
+        "name": "End the battle",
+        "graph": {
+          "nodes": [
+            {
+              "id": 102,
+              "kind": {
+                "type": "GroupIn"
+              },
+              "x": 60.0,
+              "y": 180.0,
+              "delay_ms": 0,
+              "note": ""
+            },
+            {
+              "id": 103,
+              "kind": {
+                "type": "Click",
+                "target": "Fixed",
+                "x": 110,
+                "y": 860,
+                "offset_x": 0,
+                "offset_y": 0,
+                "button": "Left",
+                "clicks": 1,
+                "area": null,
+                "jitter_px": 5
+              },
+              "x": 340.0,
+              "y": 180.0,
+              "delay_ms": 0,
+              "note": "Surrender / End Battle (bottom left) – Pick it",
+              "name": "End battle"
+            },
+            {
+              "id": 104,
+              "kind": {
+                "type": "Wait",
+                "ms": 800,
+                "jitter_ms": 250
+              },
+              "x": 620.0,
+              "y": 180.0,
+              "delay_ms": 0,
+              "note": ""
+            },
+            {
+              "id": 105,
+              "kind": {
+                "type": "Click",
+                "target": "Fixed",
+                "x": 1130,
+                "y": 700,
+                "offset_x": 0,
+                "offset_y": 0,
+                "button": "Left",
+                "clicks": 1,
+                "area": null,
+                "jitter_px": 5
+              },
+              "x": 900.0,
+              "y": 180.0,
+              "delay_ms": 0,
+              "note": "“Okay” to confirm – Pick it",
+              "name": "Okay"
+            },
+            {
+              "id": 106,
+              "kind": {
+                "type": "Wait",
+                "ms": 2500,
+                "jitter_ms": 500
+              },
+              "x": 1180.0,
+              "y": 180.0,
+              "delay_ms": 0,
+              "note": ""
+            },
+            {
+              "id": 107,
+              "kind": {
+                "type": "GroupOut"
+              },
+              "x": 1460.0,
+              "y": 180.0,
+              "delay_ms": 0,
+              "note": ""
+            }
+          ],
+          "edges": [
+            {
+              "from": 102,
+              "port": 0,
+              "to": 103
+            },
+            {
+              "from": 103,
+              "port": 0,
+              "to": 104
+            },
+            {
+              "from": 104,
+              "port": 0,
+              "to": 105
+            },
+            {
+              "from": 105,
+              "port": 0,
+              "to": 106
+            },
+            {
+              "from": 106,
+              "port": 0,
+              "to": 107
+            }
+          ]
+        }
+      },
+      "x": 3420.0,
+      "y": 360.0,
+      "delay_ms": 0,
+      "note": "Surrender / End Battle → Okay"
+    },
+    {
+      "id": 108,
+      "kind": {
+        "type": "FindImage",
+        "template": null,
+        "threshold": 0.85,
+        "timeout_ms": 12000,
+        "interval_ms": 400,
+        "click_when_found": true,
+        "search_area": null
+      },
+      "x": 3700.0,
+      "y": 180.0,
+      "delay_ms": 0,
+      "note": "Snip the Return Home button",
+      "name": "Return Home"
+    },
+    {
+      "id": 109,
+      "kind": {
+        "type": "Notify",
+        "title": "Couldn't get home",
+        "message": "No Return Home button after 12 s. Get back to the village, then click here.",
+        "style": "Error",
+        "position": "TopCenter",
+        "duration_ms": 6000,
+        "wait_for_click": true,
+        "sound": true
+      },
+      "x": 3700.0,
+      "y": 360.0,
+      "delay_ms": 0,
+      "note": ""
+    },
+    {
+      "id": 110,
+      "kind": {
+        "type": "Wait",
+        "ms": 3500,
+        "jitter_ms": 800
+      },
+      "x": 3980.0,
+      "y": 180.0,
+      "delay_ms": 0,
+      "note": "Village loading"
+    },
+    {
+      "id": 111,
+      "kind": {
+        "type": "SetVar",
+        "name": "attacks",
+        "expr": "attacks + 1"
+      },
+      "x": 4260.0,
+      "y": 180.0,
+      "delay_ms": 0,
+      "note": ""
+    },
+    {
+      "id": 112,
+      "kind": {
+        "type": "Notify",
+        "title": "Attack {attacks} done",
+        "message": "Took about {gold} gold and {elixir} elixir off that base.",
+        "style": "Success",
+        "position": "TopCenter",
+        "duration_ms": 3000,
+        "wait_for_click": false,
+        "sound": false
+      },
+      "x": 4540.0,
+      "y": 180.0,
+      "delay_ms": 0,
+      "note": "",
+      "disabled": true
+    },
+    {
+      "id": 113,
+      "kind": {
+        "type": "End"
+      },
+      "x": 4820.0,
+      "y": 180.0,
+      "delay_ms": 0,
+      "note": "Next repeat starts from the top"
+    }
+  ],
+  "edges": [
+    {
+      "from": 1,
+      "port": 0,
+      "to": 2
+    },
+    {
+      "from": 2,
+      "port": 0,
+      "to": 11
+    },
+    {
+      "from": 11,
+      "port": 1,
+      "to": 12
+    },
+    {
+      "from": 12,
+      "port": 0,
+      "to": 11
+    },
+    {
+      "from": 32,
+      "port": 0,
+      "to": 40
+    },
+    {
+      "from": 40,
+      "port": 1,
+      "to": 41
+    },
+    {
+      "from": 41,
+      "port": 0,
+      "to": 19
+    },
+    {
+      "from": 40,
+      "port": 0,
+      "to": 42
+    },
+    {
+      "from": 42,
+      "port": 0,
+      "to": 51
+    },
+    {
+      "from": 51,
+      "port": 1,
+      "to": 52
+    },
+    {
+      "from": 52,
+      "port": 1,
+      "to": 53
+    },
+    {
+      "from": 53,
+      "port": 1,
+      "to": 54
+    },
+    {
+      "from": 54,
+      "port": 0,
+      "to": 55
+    },
+    {
+      "from": 55,
+      "port": 0,
+      "to": 56
+    },
+    {
+      "from": 55,
+      "port": 1,
+      "to": 58
+    },
+    {
+      "from": 56,
+      "port": 0,
+      "to": 57
+    },
+    {
+      "from": 57,
+      "port": 0,
+      "to": 58
+    },
+    {
+      "from": 58,
+      "port": 0,
+      "to": 59
+    },
+    {
+      "from": 59,
+      "port": 0,
+      "to": 40
+    },
+    {
+      "from": 51,
+      "port": 0,
+      "to": 60
+    },
+    {
+      "from": 52,
+      "port": 0,
+      "to": 60
+    },
+    {
+      "from": 53,
+      "port": 0,
+      "to": 60
+    },
+    {
+      "from": 60,
+      "port": 0,
+      "to": 84
+    },
+    {
+      "from": 84,
+      "port": 0,
+      "to": 91
+    },
+    {
+      "from": 91,
+      "port": 0,
+      "to": 100
+    },
+    {
+      "from": 100,
+      "port": 1,
+      "to": 101
+    },
+    {
+      "from": 100,
+      "port": 0,
+      "to": 108
+    },
+    {
+      "from": 101,
+      "port": 0,
+      "to": 108
+    },
+    {
+      "from": 108,
+      "port": 1,
+      "to": 109
+    },
+    {
+      "from": 108,
+      "port": 0,
+      "to": 110
+    },
+    {
+      "from": 109,
+      "port": 0,
+      "to": 110
+    },
+    {
+      "from": 110,
+      "port": 0,
+      "to": 111
+    },
+    {
+      "from": 111,
+      "port": 0,
+      "to": 112
+    },
+    {
+      "from": 112,
+      "port": 0,
+      "to": 113
+    },
+    {
+      "from": 11,
+      "port": 0,
+      "to": 13
+    },
+    {
+      "from": 13,
+      "port": 0,
+      "to": 19
+    },
+    {
+      "from": 19,
+      "port": 0,
+      "to": 32
+    }
+  ],
+  "next_id": 114,
+  "start_delay_ms": 3000,
+  "step_delay_ms": 60,
+  "speed_pct": 100,
+  "repeat": 30,
+  "alert_on_stop": true,
+  "reference": {
+    "x": 0,
+    "y": 0,
+    "w": 1920,
+    "h": 1080
+  },
+  "human_mouse": true,
+  "mouse_speed": 130,
+  "failsafe": true,
+  "alert_on_finish": true
+}
