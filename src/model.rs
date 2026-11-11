@@ -26,6 +26,389 @@ impl MouseBtn {
     }
 }
 
+/// The outline of a random click area.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ShapeKind {
+    #[default]
+    Rectangle,
+    /// An ellipse (a circle in a square box).
+    Ellipse,
+    /// Corners at the middle of each side of the box, like a base in a game seen from above.
+    Diamond,
+    /// Point at the top middle, base along the bottom.
+    Triangle,
+    /// Any outline: corners you place yourself (`AreaShape::points`).
+    Polygon,
+}
+
+impl ShapeKind {
+    pub const ALL: [ShapeKind; 5] = [
+        ShapeKind::Rectangle,
+        ShapeKind::Ellipse,
+        ShapeKind::Diamond,
+        ShapeKind::Triangle,
+        ShapeKind::Polygon,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ShapeKind::Rectangle => "▭ Rectangle",
+            ShapeKind::Ellipse => "◯ Ellipse",
+            ShapeKind::Diamond => "◇ Diamond",
+            ShapeKind::Triangle => "△ Triangle",
+            ShapeKind::Polygon => "⬠ Freeform",
+        }
+    }
+
+    fn word(self) -> &'static str {
+        match self {
+            ShapeKind::Rectangle => "rectangle",
+            ShapeKind::Ellipse => "ellipse",
+            ShapeKind::Diamond => "diamond",
+            ShapeKind::Triangle => "triangle",
+            ShapeKind::Polygon => "freeform shape",
+        }
+    }
+}
+
+/// The shape a random click area has inside the box you dragged: its outline,
+/// how far it's turned, and whether only a band along its edge counts.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct AreaShape {
+    #[serde(default)]
+    pub kind: ShapeKind,
+    /// Turned clockwise around the middle of the box, in degrees.
+    #[serde(default)]
+    pub rotation: f32,
+    /// 0 = the whole shape. Otherwise only a band this many pixels wide just
+    /// inside its edge (a hollow rectangle, a ring…).
+    #[serde(default)]
+    pub hollow_px: i32,
+    /// The corners of a freeform outline, as fractions of the box (0 = left / top,
+    /// 1 = right / bottom), in order around the outline. Only for `Polygon`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub points: Vec<[f32; 2]>,
+}
+
+/// Six corners round the middle of the box, to start a freeform outline from.
+pub fn default_polygon_points() -> Vec<[f32; 2]> {
+    (0..6)
+        .map(|i| {
+            let t = (i as f32 * 60.0 - 90.0).to_radians();
+            [0.5 + 0.5 * t.cos(), 0.5 + 0.5 * t.sin()]
+        })
+        .collect()
+}
+
+/// Even-odd test: is (x, y) inside the polygon?
+fn point_in_polygon(poly: &[(f64, f64)], x: f64, y: f64) -> bool {
+    let mut inside = false;
+    let n = poly.len();
+    for i in 0..n {
+        let (x1, y1) = poly[i];
+        let (x2, y2) = poly[(i + 1) % n];
+        if (y1 > y) != (y2 > y) && x < x1 + (y - y1) * (x2 - x1) / (y2 - y1) {
+            inside = !inside;
+        }
+    }
+    inside
+}
+
+/// How far (x, y) is from the nearest edge of a closed outline.
+fn distance_to_outline(poly: &[(f64, f64)], x: f64, y: f64) -> f64 {
+    let n = poly.len();
+    let mut best = f64::MAX;
+    for i in 0..n {
+        let (ax, ay) = poly[i];
+        let (bx, by) = poly[(i + 1) % n];
+        let (dx, dy) = (bx - ax, by - ay);
+        let len2 = dx * dx + dy * dy;
+        let t = if len2 > 0.0 { (((x - ax) * dx + (y - ay) * dy) / len2).clamp(0.0, 1.0) } else { 0.0 };
+        let (px, py) = (ax + t * dx - x, ay + t * dy - y);
+        best = best.min((px * px + py * py).sqrt());
+    }
+    best
+}
+
+impl AreaShape {
+    /// The plain rectangle every area was before shapes existed.
+    pub fn is_plain(&self) -> bool {
+        *self == AreaShape::default()
+    }
+
+    /// "hollow ellipse turned 30°" (empty for a plain rectangle).
+    pub fn describe(&self) -> String {
+        let mut s = String::new();
+        if self.hollow_px > 0 {
+            s.push_str("hollow ");
+        }
+        s.push_str(self.kind.word());
+        if self.rotation.abs() >= 0.5 {
+            s.push_str(&format!(" turned {:.0}°", self.rotation));
+        }
+        if self.hollow_px > 0 {
+            s.push_str(&format!(", {} px edge", self.hollow_px));
+        }
+        s
+    }
+
+    /// Is (lx, ly) inside the shape? Measured from the middle of the box, before
+    /// turning, with `a` / `b` half the box's width / height.
+    fn contains_local(&self, lx: f64, ly: f64, a: f64, b: f64) -> bool {
+        if let Some(poly) = self.polygon_local(a, b) {
+            if !point_in_polygon(&poly, lx, ly) {
+                return false;
+            }
+            return self.hollow_px <= 0 || distance_to_outline(&poly, lx, ly) <= self.hollow_px as f64;
+        }
+        // A freeform shape without enough corners yet counts as a rectangle.
+        let kind = self.plain_kind();
+        if !shape_contains(kind, lx, ly, a, b) {
+            return false;
+        }
+        if self.hollow_px <= 0 {
+            return true;
+        }
+        // Hollow: leave out the same shape shrunk so the band is hollow_px wide.
+        let t = self.hollow_px as f64;
+        let (ia, ib) = match kind {
+            ShapeKind::Rectangle | ShapeKind::Ellipse => (a - t, b - t),
+            ShapeKind::Diamond => {
+                // Each edge is ab / sqrt(a² + b²) from the middle.
+                let k = 1.0 - t * (a * a + b * b).sqrt() / (a * b).max(1e-9);
+                (a * k, b * k)
+            }
+            ShapeKind::Triangle | ShapeKind::Polygon => {
+                // The inner triangle has the same middle (centroid), scaled down so
+                // the band along every side is at least t wide.
+                let to_base = 2.0 * b / 3.0;
+                let to_side = 4.0 * a * b / (3.0 * (a * a + 4.0 * b * b).sqrt());
+                let k = 1.0 - t / to_base.min(to_side).max(1e-9);
+                let centroid = b / 3.0; // below the middle of the box
+                if k <= 0.0 {
+                    return true;
+                }
+                let (sx, sy) = (lx / k, (ly - centroid) / k + centroid);
+                return !shape_contains(ShapeKind::Triangle, sx, sy, a, b);
+            }
+        };
+        if ia <= 0.0 || ib <= 0.0 {
+            return true;
+        }
+        !shape_contains(kind, lx, ly, ia, ib)
+    }
+
+    /// The shape used when it isn't a freeform outline with at least 3 corners.
+    fn plain_kind(&self) -> ShapeKind {
+        if self.kind == ShapeKind::Polygon {
+            ShapeKind::Rectangle
+        } else {
+            self.kind
+        }
+    }
+
+    /// A freeform outline's corners measured from the middle of the box (before
+    /// turning), or None if this isn't one (or has fewer than 3 corners).
+    fn polygon_local(&self, a: f64, b: f64) -> Option<Vec<(f64, f64)>> {
+        if self.kind != ShapeKind::Polygon || self.points.len() < 3 {
+            return None;
+        }
+        Some(
+            self.points
+                .iter()
+                .map(|p| ((p[0] as f64 - 0.5) * 2.0 * a, (p[1] as f64 - 0.5) * 2.0 * b))
+                .collect(),
+        )
+    }
+
+    /// Inside the outline at all (ignoring "hollow")?
+    fn outer_contains(&self, lx: f64, ly: f64, a: f64, b: f64) -> bool {
+        match self.polygon_local(a, b) {
+            Some(poly) => point_in_polygon(&poly, lx, ly),
+            None => shape_contains(self.plain_kind(), lx, ly, a, b),
+        }
+    }
+
+    /// The outline as corners (an ellipse as many short sides), measured from the
+    /// middle of the box, before turning.
+    fn outline_local(&self, a: f64, b: f64) -> Vec<(f64, f64)> {
+        if let Some(poly) = self.polygon_local(a, b) {
+            return poly;
+        }
+        match self.plain_kind() {
+            ShapeKind::Rectangle | ShapeKind::Polygon => vec![(-a, -b), (a, -b), (a, b), (-a, b)],
+            ShapeKind::Diamond => vec![(0.0, -b), (a, 0.0), (0.0, b), (-a, 0.0)],
+            ShapeKind::Triangle => vec![(0.0, -b), (a, b), (-a, b)],
+            ShapeKind::Ellipse => (0..72)
+                .map(|i| {
+                    let t = (i as f64 * 5.0 - 90.0).to_radians();
+                    (a * t.cos(), b * t.sin())
+                })
+                .collect(),
+        }
+    }
+}
+
+fn shape_contains(kind: ShapeKind, lx: f64, ly: f64, a: f64, b: f64) -> bool {
+    if a <= 0.0 || b <= 0.0 {
+        return false;
+    }
+    match kind {
+        ShapeKind::Rectangle | ShapeKind::Polygon => lx.abs() <= a && ly.abs() <= b,
+        ShapeKind::Ellipse => (lx / a).powi(2) + (ly / b).powi(2) <= 1.0,
+        ShapeKind::Diamond => lx.abs() / a + ly.abs() / b <= 1.0,
+        // Apex at (0, -b), base from (-a, b) to (a, b).
+        ShapeKind::Triangle => ly <= b && ly >= -b && lx.abs() <= a * (ly + b) / (2.0 * b),
+    }
+}
+
+/// Half the width and height of the part of `r` clicks can land in (a couple of
+/// pixels in from the edge), and its middle.
+fn area_frame(r: ScreenRect) -> (f64, f64, f64, f64) {
+    let inset = if r.w >= 8 && r.h >= 8 { 2.0 } else { 0.0 };
+    let a = (r.w as f64 / 2.0 - inset).max(0.5);
+    let b = (r.h as f64 / 2.0 - inset).max(0.5);
+    (a, b, r.x as f64 + r.w as f64 / 2.0, r.y as f64 + r.h as f64 / 2.0)
+}
+
+/// Is the screen point (px, py) inside area `r` with `shape`?
+pub fn area_contains(r: ScreenRect, shape: &AreaShape, px: f64, py: f64) -> bool {
+    let (a, b, cx, cy) = area_frame(r);
+    let th = -(shape.rotation as f64).to_radians();
+    let (dx, dy) = (px - cx, py - cy);
+    let (lx, ly) = (dx * th.cos() - dy * th.sin(), dx * th.sin() + dy * th.cos());
+    shape.contains_local(lx, ly, a, b)
+}
+
+/// A random spot inside area `r` with `shape` (evenly spread over it), staying a
+/// couple of pixels inside the edge. `unit` returns random numbers from 0 to 1.
+pub fn area_point(r: ScreenRect, shape: &AreaShape, unit: &mut dyn FnMut() -> f64) -> (i32, i32) {
+    let (a, b, cx, cy) = area_frame(r);
+    let (lx, ly) = local_point(shape, a, b, unit);
+    turned(shape, cx, cy, lx, ly)
+}
+
+/// A point measured from the middle of the box, turned with the shape and put on screen.
+fn turned(shape: &AreaShape, cx: f64, cy: f64, lx: f64, ly: f64) -> (i32, i32) {
+    let th = (shape.rotation as f64).to_radians();
+    // Clockwise on screen (y points down).
+    let (x, y) = (lx * th.cos() - ly * th.sin(), lx * th.sin() + ly * th.cos());
+    ((cx + x).round() as i32, (cy + y).round() as i32)
+}
+
+/// A random spot inside the shape, measured from the middle of the box.
+fn local_point(shape: &AreaShape, a: f64, b: f64, unit: &mut dyn FnMut() -> f64) -> (f64, f64) {
+    // Pick spots in the box until one is inside the shape. Even a thin hollow band
+    // is found within a few thousand tries, which takes microseconds.
+    for _ in 0..20_000 {
+        let lx = (unit() * 2.0 - 1.0) * a;
+        let ly = (unit() * 2.0 - 1.0) * b;
+        if shape.contains_local(lx, ly, a, b) {
+            return (lx, ly);
+        }
+    }
+    // Practically never: a point on the outline.
+    shape.outline_local(a, b).first().copied().unwrap_or((0.0, 0.0))
+}
+
+/// The outline of area `r` with `shape`, as corners on screen (an ellipse as many
+/// short sides), in order around it.
+pub fn area_outline(r: ScreenRect, shape: &AreaShape) -> Vec<(f64, f64)> {
+    let (a, b, cx, cy) = area_frame(r);
+    let th = (shape.rotation as f64).to_radians();
+    shape
+        .outline_local(a, b)
+        .into_iter()
+        .map(|(lx, ly)| (cx + lx * th.cos() - ly * th.sin(), cy + lx * th.sin() + ly * th.cos()))
+        .collect()
+}
+
+/// Where `n` taps go in area `r` with `shape`. A hollow shape gets them evenly
+/// round its edge band, in order (from a random starting point, either way round);
+/// a solid one gets them spread evenly over the whole shape, ordered round its
+/// middle. Every spot is a little random, so no two runs tap the same pixels.
+pub fn spread_taps(r: ScreenRect, shape: &AreaShape, n: u32, unit: &mut dyn FnMut() -> f64) -> Vec<(i32, i32)> {
+    let n = n.clamp(1, 2000) as usize;
+    let (a, b, cx, cy) = area_frame(r);
+    let mut out = Vec::with_capacity(n);
+    if shape.hollow_px > 0 {
+        let outline = shape.outline_local(a, b);
+        let m = outline.len();
+        let lens: Vec<f64> = (0..m)
+            .map(|i| {
+                let (p, q) = (outline[i], outline[(i + 1) % m]);
+                ((q.0 - p.0).powi(2) + (q.1 - p.1).powi(2)).sqrt()
+            })
+            .collect();
+        let perimeter: f64 = lens.iter().sum();
+        if perimeter > 0.0 {
+            let band = shape.hollow_px as f64;
+            let start = unit() * perimeter;
+            let forward = unit() < 0.5;
+            for i in 0..n {
+                let step = i as f64 * perimeter / n as f64;
+                let mut d = if forward { start + step } else { start - step };
+                d = d.rem_euclid(perimeter);
+                // Which side, and where along it.
+                let mut j = 0;
+                while j + 1 < m && d > lens[j] {
+                    d -= lens[j];
+                    j += 1;
+                }
+                let (p, q) = (outline[j], outline[(j + 1) % m]);
+                let t = if lens[j] > 0.0 { d / lens[j] } else { 0.0 };
+                let (ex, ey) = (p.0 + (q.0 - p.0) * t, p.1 + (q.1 - p.1) * t);
+                // Step inwards (the side of the edge the shape is on) a random
+                // amount into the band.
+                let len = lens[j].max(1e-9);
+                let (nx, ny) = (-(q.1 - p.1) / len, (q.0 - p.0) / len);
+                let (mx, my) = ((p.0 + q.0) / 2.0, (p.1 + q.1) / 2.0);
+                let sign = if shape.outer_contains(mx + nx, my + ny, a, b) { 1.0 } else { -1.0 };
+                let depth = 1.0 + unit() * (band - 2.0).max(0.5);
+                let mut spot = (ex + nx * sign * depth, ey + ny * sign * depth);
+                if !shape.contains_local(spot.0, spot.1, a, b) {
+                    // An awkward corner: any spot of the band close by.
+                    for _ in 0..40 {
+                        let (dx, dy) = ((unit() * 2.0 - 1.0) * band, (unit() * 2.0 - 1.0) * band);
+                        if shape.contains_local(ex + dx, ey + dy, a, b) {
+                            spot = (ex + dx, ey + dy);
+                            break;
+                        }
+                    }
+                }
+                out.push(turned(shape, cx, cy, spot.0, spot.1));
+            }
+            return out;
+        }
+    }
+    // Solid: "best candidate" spreading – each tap is the one of several random
+    // spots that's furthest from the taps so far, so they don't bunch up.
+    let mut spots: Vec<(f64, f64)> = Vec::with_capacity(n);
+    for _ in 0..n {
+        let mut best = local_point(shape, a, b, unit);
+        let mut best_d = -1.0;
+        for _ in 0..10 {
+            let c = local_point(shape, a, b, unit);
+            let d = spots
+                .iter()
+                .map(|s| (s.0 - c.0).powi(2) + (s.1 - c.1).powi(2))
+                .fold(f64::MAX, f64::min);
+            if d > best_d {
+                best = c;
+                best_d = d;
+            }
+        }
+        spots.push(best);
+    }
+    // Go round the middle, like sweeping a finger round the area.
+    let start = unit() * std::f64::consts::TAU;
+    spots.sort_by(|p, q| {
+        let ang = |s: &(f64, f64)| (s.1.atan2(s.0) - start).rem_euclid(std::f64::consts::TAU);
+        ang(p).partial_cmp(&ang(q)).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    spots.into_iter().map(|(x, y)| turned(shape, cx, cy, x, y)).collect()
+}
+
 /// Where a mouse step acts.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Target {
@@ -301,6 +684,18 @@ fn default_one() -> u32 {
     1
 }
 
+fn default_hold_ms() -> u64 {
+    80
+}
+
+fn is_default_hold(v: &u64) -> bool {
+    *v == 80
+}
+
+fn is_zero(v: &u32) -> bool {
+    *v == 0
+}
+
 fn is_one(v: &u32) -> bool {
     *v == 1
 }
@@ -479,6 +874,10 @@ pub enum NodeKind {
         /// Move up to this many pixels in a random direction each time (0 = exact).
         #[serde(default)]
         jitter_px: i32,
+        /// The shape inside the area (rectangle, ellipse…, rotated, hollow).
+        /// Optional, so older macros still open (and save as before).
+        #[serde(default, skip_serializing_if = "AreaShape::is_plain")]
+        area_shape: AreaShape,
     },
     MoveMouse {
         target: Target,
@@ -490,6 +889,8 @@ pub enum NodeKind {
         area: Option<ScreenRect>,
         #[serde(default)]
         jitter_px: i32,
+        #[serde(default, skip_serializing_if = "AreaShape::is_plain")]
+        area_shape: AreaShape,
     },
     KeyPress {
         key: String,
@@ -584,6 +985,23 @@ pub enum NodeKind {
         /// How long the move between the two spots takes.
         #[serde(default = "default_drag_ms")]
         duration_ms: u64,
+        /// Instead of dragging, tap this many times evenly along the line (0 = drag).
+        /// For apps where dragging moves the view, e.g. placing troops in a game.
+        /// Optional, so older macros still open.
+        #[serde(default, skip_serializing_if = "is_zero")]
+        taps: u32,
+        /// How long to hold the button still after pressing, before moving (some
+        /// apps only pick things up after a still hold; moving sooner pans instead).
+        /// Optional: older macros get the short 80 ms hold they always had.
+        #[serde(default = "default_hold_ms", skip_serializing_if = "is_default_hold")]
+        hold_ms: u64,
+        /// With taps: spread them round `tap_area` instead of along the line.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        tap_in_area: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tap_area: Option<ScreenRect>,
+        #[serde(default, skip_serializing_if = "AreaShape::is_plain")]
+        tap_shape: AreaShape,
     },
     /// Store a value (text, a number, or a sum like `gold + 1000`) in a variable.
     SetVar {
@@ -665,6 +1083,7 @@ impl NodeKind {
                 clicks: 1,
                 area: None,
                 jitter_px: 0,
+                area_shape: AreaShape::default(),
             },
             NodeKind::MoveMouse {
                 target: Target::Fixed,
@@ -674,6 +1093,7 @@ impl NodeKind {
                 offset_y: 0,
                 area: None,
                 jitter_px: 0,
+                area_shape: AreaShape::default(),
             },
             NodeKind::Drag {
                 from_x: 400,
@@ -682,6 +1102,11 @@ impl NodeKind {
                 to_y: 400,
                 button: MouseBtn::Left,
                 duration_ms: default_drag_ms(),
+                taps: 0,
+                hold_ms: default_hold_ms(),
+                tap_in_area: false,
+                tap_area: None,
+                tap_shape: AreaShape::default(),
             },
             NodeKind::KeyPress {
                 key: "enter".into(),
@@ -891,19 +1316,61 @@ impl NodeKind {
         matches!(self, NodeKind::Start | NodeKind::GroupIn | NodeKind::GroupOut)
     }
 
+    /// The random area a step uses and its shape: Click / Move mouse's "random in
+    /// area", or Drag's "taps round a shape". None for other steps.
+    pub fn area_parts(&self) -> Option<(Option<ScreenRect>, &AreaShape)> {
+        match self {
+            NodeKind::Click { area, area_shape, .. } | NodeKind::MoveMouse { area, area_shape, .. } => {
+                Some((*area, area_shape))
+            }
+            NodeKind::Drag { tap_area, tap_shape, .. } => Some((*tap_area, tap_shape)),
+            _ => None,
+        }
+    }
+
+    pub fn area_parts_mut(&mut self) -> Option<(&mut Option<ScreenRect>, &mut AreaShape)> {
+        match self {
+            NodeKind::Click { area, area_shape, .. } | NodeKind::MoveMouse { area, area_shape, .. } => {
+                Some((area, area_shape))
+            }
+            NodeKind::Drag { tap_area, tap_shape, .. } => Some((tap_area, tap_shape)),
+            _ => None,
+        }
+    }
+
+    /// Does the step actually use its random area right now?
+    pub fn uses_area(&self) -> bool {
+        match self {
+            NodeKind::Click { target, .. } | NodeKind::MoveMouse { target, .. } => *target == Target::Area,
+            NodeKind::Drag { taps, tap_in_area, .. } => *taps > 0 && *tap_in_area,
+            _ => false,
+        }
+    }
+
     pub fn is_group(&self) -> bool {
         matches!(self, NodeKind::Group { .. })
     }
 
     pub fn summary(&self) -> String {
-        fn place(target: &Target, x: i32, y: i32, ox: i32, oy: i32, area: &Option<ScreenRect>, jitter: i32) -> String {
+        #[allow(clippy::too_many_arguments)]
+        fn place(
+            target: &Target,
+            x: i32,
+            y: i32,
+            ox: i32,
+            oy: i32,
+            area: &Option<ScreenRect>,
+            jitter: i32,
+            shape: &AreaShape,
+        ) -> String {
             let at = match target {
                 Target::Fixed => format!("at ({x}, {y})"),
                 Target::FoundImage if ox == 0 && oy == 0 => "on found image".into(),
                 Target::FoundImage => format!("on found image {ox:+}, {oy:+}"),
                 Target::Current => "at current position".into(),
                 Target::Area => match area {
-                    Some(r) => format!("randomly in {}×{}", r.w, r.h),
+                    Some(r) if shape.is_plain() => format!("randomly in {}×{}", r.w, r.h),
+                    Some(r) => format!("randomly in a {} {}×{}", shape.describe(), r.w, r.h),
                     None => "randomly in an area (not set)".into(),
                 },
             };
@@ -925,6 +1392,7 @@ impl NodeKind {
                 clicks,
                 area,
                 jitter_px,
+                area_shape,
             } => {
                 let times = if *clicks > 1 {
                     format!(" ×{clicks}")
@@ -934,7 +1402,7 @@ impl NodeKind {
                 format!(
                     "{}{times} {}",
                     button.label(),
-                    place(target, *x, *y, *offset_x, *offset_y, area, *jitter_px)
+                    place(target, *x, *y, *offset_x, *offset_y, area, *jitter_px, area_shape)
                 )
             }
             NodeKind::MoveMouse {
@@ -945,7 +1413,8 @@ impl NodeKind {
                 offset_y,
                 area,
                 jitter_px,
-            } => format!("Move {}", place(target, *x, *y, *offset_x, *offset_y, area, *jitter_px)),
+                area_shape,
+            } => format!("Move {}", place(target, *x, *y, *offset_x, *offset_y, area, *jitter_px, area_shape)),
             NodeKind::KeyPress { key, mods } => crate::keys::combo_label(key, mods),
             NodeKind::TypeText { text, press_enter } => {
                 let short: String = text.chars().take(28).collect();
@@ -1053,10 +1522,28 @@ impl NodeKind {
                 to_y,
                 button,
                 duration_ms,
-            } => format!(
-                "{} ({from_x}, {from_y}) → ({to_x}, {to_y}) · {duration_ms} ms",
-                button.label()
-            ),
+                taps,
+                hold_ms,
+                tap_in_area,
+                tap_area,
+                tap_shape,
+            } => {
+                if *taps > 0 && *tap_in_area {
+                    match tap_area {
+                        Some(r) if tap_shape.is_plain() => format!("{taps} taps spread over {}×{}", r.w, r.h),
+                        Some(r) => format!("{taps} taps round a {} {}×{}", tap_shape.describe(), r.w, r.h),
+                        None => format!("{taps} taps in an area (not set)"),
+                    }
+                } else if *taps > 0 {
+                    format!("{taps} taps ({from_x}, {from_y}) → ({to_x}, {to_y})")
+                } else {
+                    let hold = if *hold_ms != 80 { format!(" · hold {hold_ms} ms") } else { String::new() };
+                    format!(
+                        "{} ({from_x}, {from_y}) → ({to_x}, {to_y}) · {duration_ms} ms{hold}",
+                        button.label()
+                    )
+                }
+            }
             NodeKind::SetVar { name, expr } => {
                 let n = if name.trim().is_empty() { "?" } else { name.trim() };
                 format!("{n} = {}", expr.trim())
@@ -2036,10 +2523,13 @@ pub fn map_kind(kind: &mut NodeKind, m: &Mapping) {
         return;
     }
     match kind {
-        NodeKind::Click { x, y, area, .. } | NodeKind::MoveMouse { x, y, area, .. } => {
+        NodeKind::Click { x, y, area, area_shape, .. } | NodeKind::MoveMouse { x, y, area, area_shape, .. } => {
             (*x, *y) = m.point(*x, *y);
             if let Some(r) = area {
                 *r = m.rect(*r);
+            }
+            if area_shape.hollow_px > 0 {
+                area_shape.hollow_px = ((area_shape.hollow_px as f64 * m.scale()).round() as i32).max(1);
             }
         }
         NodeKind::FindImage { search_area, .. } => {
@@ -2056,9 +2546,15 @@ pub fn map_kind(kind: &mut NodeKind, m: &Mapping) {
         NodeKind::PixelColor { x, y, .. } => {
             (*x, *y) = m.point(*x, *y);
         }
-        NodeKind::Drag { from_x, from_y, to_x, to_y, .. } => {
+        NodeKind::Drag { from_x, from_y, to_x, to_y, tap_area, tap_shape, .. } => {
             (*from_x, *from_y) = m.point(*from_x, *from_y);
             (*to_x, *to_y) = m.point(*to_x, *to_y);
+            if let Some(r) = tap_area {
+                *r = m.rect(*r);
+            }
+            if tap_shape.hollow_px > 0 {
+                tap_shape.hollow_px = ((tap_shape.hollow_px as f64 * m.scale()).round() as i32).max(1);
+            }
         }
         NodeKind::Recording { events, .. } => {
             for e in events.iter_mut() {
@@ -2598,6 +3094,24 @@ impl Macro {
     }
 }
 
+/// Where to tap for a Drag step with `taps` set: evenly along the line, both ends
+/// included (one tap goes in the middle).
+pub fn tap_points(from: (i32, i32), to: (i32, i32), taps: u32) -> Vec<(i32, i32)> {
+    let n = taps.max(1);
+    if n == 1 {
+        return vec![((from.0 + to.0) / 2, (from.1 + to.1) / 2)];
+    }
+    (0..n)
+        .map(|i| {
+            let t = i as f64 / (n - 1) as f64;
+            (
+                (from.0 as f64 + (to.0 - from.0) as f64 * t).round() as i32,
+                (from.1 as f64 + (to.1 - from.1) as f64 * t).round() as i32,
+            )
+        })
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // Ready-made macros, recent files and autosave
 // ---------------------------------------------------------------------------
@@ -2923,6 +3437,9 @@ fn graph_problems(g: &Graph, top: bool, has_find: bool, known: &dyn Fn(&str) -> 
                     push(id, true, "It aims at the found image, but there's no Find image step.".into());
                 }
             }
+            NodeKind::Drag { taps, tap_in_area, tap_area, .. } if *taps > 0 && *tap_in_area && tap_area.is_none() => {
+                push(id, true, "It taps round a shape, but no area is selected yet.".into());
+            }
             NodeKind::Group { graph, .. } => {
                 if graph.step_count() == 0 {
                     push(id, false, "This group is empty.".into());
@@ -2930,6 +3447,13 @@ fn graph_problems(g: &Graph, top: bool, has_find: bool, known: &dyn Fn(&str) -> 
                 graph_problems(graph, false, has_find, known, &mut nested);
             }
             _ => {}
+        }
+        if n.kind.uses_area() {
+            if let Some((Some(_), shape)) = n.kind.area_parts() {
+                if shape.kind == ShapeKind::Polygon && shape.points.len() < 3 {
+                    push(id, false, "The freeform area has fewer than 3 corners, so it's used as a rectangle. Use “Edit on screen” to draw it.".into());
+                }
+            }
         }
         // Branches that lead nowhere.
         let outputs = n.kind.outputs();
@@ -3429,6 +3953,134 @@ mod tests {
         assert!(compare_values(&Value::Text("1 500".into()), CmpOp::Ge, &Value::Num(1000.0)));
         assert!(compare_values(&Value::Text("Upload complete".into()), CmpOp::Contains, &Value::Text("COMPLETE".into())));
         assert_eq!(fill_vars("{gold} gold, {missing}!", &vars), "1500 gold, !");
+    }
+
+    #[test]
+    fn area_shapes() {
+        let r = ScreenRect { x: 100, y: 100, w: 400, h: 200 };
+        let mut seed = 12345u64;
+        let mut unit = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % 1_000_000) as f64 / 1_000_000.0
+        };
+        for kind in ShapeKind::ALL {
+            for rotation in [0.0f32, 30.0, 90.0] {
+                for hollow_px in [0, 15] {
+                    let shape = AreaShape { kind, rotation, hollow_px, points: default_polygon_points() };
+                    for _ in 0..300 {
+                        let (x, y) = area_point(r, &shape, &mut unit);
+                        // Allow a pixel for rounding.
+                        let d = [-0.75, 0.0, 0.75];
+                        let near = d.iter().any(|dx| {
+                            d.iter().any(|dy| area_contains(r, &shape, x as f64 + dx, y as f64 + dy))
+                        });
+                        assert!(near, "{kind:?} {rotation} {hollow_px}: ({x}, {y})");
+                    }
+                }
+            }
+        }
+        // Hollow: nothing near the middle.
+        let ring = AreaShape { kind: ShapeKind::Rectangle, rotation: 0.0, hollow_px: 20, ..Default::default() };
+        for _ in 0..500 {
+            let (x, y) = area_point(r, &ring, &mut unit);
+            let (dx, dy) = ((x - 300).abs(), (y - 200).abs());
+            assert!(dx >= 175 || dy >= 75, "({x}, {y}) is in the hollow middle");
+        }
+        // Turned 90°: a wide box becomes tall.
+        let tall = AreaShape { kind: ShapeKind::Rectangle, rotation: 90.0, hollow_px: 0, ..Default::default() };
+        for _ in 0..300 {
+            let (x, y) = area_point(r, &tall, &mut unit);
+            assert!((x - 300).abs() <= 101 && (y - 200).abs() <= 201, "({x}, {y})");
+        }
+        // Old steps open with a plain rectangle and save without the new key.
+        let old = r#"{"type":"Click","target":"Area","x":0,"y":0,"offset_x":0,"offset_y":0,"button":"Left","clicks":1,"area":{"x":1,"y":2,"w":30,"h":40}}"#;
+        let k: NodeKind = serde_json::from_str(old).unwrap();
+        assert!(matches!(&k, NodeKind::Click { area_shape, .. } if area_shape.is_plain()));
+        assert!(!serde_json::to_string(&k).unwrap().contains("area_shape"));
+        // A shaped one saves and loads.
+        let mut k2 = k.clone();
+        if let NodeKind::Click { area_shape, .. } = &mut k2 {
+            *area_shape = AreaShape { kind: ShapeKind::Diamond, rotation: 45.0, hollow_px: 12, ..Default::default() };
+        }
+        let back: NodeKind = serde_json::from_str(&serde_json::to_string(&k2).unwrap()).unwrap();
+        assert_eq!(back, k2);
+    }
+
+    #[test]
+    fn freeform_areas_and_spread_taps() {
+        let r = ScreenRect { x: 0, y: 0, w: 404, h: 404 };
+        let mut seed = 99u64;
+        let mut unit = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % 1_000_000) as f64 / 1_000_000.0
+        };
+        // An L shape: the top-right quarter is cut away.
+        let l = AreaShape {
+            kind: ShapeKind::Polygon,
+            points: vec![[0.0, 0.0], [0.5, 0.0], [0.5, 0.5], [1.0, 0.5], [1.0, 1.0], [0.0, 1.0]],
+            ..Default::default()
+        };
+        for _ in 0..400 {
+            let (x, y) = area_point(r, &l, &mut unit);
+            assert!(!(x > 205 && y < 199), "({x}, {y}) is in the cut-away corner");
+        }
+        // Hollow L: only near its edges.
+        let ring = AreaShape { hollow_px: 12, ..l.clone() };
+        for _ in 0..300 {
+            let (x, y) = area_point(r, &ring, &mut unit);
+            let middle = (x - 100).abs() < 60 && (y - 300).abs() < 60;
+            assert!(!middle, "({x}, {y}) is in the middle of a hollow shape");
+        }
+        // Too few corners: a plain rectangle (and flagged in the check).
+        let few = AreaShape { kind: ShapeKind::Polygon, points: vec![[0.0, 0.0], [1.0, 1.0]], ..Default::default() };
+        assert!(area_contains(r, &few, 200.0, 50.0));
+        // Taps round a hollow diamond: the right number, all in the band, spread out.
+        let diamond = AreaShape { kind: ShapeKind::Diamond, hollow_px: 20, rotation: 0.0, ..Default::default() };
+        let taps = spread_taps(r, &diamond, 40, &mut unit);
+        assert_eq!(taps.len(), 40);
+        let d = [-1.0, 0.0, 1.0];
+        for (x, y) in &taps {
+            let ok = d.iter().any(|dx| d.iter().any(|dy| area_contains(r, &diamond, *x as f64 + dx, *y as f64 + dy)));
+            assert!(ok, "tap ({x}, {y}) isn't in the band");
+        }
+        // Neighbours along the edge are close; nothing is tapped twice.
+        let mut uniq = taps.clone();
+        uniq.sort();
+        uniq.dedup();
+        assert!(uniq.len() >= 38);
+        // Solid shapes: spread over the whole area.
+        let solid = spread_taps(r, &AreaShape::default(), 30, &mut unit);
+        assert_eq!(solid.len(), 30);
+        let left = solid.iter().filter(|p| p.0 < 202).count();
+        assert!((8..=22).contains(&left), "{left} of 30 on the left half");
+        // Outlines: 4 corners for a rectangle, many for an ellipse.
+        assert_eq!(area_outline(r, &AreaShape::default()).len(), 4);
+        assert!(area_outline(r, &AreaShape { kind: ShapeKind::Ellipse, ..Default::default() }).len() > 30);
+        // Drag steps: the new settings are optional and old ones save the same way.
+        let old = r#"{"type":"Drag","from_x":1,"from_y":2,"to_x":3,"to_y":4,"button":"Left","duration_ms":400}"#;
+        let k: NodeKind = serde_json::from_str(old).unwrap();
+        assert!(matches!(k, NodeKind::Drag { hold_ms: 80, tap_in_area: false, tap_area: None, .. }));
+        let json = serde_json::to_string(&k).unwrap();
+        assert!(!json.contains("hold_ms") && !json.contains("tap_"));
+        // A freeform area saves and loads.
+        let back: AreaShape = serde_json::from_str(&serde_json::to_string(&l).unwrap()).unwrap();
+        assert_eq!(back, l);
+    }
+
+    #[test]
+    fn drag_taps_are_optional() {
+        // A Drag saved before "taps" existed still opens, and saves the same way.
+        let old = r#"{"id":1,"kind":{"type":"Drag","from_x":1,"from_y":2,"to_x":3,"to_y":4,"button":"Left","duration_ms":400},"x":0.0,"y":0.0}"#;
+        let n: Node = serde_json::from_str(old).unwrap();
+        assert!(matches!(n.kind, NodeKind::Drag { taps: 0, .. }));
+        assert!(!serde_json::to_string(&n).unwrap().contains("taps"));
+        // Taps along the line: both ends included, evenly spaced.
+        assert_eq!(tap_points((0, 0), (100, 0), 3), vec![(0, 0), (50, 0), (100, 0)]);
+        assert_eq!(tap_points((10, 10), (90, 50), 1), vec![(50, 30)]);
     }
 
     #[test]

@@ -90,8 +90,8 @@ If you close the window or quit with unsaved changes, MacroFlow asks whether to 
 | Step | Outputs | Notes |
 |---|---|---|
 | **Start** | next | Every run begins here. |
-| **Click** | next | Left / right / middle, single or double click, at a fixed spot, **randomly inside an area** (drag a box around it), at the found image (+ offset), or wherever the pointer is. **Random offset (px)** moves each click up to that many pixels in a random direction, so it never clicks exactly the same place twice in a row. "Pick position on screen" captures the pointer position after 3 s. |
-| **Drag** | next | Presses a mouse button at a start spot, moves smoothly to an end spot and lets go, for sliders, drag-and-drop or selecting text. **Pick start / end on screen** captures each spot after 3 s. You can set the button and how long the move takes. |
+| **Click** | next | Left / right / middle, single or double click, at a fixed spot, **randomly inside an area** (drag a box around it, then optionally give it a **shape**: rectangle, ellipse, diamond, triangle or **freeform** (any outline you click out yourself), **turned** to any angle, and **hollow** so only a band along its edge counts, e.g. a hollow diamond round the outside of a base. **Edit on screen…** opens the area over a screenshot so you can move, resize and turn it with handles and drag freeform corners about. A preview shows where clicks can land, and **Show on screen** flashes the green dot at 24 random spots), at the found image (+ offset), or wherever the pointer is. **Random offset (px)** moves each click up to that many pixels in a random direction, so it never clicks exactly the same place twice in a row. "Pick position on screen" captures the pointer position after 3 s. |
+| **Drag** | next | Presses a mouse button at a start spot, moves smoothly to an end spot and lets go, for sliders, drag-and-drop or selecting text. **Pick start / end on screen** captures each spot after 3 s. You can set the button and how long the move takes. **Hold still before moving** keeps the mouse still for a while after pressing, before it moves, for apps that only pick something up after a still hold (otherwise they pan the view). **Tap instead of dragging** (taps above 0) taps that many times instead: evenly **along the line**, or **round a shape**, an area with the same shapes, turning, hollow band and on-screen editor as Click's random area. Round a hollow shape the taps go in order round its edge band (e.g. troops round the outside of a base). In a solid shape they're spread evenly over it. |
 | **Move mouse** | next | Same targeting options as Click. |
 | **Key press** | next | Any key plus ⌃⌥⇧⌘. Use "Capture key from keyboard" to set it by pressing the keys. |
 | **Type text** | next | Types a string, optionally followed by Return. |
@@ -161,6 +161,15 @@ Every click, mouse move, drag, scroll, key press and bit of typing gets its own 
 - Keys while the card is open: **Space** plays / pauses, **← →** go a line back / forward, **Esc** closes it.
 
 The pictures are taken in the background so they don't slow the macro down. Up to 400 are kept per run (in `Documents/MacroFlow Macros/images/last-run/playback/`, cleared at the start of each run and when MacroFlow opens). If the macro is very fast, an action may have no picture, but it's always listed.
+
+### Editing an area on screen
+
+**Edit on screen…** (in a Click / Move mouse step's random area, or a Drag step tapping round a shape) hides MacroFlow, takes a screenshot of that display and opens it full size with the area drawn on top. The green dots show where clicks can land, or exactly where the taps will go.
+
+- **Drag inside** the shape to move it. The **squares** on the corners and sides resize it, and the **round handle** above it turns it (hold **Shift** to snap to 15°; **← →** nudge it a degree). **Drag outside** the box to draw a new box.
+- The toolbar switches the **shape**, sets the **hollow edge** band (− / +, Shift for bigger steps) and **Straighten**s it.
+- **Freeform:** drag a corner dot to move it, **click outside the outline** to add a corner on the nearest side, and **right-click** a dot to remove it. **Draw a new outline** clears it, then you click each corner in turn and click the first corner again (or press Enter) to finish.
+- **Save** (Enter) keeps it, **Cancel** (Esc) leaves the step as it was. The area still scales with the screen size and follows a window like any other position.
 
 ### Seeing where it clicks
 

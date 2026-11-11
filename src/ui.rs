@@ -215,6 +215,10 @@ enum Field {
     DragToX,
     DragToY,
     DragMs,
+    DragTaps,
+    AreaRotation,
+    AreaHollow,
+    DragHold,
     MouseSpeed,
     ScrollStrength,
 }
@@ -288,6 +292,8 @@ pub struct MacroApp {
     run_check: Option<RunCheck>,
     /// The run was started with F8 (so MacroFlow may be hidden).
     hotkey_start: bool,
+    /// Editing a step's random area on top of a screenshot.
+    shape_edit: Option<ShapeEdit>,
     /// The run-log line being looked at (its picture shows on the canvas).
     log_sel: Option<usize>,
     /// Playing the run log back.
@@ -423,6 +429,7 @@ impl MacroApp {
             show_original: false,
             results: HashMap::new(),
             log_sel: None,
+            shape_edit: None,
             replay_playing: false,
             replay_speed: 1,
             replay_next: None,
@@ -591,6 +598,12 @@ impl MacroApp {
                 }
                 WorkerMsg::Vars(v) => self.live_vars = v,
                 WorkerMsg::Refresh => {}
+                WorkerMsg::ShapeShot { step, shot } => {
+                    self.mode = Mode::Idle;
+                    self.restore_after_test = false;
+                    show_again(window, cx);
+                    self.open_shape_editor(step, shot);
+                }
                 WorkerMsg::Seen { step, path, caption, ok } => {
                     if let Some(old) = self.seen.insert(step, SeenShot { path, caption, ok }) {
                         let _ = std::fs::remove_file(old.path);
@@ -1332,14 +1345,25 @@ impl MacroApp {
             AreaPurpose::ClickArea(id) => {
                 let _ = std::fs::remove_file(&shot.path);
                 let rect = saved;
-                self.update_node(id, |k| match k {
-                    NodeKind::Click { area, target, .. } | NodeKind::MoveMouse { area, target, .. } => {
+                let mut taps = false;
+                self.update_node(id, |k| {
+                    if let Some((area, _)) = k.area_parts_mut() {
                         *area = Some(rect);
-                        *target = Target::Area;
                     }
-                    _ => {}
+                    match k {
+                        NodeKind::Click { target, .. } | NodeKind::MoveMouse { target, .. } => *target = Target::Area,
+                        NodeKind::Drag { tap_in_area, .. } => {
+                            *tap_in_area = true;
+                            taps = true;
+                        }
+                        _ => {}
+                    }
                 });
-                self.status = format!("It will click a random spot inside {w}×{h} at ({gx}, {gy}) each time.");
+                self.status = if taps {
+                    format!("The taps will be spread round {w}×{h} at ({gx}, {gy}). Give it a shape below.")
+                } else {
+                    format!("It will click a random spot inside {w}×{h} at ({gx}, {gy}) each time.")
+                };
                 return;
             }
         }
@@ -1429,6 +1453,515 @@ impl MacroApp {
         if self.confirm_close(AfterSave::Quit, window, cx) {
             cx.quit();
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Shape editor
+    // -----------------------------------------------------------------------
+
+    /// Take a screenshot (with MacroFlow out of the way) and open the shape editor
+    /// for a step's random area on top of it.
+    fn start_shape_editor(&mut self, id: u64, window: &mut Window) {
+        self.commit_edit();
+        let Some(saved) = self.doc.node(id).and_then(|n| n.kind.area_parts().map(|(a, _)| a)) else {
+            return;
+        };
+        // Screenshot the display the area is on (or the one under the mouse).
+        let at = match saved {
+            Some(r) => {
+                let Some(mapping) = self.test_mapping() else { return };
+                let r = mapping.rect(r);
+                Some((r.x + r.w / 2, r.y + r.h / 2))
+            }
+            None => None,
+        };
+        if self.begin_worker(Mode::Working) {
+            self.status = "Capturing the screen…".into();
+            self.restore_after_test = true;
+            window.minimize_window();
+            engine::capture_for_editor(self.tx.clone(), self.stop.clone(), id, at);
+        }
+    }
+
+    /// The screenshot arrived: open the editor with the step's area on it.
+    fn open_shape_editor(&mut self, step: u64, shot: vision::Shot) {
+        let Some((area, shape, taps)) = self.doc.node(step).and_then(|n| {
+            let taps = match &n.kind {
+                NodeKind::Drag { taps, .. } => *taps,
+                _ => 0,
+            };
+            n.kind.area_parts().map(|(a, sh)| (a, sh.clone(), taps))
+        }) else {
+            let _ = std::fs::remove_file(&shot.path);
+            return;
+        };
+        let mapping = self.test_mapping().unwrap_or_else(Mapping::identity);
+        let mut shape = shape;
+        let (cx, cy, w, h) = match area {
+            Some(r) => {
+                let r = mapping.rect(r);
+                if shape.hollow_px > 0 {
+                    shape.hollow_px = ((shape.hollow_px as f64 * mapping.scale()).round() as i32).max(1);
+                }
+                (r.x as f64 + r.w as f64 / 2.0, r.y as f64 + r.h as f64 / 2.0, r.w as f64, r.h as f64)
+            }
+            // No area yet: a box in the middle of the screen to start from.
+            None => (
+                shot.ox as f64 + shot.w as f64 / 2.0,
+                shot.oy as f64 + shot.h as f64 / 2.0,
+                shot.w as f64 * 0.3,
+                shot.h as f64 * 0.3,
+            ),
+        };
+        self.shape_edit = Some(ShapeEdit {
+            step,
+            shot,
+            cx,
+            cy,
+            w,
+            h,
+            shape,
+            taps,
+            drag: EditDrag::None,
+            drawing: false,
+            k: 0.5,
+            origin: Rc::new(Cell::new((0.0, 0.0))),
+        });
+        self.status = "Drag the shape into place, then Save (Enter). Esc cancels.".into();
+    }
+
+    fn close_shape_editor(&mut self) {
+        if let Some(ed) = self.shape_edit.take() {
+            let _ = std::fs::remove_file(&ed.shot.path);
+        }
+    }
+
+    /// Save what was drawn back into the step.
+    fn save_shape_edit(&mut self) {
+        let Some(ed) = self.shape_edit.clone() else { return };
+        if ed.is_poly() && ed.shape.points.len() < 3 {
+            self.status = "A freeform outline needs at least 3 corners.".into();
+            return;
+        }
+        let back = self.saved_mapping();
+        let saved = back.rect(ed.rect());
+        let mut shape = ed.shape.clone();
+        shape.rotation = (shape.rotation + 180.0).rem_euclid(360.0) - 180.0;
+        if shape.hollow_px > 0 {
+            shape.hollow_px = ((shape.hollow_px as f64 * back.scale()).round() as i32).max(1);
+        }
+        let desc = if shape.is_plain() { "rectangle".to_string() } else { shape.describe() };
+        self.update_node(ed.step, |k| {
+            if let Some((area, sh)) = k.area_parts_mut() {
+                *area = Some(saved);
+                *sh = shape;
+            }
+            match k {
+                NodeKind::Click { target, .. } | NodeKind::MoveMouse { target, .. } => *target = Target::Area,
+                NodeKind::Drag { tap_in_area, .. } => *tap_in_area = true,
+                _ => {}
+            }
+        });
+        self.close_shape_editor();
+        self.status = format!("Area saved: {desc}, {} × {}.", saved.w, saved.h);
+    }
+
+    fn edit_mouse_down(&mut self, pos: Point<Pixels>, right: bool) {
+        let Some(ed) = self.shape_edit.as_mut() else { return };
+        let p = ed.screen_at(f32::from(pos.x), f32::from(pos.y));
+        let tol = ed.tolerance();
+        if right {
+            // Right-click a freeform corner to remove it.
+            if ed.is_poly() && !ed.drawing && ed.shape.points.len() > 3 {
+                if let Some(i) = ed.poly().iter().position(|q| dist(*q, p) <= tol) {
+                    ed.shape.points.remove(i);
+                    ed.refit();
+                }
+            }
+            return;
+        }
+        if ed.drawing {
+            let pts = ed.poly();
+            if pts.len() >= 3 && dist(pts[0], p) <= tol * 1.4 {
+                // Back at the first corner: the outline is done.
+                ed.drawing = false;
+            } else if ed.shape.points.is_empty() {
+                ed.cx = p.0;
+                ed.cy = p.1;
+                ed.w = 1.0;
+                ed.h = 1.0;
+                ed.shape.points.push([0.5, 0.5]);
+            } else {
+                let n = ed.shape.points.len();
+                ed.set_point(n, p.0, p.1);
+            }
+            return;
+        }
+        if dist(ed.rot_handle(), p) <= tol * 1.2 {
+            ed.drag = EditDrag::Rotate;
+            return;
+        }
+        if ed.is_poly() {
+            if let Some(i) = ed.poly().iter().position(|q| dist(*q, p) <= tol) {
+                ed.drag = EditDrag::Point(i);
+                return;
+            }
+        }
+        if let Some(i) = (0..4).find(|i| dist(ed.corner(*i), p) <= tol) {
+            ed.drag = EditDrag::Corner(i);
+            return;
+        }
+        if let Some(i) = (0..4).find(|i| dist(ed.edge(*i), p) <= tol) {
+            ed.drag = EditDrag::Edge(i);
+            return;
+        }
+        if ed.is_poly() && ed.shape.points.len() >= 3 {
+            let pts = ed.poly();
+            if inside_poly(&pts, p.0, p.1) {
+                ed.drag = EditDrag::Move { dx: p.0 - ed.cx, dy: p.1 - ed.cy };
+            } else {
+                // Outside the outline: a new corner on the nearest side.
+                let n = pts.len();
+                let side = (0..n)
+                    .min_by(|a, b| {
+                        seg_dist(p, pts[*a], pts[(*a + 1) % n])
+                            .partial_cmp(&seg_dist(p, pts[*b], pts[(*b + 1) % n]))
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    })
+                    .unwrap_or(n - 1);
+                let (lx, ly) = ed.to_local(p.0, p.1);
+                let f = [(lx / ed.w.max(1.0) + 0.5) as f32, (ly / ed.h.max(1.0) + 0.5) as f32];
+                ed.shape.points.insert(side + 1, f);
+                ed.refit();
+                ed.drag = EditDrag::Point(side + 1);
+            }
+            return;
+        }
+        let (lx, ly) = ed.to_local(p.0, p.1);
+        if lx.abs() <= ed.w / 2.0 && ly.abs() <= ed.h / 2.0 {
+            ed.drag = EditDrag::Move { dx: p.0 - ed.cx, dy: p.1 - ed.cy };
+        } else {
+            // Outside: draw a new box from here.
+            ed.drag = EditDrag::NewBox { x0: p.0, y0: p.1 };
+            ed.shape.rotation = 0.0;
+            ed.cx = p.0;
+            ed.cy = p.1;
+            ed.w = 1.0;
+            ed.h = 1.0;
+        }
+    }
+
+    fn edit_mouse_move(&mut self, pos: Point<Pixels>, shift: bool) {
+        let Some(ed) = self.shape_edit.as_mut() else { return };
+        let p = ed.screen_at(f32::from(pos.x), f32::from(pos.y));
+        match ed.drag {
+            EditDrag::None => {}
+            EditDrag::Move { dx, dy } => {
+                ed.cx = p.0 - dx;
+                ed.cy = p.1 - dy;
+            }
+            EditDrag::Corner(i) => {
+                let (sx, sy) = CORNER_SIGNS[i];
+                // The opposite corner stays put.
+                let o = (-sx * ed.w / 2.0, -sy * ed.h / 2.0);
+                let l = ed.to_local(p.0, p.1);
+                let (nw, nh) = ((l.0 - o.0).abs().max(4.0), (l.1 - o.1).abs().max(4.0));
+                let mid = ((l.0 + o.0) / 2.0, (l.1 + o.1) / 2.0);
+                let (ncx, ncy) = ed.to_screen(mid.0, mid.1);
+                (ed.cx, ed.cy, ed.w, ed.h) = (ncx, ncy, nw, nh);
+            }
+            EditDrag::Edge(i) => {
+                let (sx, sy) = EDGE_SIGNS[i];
+                let l = ed.to_local(p.0, p.1);
+                if sx == 0.0 {
+                    let o = -sy * ed.h / 2.0;
+                    let nh = (l.1 - o).abs().max(4.0);
+                    let (ncx, ncy) = ed.to_screen(0.0, (l.1 + o) / 2.0);
+                    (ed.cx, ed.cy, ed.h) = (ncx, ncy, nh);
+                } else {
+                    let o = -sx * ed.w / 2.0;
+                    let nw = (l.0 - o).abs().max(4.0);
+                    let (ncx, ncy) = ed.to_screen((l.0 + o) / 2.0, 0.0);
+                    (ed.cx, ed.cy, ed.w) = (ncx, ncy, nw);
+                }
+            }
+            EditDrag::Rotate => {
+                // Straight up = 0°, clockwise positive. Shift snaps to 15°.
+                let mut deg = (p.0 - ed.cx).atan2(-(p.1 - ed.cy)).to_degrees();
+                if shift {
+                    deg = (deg / 15.0).round() * 15.0;
+                }
+                ed.shape.rotation = deg as f32;
+            }
+            EditDrag::Point(i) => ed.set_point(i, p.0, p.1),
+            EditDrag::NewBox { x0, y0 } => {
+                ed.cx = (x0 + p.0) / 2.0;
+                ed.cy = (y0 + p.1) / 2.0;
+                ed.w = (p.0 - x0).abs().max(1.0);
+                ed.h = (p.1 - y0).abs().max(1.0);
+            }
+        }
+    }
+
+    fn edit_mouse_up(&mut self) {
+        if let Some(ed) = self.shape_edit.as_mut() {
+            if let EditDrag::NewBox { .. } = ed.drag {
+                // A click rather than a drag: keep a usable box.
+                if ed.w < 6.0 || ed.h < 6.0 {
+                    ed.w = ed.w.max(40.0);
+                    ed.h = ed.h.max(40.0);
+                }
+            }
+            ed.drag = EditDrag::None;
+        }
+    }
+
+    /// Keys while the shape editor is open.
+    fn edit_key(&mut self, key: &str, shift: bool) {
+        let Some(ed) = self.shape_edit.as_mut() else { return };
+        match key {
+            "escape" => {
+                if ed.drawing && ed.shape.points.len() >= 3 {
+                    ed.drawing = false;
+                } else {
+                    self.close_shape_editor();
+                    self.status = "Area not changed.".into();
+                }
+            }
+            "enter" | "return" => {
+                if ed.drawing {
+                    if ed.shape.points.len() >= 3 {
+                        ed.drawing = false;
+                    }
+                } else {
+                    self.save_shape_edit();
+                }
+            }
+            "backspace" | "delete" if ed.drawing => {
+                ed.shape.points.pop();
+                ed.refit();
+            }
+            "left" | "right" if !ed.drawing => {
+                let step = if shift { 15.0 } else { 1.0 };
+                ed.shape.rotation += if key == "left" { -step } else { step };
+            }
+            _ => {}
+        }
+    }
+
+    fn render_shape_edit(&self, cx: &mut Context<Self>) -> Stateful<Div> {
+        let Some(ed) = &self.shape_edit else { return div().id("shape-edit") };
+        let (iw, ih) = (ed.shot.w as f32 * ed.k, ed.shot.h as f32 * ed.k);
+        let snap = ed.clone();
+        let origin = ed.origin.clone();
+        let overlay = canvas(
+            move |bounds, _, _| origin.set((f32::from(bounds.origin.x), f32::from(bounds.origin.y))),
+            move |bounds, _, window, _| paint_shape_edit(&snap, bounds, window),
+        )
+        .absolute()
+        .top_0()
+        .left_0()
+        .size_full();
+        let kind = ed.shape.kind;
+        let poly = ed.is_poly();
+        let drawing = ed.drawing;
+        let hollow = ed.shape.hollow_px;
+        let set_shape = |k: ShapeKind| {
+            cx.listener(move |this: &mut Self, _: &ClickEvent, _, cx| {
+                if let Some(ed) = this.shape_edit.as_mut() {
+                    ed.shape.kind = k;
+                    ed.drawing = false;
+                    if k == ShapeKind::Polygon && ed.shape.points.len() < 3 {
+                        ed.shape.points = default_polygon_points();
+                    }
+                }
+                cx.notify();
+            })
+        };
+        let mut shapes = div().flex().flex_row().flex_wrap().gap_1();
+        for k in ShapeKind::ALL {
+            shapes = shapes.child(chip(("edit-shape", k as usize), k.label(), kind == k).on_click(set_shape(k)));
+        }
+        let bump_hollow = |id: &'static str, label: &'static str, d: i32| {
+            small_btn(id, label).on_click(cx.listener(move |this, ev: &ClickEvent, _, cx| {
+                if let Some(ed) = this.shape_edit.as_mut() {
+                    let step = if ev.modifiers().shift { d * 5 } else { d };
+                    ed.shape.hollow_px = (ed.shape.hollow_px + step).clamp(0, 2000);
+                }
+                cx.notify();
+            }))
+        };
+        let tools = div()
+            .flex()
+            .flex_row()
+            .flex_wrap()
+            .items_center()
+            .gap_2()
+            .child(shapes)
+            .child(divider())
+            .child(div().text_xs().text_color(rgb(MUTED)).child("Hollow edge"))
+            .child(bump_hollow("edit-hollow-minus", "−", -5))
+            .child(
+                div()
+                    .min_w(px(54.))
+                    .text_center()
+                    .text_xs()
+                    .child(if hollow > 0 { format!("{hollow} px") } else { "off".to_string() }),
+            )
+            .child(bump_hollow("edit-hollow-plus", "+", 5))
+            .child(divider())
+            .child(div().text_xs().text_color(rgb(MUTED)).child(format!("Turn {:.0}°", ed.shape.rotation)))
+            .child(small_btn("edit-turn-reset", "Straighten").on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                if let Some(ed) = this.shape_edit.as_mut() {
+                    ed.shape.rotation = 0.0;
+                }
+                cx.notify();
+            })))
+            .when(poly, |d| {
+                d.child(divider()).child(
+                    small_btn("edit-draw", if drawing { "Finish outline" } else { "Draw a new outline" }).on_click(
+                        cx.listener(|this, _: &ClickEvent, _, cx| {
+                            if let Some(ed) = this.shape_edit.as_mut() {
+                                if ed.drawing {
+                                    if ed.shape.points.len() >= 3 {
+                                        ed.drawing = false;
+                                    }
+                                } else {
+                                    ed.drawing = true;
+                                    ed.shape.points.clear();
+                                    ed.shape.rotation = 0.0;
+                                }
+                            }
+                            cx.notify();
+                        }),
+                    ),
+                )
+            })
+            .child(div().flex_1())
+            .child(small_btn("edit-cancel", "Cancel  (Esc)").on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                this.close_shape_editor();
+                this.status = "Area not changed.".into();
+                cx.notify();
+            })))
+            .child(
+                small_btn("edit-save", "Save  (Enter)")
+                    .bg(rgb(ACCENT))
+                    .text_color(rgb(0xffffff))
+                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                        this.save_shape_edit();
+                        cx.notify();
+                    })),
+            );
+        let hint = if drawing {
+            "Click each corner of the outline in turn. Click the first corner again (or press Enter) to finish · Backspace removes the last corner."
+        } else if poly {
+            "Drag a corner dot to move it · click outside the outline to add a corner · right-click a dot to remove it · drag inside to move it all · squares resize · the round handle turns it (Shift snaps to 15°)."
+        } else {
+            "Drag inside to move · the squares resize · the round handle on top turns it (Shift snaps to 15°, ← → nudge) · drag outside the box to draw a new one."
+        };
+        div()
+            .id("shape-edit")
+            .occlude()
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+            .flex()
+            .flex_col()
+            .items_center()
+            .gap_2()
+            .p_3()
+            .bg(rgba(0x0b0d12f2))
+            .text_sm()
+            .text_color(rgb(TEXT))
+            .child(
+                div()
+                    .w_full()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(div().font_weight(FontWeight::BOLD).child(if ed.taps > 0 {
+                        "Where to tap"
+                    } else {
+                        "Where to click"
+                    }))
+                    .child(tools),
+            )
+            .child(
+                div()
+                    .id("shape-edit-picture")
+                    .relative()
+                    .flex_none()
+                    .w(px(iw))
+                    .h(px(ih))
+                    .border_1()
+                    .border_color(rgb(BORDER))
+                    .cursor_crosshair()
+                    .child(img(ed.shot.path.clone()).size_full())
+                    .child(overlay)
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, ev: &MouseDownEvent, _, cx| {
+                            cx.stop_propagation();
+                            this.edit_mouse_down(ev.position, false);
+                            cx.notify();
+                        }),
+                    )
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(|this, ev: &MouseDownEvent, _, cx| {
+                            cx.stop_propagation();
+                            this.edit_mouse_down(ev.position, true);
+                            cx.notify();
+                        }),
+                    ),
+            )
+            .child(div().text_xs().text_color(rgb(MUTED)).child(hint))
+    }
+
+    /// Flash the green dot at a few random spots in a step's click area, on the real
+    /// screen, so you can see where clicks will land.
+    fn show_area_on_screen(&mut self, id: u64) {
+        self.commit_edit();
+        let Some((Some(r), shape, taps)) = self.doc.node(id).and_then(|n| {
+            let taps = match &n.kind {
+                NodeKind::Drag { taps, .. } => *taps,
+                _ => 0,
+            };
+            n.kind.area_parts().map(|(a, sh)| (a, sh.clone(), taps))
+        }) else {
+            self.status = "Select an area first.".into();
+            return;
+        };
+        let Some(mapping) = self.test_mapping() else { return };
+        let r = mapping.rect(r);
+        let mut shape = shape;
+        if shape.hollow_px > 0 {
+            shape.hollow_px = ((shape.hollow_px as f64 * mapping.scale()).round() as i32).max(1);
+        }
+        let mut seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(7)
+            | 1;
+        let mut unit = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % 1_000_000) as f64 / 1_000_000.0
+        };
+        let points: Vec<(i32, i32)> = if taps > 0 {
+            spread_taps(r, &shape, taps.min(80), &mut unit)
+        } else {
+            (0..24).map(|_| area_point(r, &shape, &mut unit)).collect()
+        };
+        let n = points.len();
+        marker::tour(points);
+        self.status = if taps > 0 {
+            format!("Showing where {n} taps would go, in order, with the green dot…")
+        } else {
+            "Showing 24 random spots in the area with the green dot…".into()
+        };
     }
 
     /// Scroll wherever the mouse is in 3 seconds, the way this Scroll step would.
@@ -2215,6 +2748,7 @@ impl MacroApp {
             (Field::DragToX, NodeKind::Drag { to_x, .. }) => to_x.to_string(),
             (Field::DragToY, NodeKind::Drag { to_y, .. }) => to_y.to_string(),
             (Field::DragMs, NodeKind::Drag { duration_ms, .. }) => duration_ms.to_string(),
+            (Field::DragTaps, NodeKind::Drag { taps, .. }) => taps.to_string(),
             (Field::W, NodeKind::ReadText { w, .. }) => w.to_string(),
             (Field::H, NodeKind::ReadText { h, .. }) => h.to_string(),
             (Field::CompareValue, NodeKind::ReadText { value, .. }) => value.clone(),
@@ -2227,6 +2761,13 @@ impl MacroApp {
                 Field::ClickJitter,
                 NodeKind::Click { jitter_px, .. } | NodeKind::MoveMouse { jitter_px, .. },
             ) => jitter_px.to_string(),
+            (Field::AreaRotation, k) if k.area_parts().is_some() => {
+                format!("{:.0}", k.area_parts().map_or(0.0, |(_, sh)| sh.rotation))
+            }
+            (Field::AreaHollow, k) if k.area_parts().is_some() => {
+                k.area_parts().map_or(0, |(_, sh)| sh.hollow_px).to_string()
+            }
+            (Field::DragHold, NodeKind::Drag { hold_ms, .. }) => hold_ms.to_string(),
             (
                 Field::OffX,
                 NodeKind::Click { offset_x, .. } | NodeKind::MoveMouse { offset_x, .. },
@@ -2361,6 +2902,7 @@ impl MacroApp {
             (Field::DragToX, NodeKind::Drag { to_x, .. }) => *to_x = int()? as i32,
             (Field::DragToY, NodeKind::Drag { to_y, .. }) => *to_y = int()? as i32,
             (Field::DragMs, NodeKind::Drag { duration_ms, .. }) => *duration_ms = int()?.clamp(0, 20_000) as u64,
+            (Field::DragTaps, NodeKind::Drag { taps, .. }) => *taps = int()?.clamp(0, 500) as u32,
             (Field::W, NodeKind::ReadText { w, .. }) => *w = int()?.clamp(0, 10_000) as i32,
             (Field::H, NodeKind::ReadText { h, .. }) => *h = int()?.clamp(0, 10_000) as i32,
             (Field::CompareValue, NodeKind::ReadText { value, .. }) => *value = raw.to_string(),
@@ -2375,6 +2917,20 @@ impl MacroApp {
                 Field::ClickJitter,
                 NodeKind::Click { jitter_px, .. } | NodeKind::MoveMouse { jitter_px, .. },
             ) => *jitter_px = int()?.clamp(0, 500) as i32,
+            (Field::AreaRotation, k) if k.area_parts().is_some() => {
+                // Keep it between -180° and 180° (so 190 becomes -170).
+                let v = int()? as f32;
+                if let Some((_, sh)) = k.area_parts_mut() {
+                    sh.rotation = (v + 180.0).rem_euclid(360.0) - 180.0;
+                }
+            }
+            (Field::AreaHollow, k) if k.area_parts().is_some() => {
+                let v = int()?.clamp(0, 5000) as i32;
+                if let Some((_, sh)) = k.area_parts_mut() {
+                    sh.hollow_px = v;
+                }
+            }
+            (Field::DragHold, NodeKind::Drag { hold_ms, .. }) => *hold_ms = int()?.clamp(0, 10_000) as u64,
             (
                 Field::OffX,
                 NodeKind::Click { offset_x, .. } | NodeKind::MoveMouse { offset_x, .. },
@@ -2512,6 +3068,12 @@ impl MacroApp {
         let key = ks.key.as_str();
         let m = ks.modifiers;
 
+        if self.shape_edit.is_some() {
+            self.edit_key(key, m.shift);
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
         if self.quick.is_some() {
             self.quick_key(ev, cx);
             return;
@@ -3229,6 +3791,17 @@ impl MacroApp {
     fn on_mouse_move(&mut self, ev: &MouseMoveEvent, _window: &mut Window, cx: &mut Context<Self>) {
         let (wx, wy) = (f32::from(ev.position.x), f32::from(ev.position.y));
         self.mouse = (wx, wy);
+        if let Some(ed) = &self.shape_edit {
+            if ed.drag != EditDrag::None {
+                if ev.pressed_button == Some(MouseButton::Left) {
+                    self.edit_mouse_move(ev.position, ev.modifiers.shift);
+                } else {
+                    self.edit_mouse_up();
+                }
+                cx.notify();
+            }
+            return;
+        }
         if ev.pressed_button != Some(MouseButton::Left) {
             if self.drag != Drag::None {
                 self.drag = Drag::None;
@@ -3332,6 +3905,11 @@ impl MacroApp {
     /// Mouse released anywhere in the window.
     fn finish_drag(&mut self, pos: Point<Pixels>, cx: &mut Context<Self>) {
         self.field_drag = false;
+        if self.shape_edit.is_some() {
+            self.edit_mouse_up();
+            cx.notify();
+            return;
+        }
         // Let go of a new line on empty canvas: pick a step to add there, connected.
         if let Drag::Connect { from, port } = self.drag {
             let (ox, oy) = self.canvas_origin.get();
@@ -6220,8 +6798,11 @@ impl MacroApp {
                 out.push(self.target_row(id, *target, cx).into_any_element());
                 out.extend(self.position_fields(id, *target, cx));
             }
-            NodeKind::Drag { button, .. } => {
+            NodeKind::Drag { button, taps, tap_in_area, .. } => {
                 let b = *button;
+                let tapping = *taps > 0;
+                let in_area = tapping && *tap_in_area;
+                if !in_area {
                 out.push(section_title("Start").into_any_element());
                 out.push(self.num_field("X", Field::DragFromX, 1.0, cx).into_any_element());
                 out.push(self.num_field("Y", Field::DragFromY, 1.0, cx).into_any_element());
@@ -6245,6 +6826,7 @@ impl MacroApp {
                         .into_any_element(),
                 );
                 out.push(div().h(px(4.)).into_any_element());
+                }
                 out.push(
                     labeled(
                         "Button",
@@ -6263,8 +6845,60 @@ impl MacroApp {
                     )
                     .into_any_element(),
                 );
-                out.push(self.num_field("Move takes (ms)", Field::DragMs, 50.0, cx).into_any_element());
-                out.push(help("Presses the button at the start, moves smoothly to the end (curved if human-like mouse movement is on in the Macro tab), then lets go. Good for sliders, drag-and-drop and selecting text. The macro's Speed setting changes how long the move takes.").into_any_element());
+                out.push(self.num_field("Tap instead of dragging (taps, 0 = drag)", Field::DragTaps, 1.0, cx).into_any_element());
+                if tapping {
+                    out.push(
+                        labeled(
+                            "Spread the taps",
+                            div()
+                                .flex()
+                                .flex_wrap()
+                                .gap_1()
+                                .child(chip("tap-line", "Along the line", !in_area).on_click(cx.listener(
+                                    move |this, _: &ClickEvent, _, cx| {
+                                        this.update_node(id, |k| {
+                                            if let NodeKind::Drag { tap_in_area, .. } = k {
+                                                *tap_in_area = false;
+                                            }
+                                        });
+                                        cx.notify();
+                                    },
+                                )))
+                                .child(chip("tap-area", "Round a shape", in_area).on_click(cx.listener(
+                                    move |this, ev: &ClickEvent, window, cx| {
+                                        let mut has_area = false;
+                                        this.update_node(id, |k| {
+                                            if let NodeKind::Drag { tap_in_area, tap_area, .. } = k {
+                                                *tap_in_area = true;
+                                                has_area = tap_area.is_some();
+                                            }
+                                        });
+                                        // No area yet: go straight to dragging a box for it.
+                                        if !has_area {
+                                            this.start_area(AreaPurpose::ClickArea(id), ev.modifiers().shift, window, cx);
+                                        }
+                                        cx.notify();
+                                    },
+                                ))),
+                        )
+                        .into_any_element(),
+                    );
+                }
+                if in_area {
+                    out.extend(self.area_block(id, cx));
+                }
+                out.push(self.num_field(if tapping { "All the taps take (ms)" } else { "Move takes (ms)" }, Field::DragMs, 50.0, cx).into_any_element());
+                if !tapping {
+                    out.push(self.num_field("Hold still before moving (ms)", Field::DragHold, 50.0, cx).into_any_element());
+                    out.push(help("After pressing, it keeps the mouse still this long before it starts moving (80 ms is a quick press). Raise it to 300–800 ms for apps that only pick something up after you've held it still – otherwise they pan the view instead.").into_any_element());
+                }
+                out.push(help(if in_area {
+                    "Taps that many times round the shape below instead of dragging, spread over the time above."
+                } else if tapping {
+                    "Taps that many times, evenly spaced from the start to the end, spread over the time above (a few pixels off each time). Use this where dragging moves the view instead, e.g. placing troops along the edge of a base in a game. “Round a shape” spreads them round an area instead."
+                } else {
+                    "Presses the button at the start, holds still, moves smoothly to the end (curved if human-like mouse movement is on in the Macro tab), then lets go. Good for sliders, drag-and-drop and selecting text. The macro's Speed setting changes how long the move takes (not the hold). Set taps above 0 to tap instead of dragging."
+                }).into_any_element());
             }
             NodeKind::KeyPress { key, mods } => {
                 let capturing = self.capturing_key;
@@ -6487,6 +7121,149 @@ impl MacroApp {
         )
     }
 
+    /// The random-area settings shared by Click / Move mouse ("Random in area") and
+    /// Drag ("taps round a shape"): select / edit / show buttons, shape, turn,
+    /// hollow band and a preview.
+    fn area_block(&self, id: u64, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let Some(n) = self.doc.node(id) else { return Vec::new() };
+        let Some((area, shape)) = n.kind.area_parts() else { return Vec::new() };
+        let shape = shape.clone();
+        let taps = match &n.kind {
+            NodeKind::Drag { taps, .. } => *taps,
+            _ => 0,
+        };
+        let what = if taps > 0 { "Spreads the taps" } else { "Picks a different random spot" };
+        let mut v = vec![match area {
+            Some(r) if shape.is_plain() => {
+                help(&format!("{what} inside {} × {} at ({}, {}).", r.w, r.h, r.x, r.y)).into_any_element()
+            }
+            Some(r) => help(&format!(
+                "{what} inside a {} in the {} × {} box at ({}, {}).",
+                shape.describe(),
+                r.w,
+                r.h,
+                r.x,
+                r.y
+            ))
+            .into_any_element(),
+            None => help(if taps > 0 {
+                "No area yet – drag a box round where to tap, or draw the shape with “Edit on screen”."
+            } else {
+                "No area yet – drag a box around where it should click, or draw the shape with “Edit on screen”."
+            })
+            .into_any_element(),
+        }];
+        let select_label: &'static str = match (area.is_some(), taps > 0) {
+            (false, true) => "Select tap area",
+            (true, true) => "Select tap area again",
+            (false, false) => "Select click area",
+            (true, false) => "Select click area again",
+        };
+        v.push(
+            div()
+                .flex()
+                .flex_wrap()
+                .gap_1()
+                .child(small_btn("click-area", select_label).on_click(cx.listener(
+                    move |this, ev: &ClickEvent, window, cx| {
+                        this.start_area(AreaPurpose::ClickArea(id), ev.modifiers().shift, window, cx);
+                        cx.notify();
+                    },
+                )))
+                .child(small_btn("area-edit", "Edit on screen…").on_click(cx.listener(
+                    move |this, _: &ClickEvent, window, cx| {
+                        this.start_shape_editor(id, window);
+                        cx.notify();
+                    },
+                )))
+                .when(area.is_some(), |d| {
+                    d.child(small_btn("area-tour", "Show on screen").on_click(cx.listener(
+                        move |this, _: &ClickEvent, _, cx| {
+                            this.show_area_on_screen(id);
+                            cx.notify();
+                        },
+                    )))
+                })
+                .into_any_element(),
+        );
+        let Some(r) = area else { return v };
+        v.push(div().h(px(4.)).into_any_element());
+        v.push(
+            labeled(
+                "Shape",
+                div().flex().flex_wrap().gap_1().children(ShapeKind::ALL.into_iter().map(|k| {
+                    chip(("area-shape", k as usize), k.label(), shape.kind == k).on_click(cx.listener(
+                        move |this, _: &ClickEvent, window, cx| {
+                            let mut new_outline = false;
+                            this.update_node(id, |n| {
+                                if let Some((_, sh)) = n.area_parts_mut() {
+                                    sh.kind = k;
+                                    if k == ShapeKind::Polygon && sh.points.len() < 3 {
+                                        sh.points = default_polygon_points();
+                                        new_outline = true;
+                                    }
+                                }
+                            });
+                            // A new freeform outline: straight to drawing it on screen.
+                            if new_outline {
+                                this.start_shape_editor(id, window);
+                            }
+                            cx.notify();
+                        },
+                    ))
+                })),
+            )
+            .into_any_element(),
+        );
+        if shape.kind == ShapeKind::Polygon {
+            v.push(
+                help(&format!(
+                    "{} corners. Use “Edit on screen…” to move them, add more (click outside the outline) or draw a new outline.",
+                    shape.points.len()
+                ))
+                .into_any_element(),
+            );
+        }
+        v.push(self.num_field("Turn (degrees, clockwise)", Field::AreaRotation, 5.0, cx).into_any_element());
+        v.push(
+            div()
+                .flex()
+                .flex_wrap()
+                .gap_1()
+                .children([0i32, 30, 45, 60, 90].into_iter().map(|deg| {
+                    chip(("area-turn", deg as usize), turn_label(deg), shape.rotation.round() as i32 == deg).on_click(
+                        cx.listener(move |this, _: &ClickEvent, _, cx| {
+                            this.update_node(id, |n| {
+                                if let Some((_, sh)) = n.area_parts_mut() {
+                                    sh.rotation = deg as f32;
+                                }
+                            });
+                            cx.notify();
+                        }),
+                    )
+                }))
+                .into_any_element(),
+        );
+        v.push(
+            self.num_field("Hollow: only the edge band (px, 0 = whole shape)", Field::AreaHollow, 5.0, cx)
+                .into_any_element(),
+        );
+        v.push(area_preview(r, &shape, taps).into_any_element());
+        v.push(
+            help(if taps > 0 {
+                if shape.hollow_px > 0 {
+                    "Green dots: where the taps go. With a hollow shape they go round the edge band in order, from a random starting point, either way round – e.g. troops round the outside of a base. Every run is a little different."
+                } else {
+                    "Green dots: where the taps go – spread evenly over the whole shape, a little different every run. Make it hollow to tap round its edge instead."
+                }
+            } else {
+                "Green dots: where clicks can land (a sample). The faint box is the area you dragged; the shape fits inside it and turns around its middle, so a turned shape can stick out of the box. Hollow keeps only a band along the edge, e.g. a hollow diamond for the outside edge of a base."
+            })
+            .into_any_element(),
+        );
+        v
+    }
+
     fn position_fields(&self, id: u64, target: Target, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let mut out: Vec<AnyElement> = match target {
             Target::Fixed => vec![
@@ -6499,29 +7276,7 @@ impl MacroApp {
                     }))
                     .into_any_element(),
             ],
-            Target::Area => {
-                let area = match self.doc.node(id).map(|n| &n.kind) {
-                    Some(NodeKind::Click { area, .. } | NodeKind::MoveMouse { area, .. }) => *area,
-                    _ => None,
-                };
-                let mut v = vec![match area {
-                    Some(r) => help(&format!(
-                        "Picks a different random spot inside {} × {} at ({}, {}) every time.",
-                        r.w, r.h, r.x, r.y
-                    ))
-                    .into_any_element(),
-                    None => help("No area yet – drag a box around where it should click.").into_any_element(),
-                }];
-                v.push(
-                    small_btn("click-area", if area.is_some() { "Select click area again" } else { "Select click area" })
-                        .on_click(cx.listener(move |this, ev: &ClickEvent, window, cx| {
-                            this.start_area(AreaPurpose::ClickArea(id), ev.modifiers().shift, window, cx);
-                            cx.notify();
-                        }))
-                        .into_any_element(),
-                );
-                v
-            }
+            Target::Area => self.area_block(id, cx),
             Target::FoundImage => vec![
                 self.num_field("Offset X", Field::OffX, 1.0, cx).into_any_element(),
                 self.num_field("Offset Y", Field::OffY, 1.0, cx).into_any_element(),
@@ -7884,6 +8639,12 @@ impl Render for MacroApp {
         let vp = window.viewport_size();
         let (vw, vh) = (f32::from(vp.width), f32::from(vp.height));
         let quick = self.quick.as_ref().map(|_| self.render_quick(vw, vh, cx));
+        // The shape editor fits its screenshot into the window.
+        if let Some(ed) = self.shape_edit.as_mut() {
+            let (aw, ah) = ((vw - 32.0).max(200.0), (vh - 130.0).max(150.0));
+            ed.k = (aw / ed.shot.w.max(1) as f32).min(ah / ed.shot.h.max(1) as f32).max(0.05);
+        }
+        let shape_edit = self.shape_edit.as_ref().map(|_| self.render_shape_edit(cx));
         let check = self.run_check.as_ref().map(|_| self.render_run_check(cx));
         div()
             .relative()
@@ -7918,6 +8679,7 @@ impl Render for MacroApp {
             .children(menu)
             .children(quick)
             .children(check)
+            .children(shape_edit)
     }
 }
 
@@ -7937,6 +8699,27 @@ fn bezier_mid(x0: f32, y0: f32, x1: f32, y1: f32, zoom: f32) -> (f32, f32) {
         (x0 + 3.0 * ax + 3.0 * bx + x1) / 8.0,
         (y0 + 3.0 * ay + 3.0 * by + y1) / 8.0,
     )
+}
+
+/// Draw straight lines through `pts` (closed back to the first with `closed`).
+fn stroke_poly(window: &mut Window, pts: &[Point<Pixels>], width: f32, color: Hsla, closed: bool, dashed: bool) {
+    if pts.len() < 2 {
+        return;
+    }
+    let mut b = PathBuilder::stroke(px(width));
+    if dashed {
+        b = b.dash_array(&[px(5.), px(4.)]);
+    }
+    b.move_to(pts[0]);
+    for p in &pts[1..] {
+        b.line_to(*p);
+    }
+    if closed {
+        b.close();
+    }
+    if let Ok(path) = b.build() {
+        window.paint_path(path, color);
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -8082,6 +8865,383 @@ fn section_title(text: &'static str) -> Div {
 // ---------------------------------------------------------------------------
 // Variable pills: wherever a variable is used it's shown as a small tinted tag
 // ---------------------------------------------------------------------------
+
+fn turn_label(deg: i32) -> &'static str {
+    match deg {
+        0 => "0°",
+        30 => "30°",
+        45 => "45°",
+        60 => "60°",
+        _ => "90°",
+    }
+}
+
+/// A small picture of a random click area: green dots where clicks can land
+/// (a fixed sample, so it doesn't flicker) inside the faint box that was dragged.
+fn area_preview(r: ScreenRect, shape: &AreaShape, taps: u32) -> Div {
+    let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+    let mut unit = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        (seed % 1_000_000) as f64 / 1_000_000.0
+    };
+    let local = ScreenRect { x: 0, y: 0, w: r.w.max(2), h: r.h.max(2) };
+    let (w, h) = (local.w as f32, local.h as f32);
+    // Taps: exactly where this many taps would go; otherwise a sample of spots.
+    let spots: Vec<(i32, i32)> = if taps > 0 {
+        spread_taps(local, shape, taps, &mut unit)
+    } else {
+        (0..320).map(|_| area_point(local, shape, &mut unit)).collect()
+    };
+    let dots: Vec<(f32, f32)> = spots.into_iter().map(|(x, y)| (x as f32 - w / 2.0, y as f32 - h / 2.0)).collect();
+    let dot_size = if taps > 0 { 5.0 } else { 3.0 };
+    let outline: Vec<(f32, f32)> = area_outline(local, shape)
+        .into_iter()
+        .map(|(x, y)| (x as f32 - w / 2.0, y as f32 - h / 2.0))
+        .collect();
+    // Fit the box and the turned shape.
+    let th = shape.rotation.to_radians();
+    let tw = (w * th.cos()).abs() + (h * th.sin()).abs();
+    let thh = (w * th.sin()).abs() + (h * th.cos()).abs();
+    let (fw, fh) = (tw.max(w), thh.max(h));
+    div()
+        .h(px(130.))
+        .w_full()
+        .rounded_md()
+        .bg(rgb(BG))
+        .border_1()
+        .border_color(rgb(BORDER))
+        .child(
+            canvas(
+                |_, _, _| {},
+                move |bounds, _, window, _| {
+                    let bx = f32::from(bounds.origin.x);
+                    let by = f32::from(bounds.origin.y);
+                    let bw = f32::from(bounds.size.width);
+                    let bh = f32::from(bounds.size.height);
+                    let k = ((bw - 16.0) / fw).min((bh - 16.0) / fh).max(0.0001);
+                    let (cx, cy) = (bx + bw / 2.0, by + bh / 2.0);
+                    let (ow, oh) = (w * k, h * k);
+                    let edge = hsla(BORDER);
+                    for (x, y, ew, eh) in [
+                        (cx - ow / 2.0, cy - oh / 2.0, ow, 1.0),
+                        (cx - ow / 2.0, cy + oh / 2.0 - 1.0, ow, 1.0),
+                        (cx - ow / 2.0, cy - oh / 2.0, 1.0, oh),
+                        (cx + ow / 2.0 - 1.0, cy - oh / 2.0, 1.0, oh),
+                    ] {
+                        window.paint_quad(fill(
+                            Bounds { origin: point(px(x), px(y)), size: gpui::size(px(ew), px(eh)) },
+                            edge,
+                        ));
+                    }
+                    let pts: Vec<Point<Pixels>> =
+                        outline.iter().map(|(x, y)| point(px(cx + x * k), px(cy + y * k))).collect();
+                    stroke_poly(window, &pts, 1.5, rgba((ACCENT << 8) | 0xcc).into(), true, false);
+                    let dot = hsla(GREEN);
+                    for (dx, dy) in &dots {
+                        window.paint_quad(
+                            fill(
+                                Bounds {
+                                    origin: point(px(cx + dx * k - dot_size / 2.0), px(cy + dy * k - dot_size / 2.0)),
+                                    size: gpui::size(px(dot_size), px(dot_size)),
+                                },
+                                dot,
+                            )
+                            .corner_radii(px(dot_size / 2.0)),
+                        );
+                    }
+                },
+            )
+            .size_full(),
+        )
+}
+
+// ---------------------------------------------------------------------------
+// Editing a random area's shape on top of a screenshot
+// ---------------------------------------------------------------------------
+
+/// What's being dragged in the shape editor.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum EditDrag {
+    None,
+    /// The whole shape; (dx, dy) from the mouse to the middle.
+    Move { dx: f64, dy: f64 },
+    /// A corner of the box: 0 top-left, 1 top-right, 2 bottom-right, 3 bottom-left.
+    Corner(usize),
+    /// The middle of a side: 0 top, 1 right, 2 bottom, 3 left.
+    Edge(usize),
+    /// The round handle above the shape.
+    Rotate,
+    /// A corner of a freeform outline.
+    Point(usize),
+    /// Drawing a new box from (x0, y0).
+    NewBox { x0: f64, y0: f64 },
+}
+
+const CORNER_SIGNS: [(f64, f64); 4] = [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)];
+const EDGE_SIGNS: [(f64, f64); 4] = [(0.0, -1.0), (1.0, 0.0), (0.0, 1.0), (-1.0, 0.0)];
+
+/// The shape editor: a screenshot of one display with the area drawn on it.
+/// Everything is in screen coordinates (the ones the mouse uses).
+#[derive(Clone)]
+struct ShapeEdit {
+    step: u64,
+    shot: vision::Shot,
+    /// The box: its middle, size and turn (degrees, clockwise).
+    cx: f64,
+    cy: f64,
+    w: f64,
+    h: f64,
+    shape: AreaShape,
+    /// Taps to show (Drag steps); 0 = show where clicks can land.
+    taps: u32,
+    drag: EditDrag,
+    /// Clicks add corners one after another (drawing a new freeform outline).
+    drawing: bool,
+    /// Window pixels per screen point, and where the picture is in the window.
+    k: f32,
+    origin: Rc<Cell<(f32, f32)>>,
+}
+
+impl ShapeEdit {
+    fn rot(&self) -> f64 {
+        (self.shape.rotation as f64).to_radians()
+    }
+
+    /// Measured from the middle of the box (before turning) -> on screen.
+    fn to_screen(&self, lx: f64, ly: f64) -> (f64, f64) {
+        let t = self.rot();
+        (self.cx + lx * t.cos() - ly * t.sin(), self.cy + lx * t.sin() + ly * t.cos())
+    }
+
+    /// On screen -> measured from the middle of the box (before turning).
+    fn to_local(&self, sx: f64, sy: f64) -> (f64, f64) {
+        let t = -self.rot();
+        let (dx, dy) = (sx - self.cx, sy - self.cy);
+        (dx * t.cos() - dy * t.sin(), dx * t.sin() + dy * t.cos())
+    }
+
+    fn corner(&self, i: usize) -> (f64, f64) {
+        let (sx, sy) = CORNER_SIGNS[i];
+        self.to_screen(sx * self.w / 2.0, sy * self.h / 2.0)
+    }
+
+    fn edge(&self, i: usize) -> (f64, f64) {
+        let (sx, sy) = EDGE_SIGNS[i];
+        self.to_screen(sx * self.w / 2.0, sy * self.h / 2.0)
+    }
+
+    /// The round turn handle, a little above the top of the box.
+    fn rot_handle(&self) -> (f64, f64) {
+        self.to_screen(0.0, -self.h / 2.0 - 28.0 / self.k.max(0.05) as f64)
+    }
+
+    /// The freeform corners on screen.
+    fn poly(&self) -> Vec<(f64, f64)> {
+        self.shape
+            .points
+            .iter()
+            .map(|p| self.to_screen((p[0] as f64 - 0.5) * self.w, (p[1] as f64 - 0.5) * self.h))
+            .collect()
+    }
+
+    fn is_poly(&self) -> bool {
+        self.shape.kind == ShapeKind::Polygon
+    }
+
+    /// The box as a screen rectangle (what gets saved).
+    fn rect(&self) -> ScreenRect {
+        ScreenRect {
+            x: (self.cx - self.w / 2.0).round() as i32,
+            y: (self.cy - self.h / 2.0).round() as i32,
+            w: self.w.round().max(2.0) as i32,
+            h: self.h.round().max(2.0) as i32,
+        }
+    }
+
+    /// After moving freeform corners: make the box fit them snugly again.
+    fn refit(&mut self) {
+        if self.shape.points.is_empty() {
+            return;
+        }
+        let local: Vec<(f64, f64)> = self
+            .shape
+            .points
+            .iter()
+            .map(|p| ((p[0] as f64 - 0.5) * self.w, (p[1] as f64 - 0.5) * self.h))
+            .collect();
+        let (mut x0, mut y0, mut x1, mut y1) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
+        for (x, y) in &local {
+            x0 = x0.min(*x);
+            y0 = y0.min(*y);
+            x1 = x1.max(*x);
+            y1 = y1.max(*y);
+        }
+        let (w, h) = ((x1 - x0).max(1.0), (y1 - y0).max(1.0));
+        let (mx, my) = ((x0 + x1) / 2.0, (y0 + y1) / 2.0);
+        let (ncx, ncy) = self.to_screen(mx, my);
+        self.shape.points = local
+            .iter()
+            .map(|(x, y)| [((x - x0) / w) as f32, ((y - y0) / h) as f32])
+            .collect();
+        self.cx = ncx;
+        self.cy = ncy;
+        self.w = w;
+        self.h = h;
+    }
+
+    /// Put a freeform corner at a screen point (index i), then refit the box.
+    fn set_point(&mut self, i: usize, sx: f64, sy: f64) {
+        let (lx, ly) = self.to_local(sx, sy);
+        let f = [(lx / self.w.max(1.0) + 0.5) as f32, (ly / self.h.max(1.0) + 0.5) as f32];
+        if i < self.shape.points.len() {
+            self.shape.points[i] = f;
+        } else {
+            self.shape.points.push(f);
+        }
+        self.refit();
+    }
+
+    /// Window position -> screen position.
+    fn screen_at(&self, wx: f32, wy: f32) -> (f64, f64) {
+        let (ox, oy) = self.origin.get();
+        let k = self.k.max(0.05) as f64;
+        (
+            self.shot.ox as f64 + (wx - ox) as f64 / k,
+            self.shot.oy as f64 + (wy - oy) as f64 / k,
+        )
+    }
+
+    /// How close (in screen points) counts as "on" a handle.
+    fn tolerance(&self) -> f64 {
+        10.0 / self.k.max(0.05) as f64
+    }
+}
+
+fn dist(a: (f64, f64), b: (f64, f64)) -> f64 {
+    ((a.0 - b.0).powi(2) + (a.1 - b.1).powi(2)).sqrt()
+}
+
+/// Distance from p to the segment a–b.
+fn seg_dist(p: (f64, f64), a: (f64, f64), b: (f64, f64)) -> f64 {
+    let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+    let len2 = dx * dx + dy * dy;
+    let t = if len2 > 0.0 { (((p.0 - a.0) * dx + (p.1 - a.1) * dy) / len2).clamp(0.0, 1.0) } else { 0.0 };
+    dist(p, (a.0 + t * dx, a.1 + t * dy))
+}
+
+fn inside_poly(poly: &[(f64, f64)], x: f64, y: f64) -> bool {
+    let mut inside = false;
+    for i in 0..poly.len() {
+        let (x1, y1) = poly[i];
+        let (x2, y2) = poly[(i + 1) % poly.len()];
+        if (y1 > y) != (y2 > y) && x < x1 + (y - y1) * (x2 - x1) / (y2 - y1) {
+            inside = !inside;
+        }
+    }
+    inside
+}
+
+/// Draw the shape editor's overlay: where clicks / taps land, the outline, the box
+/// and its handles.
+fn paint_shape_edit(ed: &ShapeEdit, bounds: Bounds<Pixels>, window: &mut Window) {
+    let (bx, by) = (f32::from(bounds.origin.x), f32::from(bounds.origin.y));
+    let k = ed.k as f64;
+    let (sox, soy) = (ed.shot.ox as f64, ed.shot.oy as f64);
+    let at = |p: (f64, f64)| point(px(bx + ((p.0 - sox) * k) as f32), px(by + ((p.1 - soy) * k) as f32));
+    let accent: Hsla = hsla(ACCENT);
+    let white: Hsla = hsla(0xffffff);
+    let shade: Hsla = rgba(0x0000_0099).into();
+    let poly_ok = !ed.is_poly() || ed.shape.points.len() >= 3;
+
+    // Where clicks / taps land.
+    if poly_ok && !ed.drawing {
+        let r = ed.rect();
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut unit = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % 1_000_000) as f64 / 1_000_000.0
+        };
+        let (spots, size) = if ed.taps > 0 {
+            (spread_taps(r, &ed.shape, ed.taps, &mut unit), 7.0f32)
+        } else {
+            ((0..700).map(|_| area_point(r, &ed.shape, &mut unit)).collect::<Vec<_>>(), 3.0f32)
+        };
+        let green: Hsla = hsla(GREEN);
+        for (x, y) in spots {
+            let p = at((x as f64, y as f64));
+            if ed.taps > 0 {
+                window.paint_quad(
+                    fill(
+                        Bounds { origin: point(p.x - px(size / 2.0 + 1.5), p.y - px(size / 2.0 + 1.5)), size: gpui::size(px(size + 3.0), px(size + 3.0)) },
+                        shade,
+                    )
+                    .corner_radii(px(size)),
+                );
+            }
+            window.paint_quad(
+                fill(
+                    Bounds { origin: point(p.x - px(size / 2.0), p.y - px(size / 2.0)), size: gpui::size(px(size), px(size)) },
+                    green,
+                )
+                .corner_radii(px(size / 2.0)),
+            );
+        }
+        // The outline.
+        let outline: Vec<Point<Pixels>> = area_outline(r, &ed.shape).into_iter().map(at).collect();
+        stroke_poly(window, &outline, 4.0, shade, true, false);
+        stroke_poly(window, &outline, 2.0, accent, true, false);
+    }
+
+    // The box (dashed) and its handles.
+    if !ed.drawing {
+        let corners: Vec<Point<Pixels>> = (0..4).map(|i| at(ed.corner(i))).collect();
+        stroke_poly(window, &corners, 1.0, rgba(0xffffffaa).into(), true, true);
+        let top = at(ed.edge(0));
+        let rh = at(ed.rot_handle());
+        stroke_poly(window, &[top, rh], 1.5, white, false, false);
+        let square = |window: &mut Window, p: Point<Pixels>| {
+            window.paint_quad(fill(Bounds { origin: point(p.x - px(6.), p.y - px(6.)), size: gpui::size(px(12.), px(12.)) }, accent));
+            window.paint_quad(fill(Bounds { origin: point(p.x - px(3.5), p.y - px(3.5)), size: gpui::size(px(7.), px(7.)) }, white));
+        };
+        for i in 0..4 {
+            square(window, at(ed.corner(i)));
+            square(window, at(ed.edge(i)));
+        }
+        window.paint_quad(
+            fill(Bounds { origin: point(rh.x - px(8.), rh.y - px(8.)), size: gpui::size(px(16.), px(16.)) }, accent)
+                .corner_radii(px(8.)),
+        );
+        window.paint_quad(
+            fill(Bounds { origin: point(rh.x - px(4.), rh.y - px(4.)), size: gpui::size(px(8.), px(8.)) }, white)
+                .corner_radii(px(4.)),
+        );
+    }
+
+    // Freeform corners.
+    if ed.is_poly() {
+        let pts: Vec<Point<Pixels>> = ed.poly().into_iter().map(at).collect();
+        if ed.drawing {
+            stroke_poly(window, &pts, 4.0, shade, false, false);
+            stroke_poly(window, &pts, 2.0, accent, false, false);
+        }
+        for (i, p) in pts.iter().enumerate() {
+            let big = ed.drawing && i == 0 && pts.len() >= 3;
+            let r = if big { 9.0 } else { 6.0 };
+            window.paint_quad(
+                fill(Bounds { origin: point(p.x - px(r + 1.5), p.y - px(r + 1.5)), size: gpui::size(px(2.0 * r + 3.0), px(2.0 * r + 3.0)) }, accent)
+                    .corner_radii(px(r + 1.5)),
+            );
+            window.paint_quad(
+                fill(Bounds { origin: point(p.x - px(r - 1.0), p.y - px(r - 1.0)), size: gpui::size(px(2.0 * r - 2.0), px(2.0 * r - 2.0)) }, white)
+                    .corner_radii(px(r - 1.0)),
+            );
+        }
+    }
+}
 
 /// What a step did the last time the macro ran (the tag under its card).
 struct CardResult {

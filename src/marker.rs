@@ -70,22 +70,39 @@ pub fn show(x: i32, y: i32, click: bool) {
 /// Starts the helper if needed and waits for it, without holding anything up.
 pub fn flash(x: i32, y: i32, click: bool) {
     std::thread::spawn(move || {
-        prepare();
-        let t0 = Instant::now();
-        while t0.elapsed() < Duration::from_millis(2500) {
-            let ready = {
-                let st = lock();
-                st.helper.as_ref().map_or(false, |h| READY.load(Ordering::SeqCst) == h.generation)
-            };
-            if ready {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(30));
-        }
+        wait_ready();
         show(x, y, click);
         std::thread::sleep(Duration::from_millis(700));
         pulse();
     });
+}
+
+/// Show the dot at each spot in turn (to preview a random click area on screen).
+pub fn tour(points: Vec<(i32, i32)>) {
+    std::thread::spawn(move || {
+        wait_ready();
+        for (x, y) in points {
+            show(x, y, true);
+            std::thread::sleep(Duration::from_millis(260));
+        }
+        pulse();
+    });
+}
+
+/// Start the helper if needed and wait (up to 2.5 s) until it takes commands.
+fn wait_ready() {
+    prepare();
+    let t0 = Instant::now();
+    while t0.elapsed() < Duration::from_millis(2500) {
+        let ready = {
+            let st = lock();
+            st.helper.as_ref().map_or(false, |h| READY.load(Ordering::SeqCst) == h.generation)
+        };
+        if ready {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(30));
+    }
 }
 
 /// The click itself: a short ripple, then the dot goes away.

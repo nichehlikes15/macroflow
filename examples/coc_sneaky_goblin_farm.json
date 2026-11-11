@@ -1102,13 +1102,13 @@
               "id": 64,
               "kind": {
                 "type": "Scroll",
-                "amount": 6,
+                "amount": 8,
                 "horizontal": false
               },
               "x": 900.0,
               "y": 180.0,
               "delay_ms": 0,
-              "note": "Zoom right out (check: down = out)",
+              "note": "Zoom right out with the wheel (if it zooms IN, change 8 to −8)",
               "name": "Zoom out"
             },
             {
@@ -1166,12 +1166,13 @@
                 "to_x": 960,
                 "to_y": 60,
                 "button": "Left",
-                "duration_ms": 1400
+                "duration_ms": 1500,
+                "taps": 24
               },
               "x": 1740.0,
               "y": 180.0,
               "delay_ms": 0,
-              "note": "Left corner → top corner, just outside the red line",
+              "note": "Left corner → top corner, just outside the red line. 24 taps = 24 goblins",
               "name": "Goblins: left→top"
             },
             {
@@ -1183,12 +1184,13 @@
                 "to_x": 1770,
                 "to_y": 520,
                 "button": "Left",
-                "duration_ms": 1400
+                "duration_ms": 1500,
+                "taps": 24
               },
               "x": 2020.0,
               "y": 180.0,
               "delay_ms": 0,
-              "note": "Top → right",
+              "note": "Top → right · 24 taps",
               "name": "Goblins: top→right"
             },
             {
@@ -1200,12 +1202,13 @@
                 "to_x": 960,
                 "to_y": 900,
                 "button": "Left",
-                "duration_ms": 1200
+                "duration_ms": 1500,
+                "taps": 24
               },
               "x": 2300.0,
               "y": 180.0,
               "delay_ms": 0,
-              "note": "Right → bottom (keep above the troop bar)",
+              "note": "Right → bottom (keep above the troop bar) · 24 taps",
               "name": "Goblins: right→bottom"
             },
             {
@@ -1217,12 +1220,13 @@
                 "to_x": 150,
                 "to_y": 520,
                 "button": "Left",
-                "duration_ms": 1200
+                "duration_ms": 1500,
+                "taps": 24
               },
               "x": 2580.0,
               "y": 180.0,
               "delay_ms": 0,
-              "note": "Bottom → left",
+              "note": "Bottom → left · 24 taps",
               "name": "Goblins: bottom→left"
             },
             {
@@ -1418,6 +1422,24 @@
               "y": 360.0,
               "delay_ms": 0,
               "note": ""
+            },
+            {
+              "id": 114,
+              "kind": {
+                "type": "Drag",
+                "from_x": 960,
+                "from_y": 420,
+                "to_x": 960,
+                "to_y": 520,
+                "button": "Left",
+                "duration_ms": 500
+              },
+              "x": 1040.0,
+              "y": 360.0,
+              "delay_ms": 0,
+              "note": "Optional: drag the view to centre the base (dragging moves the camera). Enable if the base sits off-centre after zooming out",
+              "name": "Centre the base",
+              "disabled": true
             }
           ],
           "edges": [
@@ -1444,7 +1466,7 @@
             {
               "from": 65,
               "port": 0,
-              "to": 66
+              "to": 114
             },
             {
               "from": 66,
@@ -1560,6 +1582,11 @@
               "from": 67,
               "port": 0,
               "to": 83
+            },
+            {
+              "from": 114,
+              "port": 0,
+              "to": 66
             }
           ]
         }
@@ -2301,7 +2328,7 @@
       "to": 32
     }
   ],
-  "next_id": 114,
+  "next_id": 115,
   "start_delay_ms": 3000,
   "step_delay_ms": 60,
   "speed_pct": 100,

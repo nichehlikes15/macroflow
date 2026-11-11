@@ -50,6 +50,8 @@ pub enum WorkerMsg {
     Vars(Vec<(String, String)>),
     /// Something finished in the background (e.g. a log picture): redraw.
     Refresh,
+    /// A screenshot to draw a step's area on (the on-screen shape editor).
+    ShapeShot { step: u64, shot: vision::Shot },
     /// The user finished (or cancelled) dragging a box on the screen.
     /// `sel` is (x0, y0, x1, y1) in the screenshot's display coordinates.
     AreaPicked {
@@ -1076,6 +1078,7 @@ impl<'a> Runner<'a> {
         ox: i32,
         oy: i32,
         area: Option<ScreenRect>,
+        shape: &AreaShape,
         jitter: i32,
     ) -> Result<Option<(i32, i32)>, String> {
         let jitter = jitter.clamp(0, 2000);
@@ -1094,11 +1097,8 @@ impl<'a> Runner<'a> {
                     let r = area.ok_or_else(|| {
                         "It clicks randomly in an area, but no area is selected yet. Use “Select click area”.".to_string()
                     })?;
-                    // Stay a couple of pixels inside the edge.
-                    let inset = if r.w >= 8 && r.h >= 8 { 2.0 } else { 0.0 };
-                    let rx = r.x as f64 + inset + self.unit() * (r.w as f64 - 1.0 - inset * 2.0).max(0.0);
-                    let ry = r.y as f64 + inset + self.unit() * (r.h as f64 - 1.0 - inset * 2.0).max(0.0);
-                    Some((rx.round() as i32, ry.round() as i32))
+                    // Anywhere in the area's shape (rotated, hollow…), a little inside the edge.
+                    Some(area_point(r, shape, &mut || self.unit()))
                 }
             };
             let Some((bx, by)) = base else { return Ok(None) };
@@ -1229,9 +1229,10 @@ impl<'a> Runner<'a> {
                 clicks,
                 area,
                 jitter_px,
+                area_shape,
             } => {
                 if let Some((px, py)) =
-                    self.resolve(node.id, *target, *x, *y, *offset_x, *offset_y, *area, *jitter_px)?
+                    self.resolve(node.id, *target, *x, *y, *offset_x, *offset_y, *area, area_shape, *jitter_px)?
                 {
                     // The green dot goes where it's about to click, then the mouse heads there.
                     self.mark(px, py, true);
@@ -1266,9 +1267,10 @@ impl<'a> Runner<'a> {
                 offset_y,
                 area,
                 jitter_px,
+                area_shape,
             } => {
                 if let Some((px, py)) =
-                    self.resolve(node.id, *target, *x, *y, *offset_x, *offset_y, *area, *jitter_px)?
+                    self.resolve(node.id, *target, *x, *y, *offset_x, *offset_y, *area, area_shape, *jitter_px)?
                 {
                     // A green ring where the mouse is going (no click).
                     self.mark(px, py, false);
@@ -1286,8 +1288,62 @@ impl<'a> Runner<'a> {
                 to_y,
                 button,
                 duration_ms,
+                taps,
+                hold_ms,
+                tap_in_area,
+                tap_area,
+                tap_shape,
             } => {
                 let b = to_button(*button);
+                if *taps > 0 {
+                    // Tap instead of dragging (dragging moves the view in some apps):
+                    // along the line, or spread round a shaped area. The taps are
+                    // spread over the step's time.
+                    let in_area = match (*tap_in_area, tap_area) {
+                        (true, Some(r)) => Some(*r),
+                        (true, None) => {
+                            return Err("It taps round a shape, but no area is selected yet. Use “Select tap area”.".into())
+                        }
+                        _ => None,
+                    };
+                    let points = match in_area {
+                        Some(r) => spread_taps(r, tap_shape, *taps, &mut || self.unit()),
+                        None => tap_points((*from_x, *from_y), (*to_x, *to_y), *taps),
+                    };
+                    let gap = (self.scaled(*duration_ms) / points.len().max(1) as u64).max(25);
+                    let text = match in_area {
+                        Some(r) if tap_shape.is_plain() => format!("⋯ {} taps spread over {}×{}", points.len(), r.w, r.h),
+                        Some(_) => format!("⋯ {} taps round a {}", points.len(), tap_shape.describe()),
+                        None => format!("⋯ {} taps ({from_x}, {from_y}) → ({to_x}, {to_y})", points.len()),
+                    };
+                    let first = points.first().copied();
+                    let last = if in_area.is_some() { None } else { Some((*to_x, *to_y)) };
+                    self.log_action(text, vision::Mark::Move, first, last);
+                    for (i, (x, y)) in points.into_iter().enumerate() {
+                        // A few pixels off each time along a line, so no two runs tap the
+                        // same pixels (spots in an area are random already).
+                        let (jx, jy) = if in_area.is_some() {
+                            (0, 0)
+                        } else {
+                            (self.random(8) as i32 - 4, self.random(8) as i32 - 4)
+                        };
+                        let (x, y) = (x + jx, y + jy);
+                        self.mark(x, y, true);
+                        if i == 0 {
+                            self.move_to(x, y)?;
+                        } else {
+                            // Short hops between taps: straight there, a human-like
+                            // glide would be far too slow for dozens of taps.
+                            self.jump_to(x, y)?;
+                        }
+                        self.sleep(12)?;
+                        self.enigo.button(b, Direction::Click).map_err(input_err)?;
+                        let wobble = self.random(gap / 3);
+                        self.sleep(gap - gap / 6 + wobble)?;
+                    }
+                    self.mark_click();
+                    return Ok(Some(0));
+                }
                 self.mark(*from_x, *from_y, true);
                 self.move_to(*from_x, *from_y)?;
                 self.sleep(40)?;
@@ -1295,8 +1351,10 @@ impl<'a> Runner<'a> {
                 self.held_buttons.push(b);
                 // While dragging, a ring shows where it'll let go.
                 self.mark(*to_x, *to_y, false);
-                // A short hold so apps notice the press before the move starts.
-                self.sleep(80)?;
+                // Hold still before moving, so apps notice the press (and apps that
+                // only pick something up after a still hold don't pan instead).
+                // Not changed by the Speed setting: the app needs the real time.
+                self.sleep(*hold_ms)?;
                 let ms = self.scaled(*duration_ms) as f64;
                 let human = self.doc.human_mouse;
                 self.glide((*from_x, *from_y), (*to_x, *to_y), ms, human)?;
@@ -2017,6 +2075,7 @@ pub fn record_step(tx: Tx, stop: Arc<AtomicBool>) {
                             clicks,
                             area: None,
                             jitter_px: 0,
+                            area_shape: AreaShape::default(),
                         }),
                     );
                 }
@@ -2236,6 +2295,26 @@ pub fn capture_for_area(tx: Tx, stop: Arc<AtomicBool>, countdown_first: bool, pu
         })();
         match result {
             Ok((shot, sel)) => send(&tx, WorkerMsg::AreaPicked { purpose, shot, sel }),
+            Err(e) => send(&tx, WorkerMsg::Failed(e)),
+        }
+    });
+}
+
+/// Screenshot the display at `at` (or under the mouse) once MacroFlow is out of the
+/// way, for editing a step's area on top of it.
+pub fn capture_for_editor(tx: Tx, stop: Arc<AtomicBool>, step: u64, at: Option<(i32, i32)>) {
+    thread::spawn(move || {
+        let result = (|| -> Result<vision::Shot, String> {
+            // Let the minimise animation finish.
+            sleep_checked(700, &stop)?;
+            let (x, y) = match at {
+                Some(p) => p,
+                None => device()?.get_mouse().coords,
+            };
+            vision::screenshot_display_at(x, y)
+        })();
+        match result {
+            Ok(shot) => send(&tx, WorkerMsg::ShapeShot { step, shot }),
             Err(e) => send(&tx, WorkerMsg::Failed(e)),
         }
     });
