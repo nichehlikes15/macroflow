@@ -4,6 +4,7 @@
 use crate::keys;
 use crate::marker;
 use crate::model::*;
+use crate::remote;
 use crate::vision;
 use device_query::{DeviceQuery, DeviceState, Keycode};
 use enigo::{Axis, Button, Coordinate, Direction, Enigo, Key, Keyboard, Mouse, Settings};
@@ -60,6 +61,10 @@ pub enum WorkerMsg {
         sel: Option<(f32, f32, f32, f32)>,
     },
     Failed(String),
+    /// A Discord user asked for something (start, stop…); answer through `reply`.
+    Remote { cmd: remote::RemoteCmd, reply: remote::Reply },
+    /// The Discord bot's connection changed.
+    Bot(remote::BotState),
 }
 
 /// What a drag-a-box selection is for.
@@ -730,8 +735,16 @@ impl<'a> Runner<'a> {
                 .ok_or_else(|| "Add a Start step first.".to_string())?,
         };
         self.current = Some(start);
+        // A top-level Trigger is another Start: it repeats like one, with its own count.
+        let trigger_repeat = match self.doc.root.nodes.iter().find(|n| Some(n.id) == from).map(|n| &n.kind) {
+            Some(NodeKind::Trigger { repeat, .. }) => Some(*repeat),
+            _ => None,
+        };
         if from.is_none() && self.doc.next(start, 0).is_none() {
             return Err("Connect the Start step to your first step (drag from its right-hand dot).".into());
+        }
+        if trigger_repeat.is_some() && self.doc.next(start, 0).is_none() {
+            return Err("Nothing is connected to this trigger. Drag from its right-hand dot to the first step.".into());
         }
         let wait = self.doc.start_delay_ms;
         if wait > 0 {
@@ -741,7 +754,7 @@ impl<'a> Runner<'a> {
             ));
             self.sleep(wait)?;
         }
-        if from.is_some() {
+        if from.is_some() && trigger_repeat.is_none() {
             // Run from this step; when it's inside a group, carry on after the group
             // (and after any groups around that) like a normal run would.
             let mut first = true;
@@ -762,7 +775,7 @@ impl<'a> Runner<'a> {
             }
             return Ok(1);
         }
-        let total = self.doc.repeat;
+        let total = trigger_repeat.unwrap_or(self.doc.repeat);
         let mut iteration = 0u32;
         loop {
             iteration += 1;
@@ -1222,7 +1235,7 @@ impl<'a> Runner<'a> {
     /// Run one step. Returns which output to follow (None = stop here).
     fn exec(&mut self, node: &Node) -> Result<Option<usize>, String> {
         match &node.kind {
-            NodeKind::Start | NodeKind::GroupIn | NodeKind::Group { .. } => Ok(Some(0)),
+            NodeKind::Start | NodeKind::GroupIn | NodeKind::Group { .. } | NodeKind::Trigger { .. } => Ok(Some(0)),
             NodeKind::End | NodeKind::GroupOut => Ok(None),
 
             NodeKind::Click {
@@ -1772,6 +1785,73 @@ impl<'a> Runner<'a> {
                     }
                 } else {
                     self.toast = Some(child);
+                }
+                Ok(Some(0))
+            }
+
+            NodeKind::Webhook { url, format, message, body, screenshot, save_to } => {
+                let own = self.fill_text(url).trim().to_string();
+                let url = if own.is_empty() { remote::RemoteSettings::load().webhook_url.trim().to_string() } else { own };
+                if url.is_empty() {
+                    return Err("This Webhook step has no URL. Paste one into the step, or set a default webhook in the Remote tab.".into());
+                }
+                let job: Box<dyn FnOnce() -> Result<String, String> + Send> = match format {
+                    HookFormat::Discord => {
+                        let text = self.fill_text(message);
+                        let png = if *screenshot {
+                            self.status("↗ Taking a screenshot for Discord…".into());
+                            match remote::screenshot_png() {
+                                Ok(p) => Some(p),
+                                Err(e) => {
+                                    self.log(LogLevel::Warn, format!("No screenshot: {e}"));
+                                    None
+                                }
+                            }
+                        } else {
+                            None
+                        };
+                        Box::new(move || remote::send_discord(&url, &text, png).map(|_| String::new()))
+                    }
+                    HookFormat::Custom => {
+                        // Values going into JSON are escaped, so quotes in them can't break it.
+                        let looks_json = matches!(body.trim_start().chars().next(), Some('{') | Some('['));
+                        let body = if looks_json { fill_vars_json(body, &self.vars) } else { self.fill_text(body) };
+                        Box::new(move || remote::send_custom(&url, &body).map(|r| r.body))
+                    }
+                };
+                self.status("↗ Sending the webhook…".into());
+                // Send in the background, so Esc still stops the macro straight away.
+                let (done_tx, done_rx) = std::sync::mpsc::channel();
+                thread::spawn(move || {
+                    let _ = done_tx.send(job());
+                });
+                let result = loop {
+                    if self.stop.load(Ordering::Relaxed) {
+                        return Err(STOPPED.into());
+                    }
+                    match done_rx.recv_timeout(Duration::from_millis(30)) {
+                        Ok(r) => break r,
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                        Err(_) => break Err("The webhook stopped unexpectedly.".into()),
+                    }
+                };
+                let save = save_to.trim();
+                match result {
+                    Ok(reply) => {
+                        self.log(LogLevel::Good, "↗ Webhook sent".into());
+                        self.note = Some("↗ sent".into());
+                        if is_ident(save) {
+                            self.vars.insert(save.to_string(), reply.trim().to_string());
+                        }
+                    }
+                    Err(e) => {
+                        // A webhook is a side note: a hiccup shouldn't end a long run.
+                        self.log(LogLevel::Warn, format!("↗ Webhook failed: {e}"));
+                        self.note = Some("✗ not sent".into());
+                        if is_ident(save) {
+                            self.vars.insert(save.to_string(), String::new());
+                        }
+                    }
                 }
                 Ok(Some(0))
             }

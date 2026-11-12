@@ -20,6 +20,10 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 regex = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Webhook steps and the Discord bot: plain blocking HTTPS (rustls with ring, no C toolchain).
+ureq = { version = "=3.5.2", features = ["json"] }
+# The Discord bot's live connection (Discord's "gateway" is a websocket).
+tungstenite = { version = "=0.30.0", features = ["rustls-tls-webpki-roots"] }
 
 # Image search is CPU-heavy. This keeps `cargo run` responsive while still compiling quickly.
 [profile.dev]
@@ -30,6 +34,14 @@ opt-level = 3
 
 [profile.release]
 opt-level = 3
+
+# macOS only: show MacroFlow's icon in the Dock (the same version GPUI uses).
+[target.'cfg(target_os = "macos")'.dependencies]
+objc = "=0.2.7"
+
+# Windows only: build the app icon into the .exe (the same version GPUI uses).
+[target.'cfg(windows)'.build-dependencies]
+embed-resource = "=3.0.12"
 
 # Windows only: maximise / restore from MacroFlow's own title bar buttons.
 [target.'cfg(windows)'.dependencies]

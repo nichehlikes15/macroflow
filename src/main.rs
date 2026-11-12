@@ -1,7 +1,9 @@
+mod assets;
 mod engine;
 mod keys;
 mod marker;
 mod model;
+mod remote;
 mod ui;
 mod vision;
 
@@ -48,7 +50,9 @@ fn install_crash_alert() {
 
 fn main() {
     install_crash_alert();
-    Application::new().run(|cx: &mut App| {
+    Application::new().with_assets(assets::Assets).run(|cx: &mut App| {
+        #[cfg(target_os = "macos")]
+        assets::set_dock_icon();
         // The editor handles Quit itself so it can ask to save first; this is the fallback.
         cx.on_action(|_: &Quit, cx: &mut App| cx.quit());
         cx.bind_keys([KeyBinding::new("secondary-q", Quit, None)]);

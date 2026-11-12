@@ -554,6 +554,44 @@ fn default_notice_ms() -> u64 {
     3000
 }
 
+/// Slash commands the Discord bot always has, so a Trigger can't use these names.
+pub const BOT_COMMANDS: [&str; 6] = ["start", "stop", "pause", "status", "screenshot", "panel"];
+
+/// Turn what was typed into a valid Discord command name: lower case, spaces become
+/// dashes, only letters / numbers / - / _ are kept, at most 32 characters.
+pub fn command_name(raw: &str) -> String {
+    raw.trim()
+        .trim_start_matches('/')
+        .trim()
+        .to_lowercase()
+        .chars()
+        .map(|c| if c.is_whitespace() { '-' } else { c })
+        .filter(|c| c.is_alphanumeric() || *c == '-' || *c == '_')
+        .take(32)
+        .collect()
+}
+
+/// What a Webhook step sends.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum HookFormat {
+    /// A Discord channel webhook: a chat message, optionally with a screenshot.
+    #[default]
+    Discord,
+    /// Any other URL: the body is POSTed as it is (JSON if it looks like JSON).
+    Custom,
+}
+
+impl HookFormat {
+    pub const ALL: [HookFormat; 2] = [HookFormat::Discord, HookFormat::Custom];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            HookFormat::Discord => "Discord",
+            HookFormat::Custom => "Other (POST)",
+        }
+    }
+}
+
 impl ScreenRect {
     #[allow(dead_code)]
     pub fn shifted(self, dx: i32, dy: i32) -> ScreenRect {
@@ -1075,6 +1113,36 @@ pub enum NodeKind {
     },
     /// Leaving a group: playback carries on after the Group step.
     GroupOut,
+    /// Another way into the macro: a named start point that a Discord command or
+    /// button (or "Run from here") can run, instead of Start.
+    Trigger {
+        #[serde(default)]
+        name: String,
+        /// How many times to run from here (0 = until stopped).
+        #[serde(default = "default_one")]
+        repeat: u32,
+    },
+    /// Send a message to a Discord webhook, or POST to any other URL.
+    Webhook {
+        /// Empty = the default webhook from the Remote tab (keeps the secret URL
+        /// out of macro files you share).
+        #[serde(default)]
+        url: String,
+        #[serde(default)]
+        format: HookFormat,
+        /// The Discord message.
+        #[serde(default)]
+        message: String,
+        /// What's POSTed for other URLs.
+        #[serde(default)]
+        body: String,
+        /// Attach a screenshot of the main screen (Discord only).
+        #[serde(default)]
+        screenshot: bool,
+        /// Store the reply in this variable (empty = don't).
+        #[serde(default)]
+        save_to: String,
+    },
 }
 
 impl NodeKind {
@@ -1137,6 +1205,18 @@ impl NodeKind {
                 duration_ms: default_notice_ms(),
                 wait_for_click: false,
                 sound: false,
+            },
+            NodeKind::Webhook {
+                url: String::new(),
+                format: HookFormat::Discord,
+                message: "Run {run} reached this step".into(),
+                body: String::new(),
+                screenshot: false,
+                save_to: String::new(),
+            },
+            NodeKind::Trigger {
+                name: "my-action".into(),
+                repeat: 1,
             },
             NodeKind::Scroll {
                 amount: 3,
@@ -1240,32 +1320,38 @@ impl NodeKind {
             NodeKind::GroupIn => "Group start",
             NodeKind::Notify { .. } => "Pop-up",
             NodeKind::GroupOut => "Group end",
+            NodeKind::Trigger { .. } => "Trigger",
+            NodeKind::Webhook { .. } => "Webhook",
         }
     }
 
+    /// The step's icon: an SVG built into the app (see assets/icons).
     pub fn icon(&self) -> &'static str {
         match self {
-            NodeKind::Start => "▶",
-            NodeKind::Click { .. } => "◉",
-            NodeKind::MoveMouse { .. } => "➜",
-            NodeKind::Drag { .. } => "⇢",
-            NodeKind::KeyPress { .. } => "⌘",
-            NodeKind::TypeText { .. } => "T",
-            NodeKind::Wait { .. } => "◷",
-            NodeKind::Scroll { .. } => "⇵",
-            NodeKind::Recording { .. } => "●",
-            NodeKind::FindImage { .. } => "◎",
-            NodeKind::Loop { .. } => "↻",
-            NodeKind::WindowCheck { .. } => "▣",
-            NodeKind::ReadText { .. } => "Aa",
-            NodeKind::SetVar { .. } => "x=",
-            NodeKind::IfCompare { .. } => "?",
-            NodeKind::PixelColor { .. } => "◈",
-            NodeKind::End => "■",
-            NodeKind::Group { .. } => "▤",
-            NodeKind::GroupIn => "▷",
-            NodeKind::Notify { .. } => "✦",
-            NodeKind::GroupOut => "➜",
+            NodeKind::Start => "icons/start.svg",
+            NodeKind::Click { .. } => "icons/click.svg",
+            NodeKind::MoveMouse { .. } => "icons/move.svg",
+            NodeKind::Drag { .. } => "icons/drag.svg",
+            NodeKind::KeyPress { .. } => "icons/key.svg",
+            NodeKind::TypeText { .. } => "icons/type.svg",
+            NodeKind::Wait { .. } => "icons/wait.svg",
+            NodeKind::Scroll { .. } => "icons/scroll.svg",
+            NodeKind::Recording { .. } => "icons/record.svg",
+            NodeKind::FindImage { until_gone: true, .. } => "icons/gone.svg",
+            NodeKind::FindImage { .. } => "icons/find.svg",
+            NodeKind::Loop { .. } => "icons/loop.svg",
+            NodeKind::WindowCheck { .. } => "icons/window.svg",
+            NodeKind::ReadText { .. } => "icons/read.svg",
+            NodeKind::SetVar { .. } => "icons/variable.svg",
+            NodeKind::IfCompare { .. } => "icons/if.svg",
+            NodeKind::PixelColor { .. } => "icons/pixel.svg",
+            NodeKind::End => "icons/end.svg",
+            NodeKind::Group { .. } => "icons/group.svg",
+            NodeKind::GroupIn => "icons/group_in.svg",
+            NodeKind::Notify { .. } => "icons/bell.svg",
+            NodeKind::GroupOut => "icons/group_out.svg",
+            NodeKind::Trigger { .. } => "icons/trigger.svg",
+            NodeKind::Webhook { .. } => "icons/webhook.svg",
         }
     }
 
@@ -1296,6 +1382,8 @@ impl NodeKind {
             NodeKind::End => 0x7f8796,
             NodeKind::Group { .. } | NodeKind::GroupIn | NodeKind::GroupOut => GROUP_COLOR,
             NodeKind::Notify { style, .. } => style.color(),
+            NodeKind::Trigger { .. } => 0x5865f2,
+            NodeKind::Webhook { .. } => 0x00a8fc,
         }
     }
 
@@ -1317,7 +1405,12 @@ impl NodeKind {
     }
 
     pub fn has_input(&self) -> bool {
-        !matches!(self, NodeKind::Start | NodeKind::GroupIn)
+        !self.is_entry()
+    }
+
+    /// Where a run can begin: Start, a group's start, or a Trigger.
+    pub fn is_entry(&self) -> bool {
+        matches!(self, NodeKind::Start | NodeKind::GroupIn | NodeKind::Trigger { .. })
     }
 
     /// Steps that are part of the macro's structure and can't be deleted, copied or grouped.
@@ -1605,6 +1698,32 @@ impl NodeKind {
                 format!("{} · “{short}{more}” · {how}", style.label())
             }
             NodeKind::GroupOut => "Leave the group and carry on".into(),
+            NodeKind::Trigger { name, repeat } => {
+                let times = match repeat {
+                    0 => " · until stopped".to_string(),
+                    1 => String::new(),
+                    n => format!(" · {n}×"),
+                };
+                if name.trim().is_empty() {
+                    "Name its command to run it from Discord".into()
+                } else {
+                    format!("/{}{times}", name.trim())
+                }
+            }
+            NodeKind::Webhook { url, format, message, body, screenshot, .. } => {
+                let shot = if *screenshot && *format == HookFormat::Discord { " · 📷" } else { "" };
+                let to = if url.trim().is_empty() { "default webhook".to_string() } else { url_host(url) };
+                let text = match format {
+                    HookFormat::Discord => message.trim(),
+                    HookFormat::Custom => body.trim(),
+                };
+                let short: String = text.chars().take(22).collect();
+                let more = if text.chars().count() > 22 { "…" } else { "" };
+                match format {
+                    HookFormat::Discord => format!("Discord · “{short}{more}”{shot}"),
+                    HookFormat::Custom => format!("POST {to}"),
+                }
+            }
         }
     }
 
@@ -2094,6 +2213,30 @@ impl Macro {
             .unwrap_or_default()
             .iter()
             .any(|g| self.node(*g).map_or(false, |n| n.disabled))
+    }
+
+    /// The named Trigger steps at the top level of the macro: (id, name), in the order
+    /// they were added. Triggers with no name are left out.
+    pub fn triggers(&self) -> Vec<(u64, String)> {
+        self.root
+            .nodes
+            .iter()
+            .filter(|n| !n.disabled)
+            .filter_map(|n| match &n.kind {
+                NodeKind::Trigger { name, .. } if !name.trim().is_empty() => Some((n.id, name.trim().to_string())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The top-level Trigger with this command name (`farm`, `/farm` and `Farm` all
+    /// match; so does an older trigger named "My farm" for `/my-farm`).
+    pub fn trigger_named(&self, name: &str) -> Option<u64> {
+        let want = command_name(name);
+        self.triggers()
+            .into_iter()
+            .find(|(_, n)| command_name(n) == want)
+            .map(|(id, _)| id)
     }
 
     pub fn start_id(&self) -> Option<u64> {
@@ -2652,33 +2795,46 @@ pub fn is_ident(s: &str) -> bool {
 }
 
 /// Replace every `{name}` with that variable's value (unknown names become empty).
-/// Braces around anything that isn't a name are left alone.
+/// Braces around anything that isn't a name are left alone, so JSON such as
+/// `{"content": "{text}"}` keeps its own braces and still fills in `{text}`.
 pub fn fill_vars(s: &str, vars: &HashMap<String, String>) -> String {
+    fill_vars_with(s, vars, |v| v.to_string())
+}
+
+/// Like `fill_vars`, but each value is escaped for use inside a JSON string, so a
+/// value with quotes or new lines can't break the JSON around it.
+pub fn fill_vars_json(s: &str, vars: &HashMap<String, String>) -> String {
+    fill_vars_with(s, vars, |v| {
+        // A JSON string is always at least `""`; keep what's between the quotes.
+        let quoted = serde_json::to_string(v).unwrap_or_else(|_| "\"\"".into());
+        quoted[1..quoted.len() - 1].to_string()
+    })
+}
+
+fn fill_vars_with(s: &str, vars: &HashMap<String, String>, value: impl Fn(&str) -> String) -> String {
+    let chars: Vec<char> = s.chars().collect();
     let mut out = String::new();
-    let mut rest = s;
-    while let Some(open) = rest.find('{') {
-        out.push_str(&rest[..open]);
-        let after = &rest[open + 1..];
-        match after.find('}') {
-            Some(close) => {
-                let name = after[..close].trim();
-                if is_ident(name) {
-                    out.push_str(vars.get(name).map(String::as_str).unwrap_or(""));
-                } else {
-                    out.push('{');
-                    out.push_str(&after[..close]);
-                    out.push('}');
-                }
-                rest = &after[close + 1..];
-            }
-            None => {
-                out.push_str(&rest[open..]);
-                rest = "";
-            }
-        }
+    let mut at = 0;
+    for r in braced_ranges(&chars) {
+        out.extend(&chars[at..r.start]);
+        out.push_str(&value(vars.get(&r.name).map(String::as_str).unwrap_or("")));
+        at = r.end;
     }
-    out.push_str(rest);
+    out.extend(&chars[at..]);
     out
+}
+
+/// "discord.com" from "https://discord.com/api/webhooks/…", for short summaries
+/// (so a secret path never shows on a step's card).
+pub fn url_host(url: &str) -> String {
+    let rest = url.trim();
+    let rest = rest.split_once("://").map_or(rest, |(_, r)| r);
+    let host = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if host.is_empty() {
+        "(no URL)".into()
+    } else {
+        host.to_string()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -3040,6 +3196,14 @@ impl NodeKind {
                     format!("” · {:.1}s", *duration_ms as f32 / 1000.0)
                 }));
             }
+            NodeKind::Webhook { format: HookFormat::Discord, message, screenshot, .. } => {
+                if !message.contains('{') {
+                    return None;
+                }
+                out.push(t("Discord · “"));
+                out.extend(var_spans(message.trim(), VarMode::Text, known));
+                out.push(t(if *screenshot { "” · 📷" } else { "”" }));
+            }
             NodeKind::ReadText { save_to, value, .. } => {
                 let save = save_to.trim();
                 if !is_ident(save) && !value.contains('{') {
@@ -3072,7 +3236,7 @@ impl Macro {
             NodeKind::SetVar { name, .. } if is_ident(name.trim()) => {
                 out.insert(name.trim().to_string());
             }
-            NodeKind::ReadText { save_to, .. } if is_ident(save_to.trim()) => {
+            NodeKind::ReadText { save_to, .. } | NodeKind::Webhook { save_to, .. } if is_ident(save_to.trim()) => {
                 out.insert(save_to.trim().to_string());
             }
             _ => {}
@@ -3097,6 +3261,7 @@ impl Macro {
                     vec![(title.as_str(), VarMode::Text), (message.as_str(), VarMode::Text)]
                 }
                 NodeKind::ReadText { value, .. } => vec![(value.as_str(), VarMode::Text)],
+                k @ NodeKind::Webhook { .. } => texts_with_vars(k),
                 _ => vec![],
             };
             for (s, mode) in texts {
@@ -3353,6 +3518,13 @@ fn texts_with_vars(kind: &NodeKind) -> Vec<(&str, VarMode)> {
         NodeKind::TypeText { text, .. } => vec![(text.as_str(), VarMode::Text)],
         NodeKind::Notify { title, message, .. } => vec![(title.as_str(), VarMode::Text), (message.as_str(), VarMode::Text)],
         NodeKind::ReadText { value, .. } => vec![(value.as_str(), VarMode::Text)],
+        NodeKind::Webhook { url, format, message, body, .. } => {
+            let text = match format {
+                HookFormat::Discord => message,
+                HookFormat::Custom => body,
+            };
+            vec![(url.as_str(), VarMode::Text), (text.as_str(), VarMode::Text)]
+        }
         _ => vec![],
     }
 }
@@ -3383,9 +3555,18 @@ fn graph_problems(g: &Graph, top: bool, has_find: bool, known: &dyn Fn(&str) -> 
     let entry: Vec<u64> = g
         .nodes
         .iter()
-        .filter(|n| matches!(n.kind, NodeKind::Start | NodeKind::GroupIn))
+        .filter(|n| n.kind.is_entry())
         .map(|n| n.id)
         .collect();
+    // Trigger names, to spot two with the same name.
+    let mut trigger_names: HashMap<String, usize> = HashMap::new();
+    for n in &g.nodes {
+        if let NodeKind::Trigger { name, .. } = &n.kind {
+            if !name.trim().is_empty() && !n.disabled {
+                *trigger_names.entry(name.trim().to_lowercase()).or_default() += 1;
+            }
+        }
+    }
     let mut reached: std::collections::HashSet<u64> = entry.iter().copied().collect();
     let mut todo = entry.clone();
     while let Some(id) = todo.pop() {
@@ -3405,8 +3586,17 @@ fn graph_problems(g: &Graph, top: bool, has_find: bool, known: &dyn Fn(&str) -> 
         }
         let reachable = reached.contains(&id);
         if matches!(n.kind, NodeKind::Start | NodeKind::GroupIn) && others > 0 && g.next_local(id, 0).is_none() {
-            let what = if top { "Start" } else { "the group's start" };
-            push(id, true, format!("Nothing is connected to {what}, so nothing would run."));
+            // A macro that's only run through its triggers doesn't need Start.
+            let used_triggers = g
+                .nodes
+                .iter()
+                .any(|t| matches!(t.kind, NodeKind::Trigger { .. }) && g.next_local(t.id, 0).is_some());
+            if top && used_triggers {
+                push(id, false, "Nothing is connected to Start, so only the triggers can run this macro.".into());
+            } else {
+                let what = if top { "Start" } else { "the group's start" };
+                push(id, true, format!("Nothing is connected to {what}, so nothing would run."));
+            }
         }
         if !reachable && !n.kind.is_fixed() && !entry.is_empty() {
             push(id, false, "Never runs: nothing leads to this step.".into());
@@ -3454,6 +3644,23 @@ fn graph_problems(g: &Graph, top: bool, has_find: bool, known: &dyn Fn(&str) -> 
             }
             NodeKind::Drag { taps, tap_in_area, tap_area, .. } if *taps > 0 && *tap_in_area && tap_area.is_none() => {
                 push(id, true, "It taps round a shape, but no area is selected yet.".into());
+            }
+            NodeKind::Trigger { name, .. } => {
+                if !top {
+                    push(id, false, "Triggers only work at the top level of the macro, not inside a group.".into());
+                } else if name.trim().is_empty() {
+                    push(id, false, "Give the trigger a command name so Discord can run it (e.g. /farm).".into());
+                } else if BOT_COMMANDS.contains(&name.trim().to_lowercase().as_str()) {
+                    push(id, false, format!("/{} is one of the bot's own commands. Pick another name.", name.trim()));
+                } else if trigger_names.get(&name.trim().to_lowercase()).copied().unwrap_or(0) > 1 {
+                    push(id, false, format!("Another trigger is also /{}; Discord runs the first one.", name.trim()));
+                }
+                if g.next_local(id, 0).is_none() {
+                    push(id, false, "Nothing is connected to this trigger, so it would do nothing.".into());
+                }
+            }
+            NodeKind::Webhook { save_to, .. } if !save_to.trim().is_empty() && !is_ident(save_to.trim()) => {
+                push(id, true, format!("“{}” can't be a variable name (letters, numbers and _ only).", save_to.trim()));
             }
             NodeKind::Group { graph, .. } => {
                 if graph.step_count() == 0 {
@@ -4325,5 +4532,80 @@ mod tests {
         assert_eq!(m.next(start, 0), Some(a));
         assert_eq!(m.next(a, 0), Some(b));
         assert_eq!(m.next(b, 0), Some(c));
+    }
+
+    #[test]
+    fn fill_vars_works_inside_json() {
+        let vars: HashMap<String, String> =
+            [("text".to_string(), "say \"hi\"".to_string()), ("n".to_string(), "5".to_string())].into();
+        assert_eq!(fill_vars(r#"{"content": "{text}", "n": {n}}"#, &vars), r#"{"content": "say "hi"", "n": 5}"#);
+        assert_eq!(
+            fill_vars_json(r#"{"content": "{text}", "n": {n}}"#, &vars),
+            r#"{"content": "say \"hi\"", "n": 5}"#
+        );
+        // Plain text still behaves as before.
+        assert_eq!(fill_vars("Gold {n} {not a var}", &vars), "Gold 5 {not a var}");
+    }
+
+    #[test]
+    fn triggers_are_found_by_name() {
+        let mut m = Macro::default();
+        let t = m.add_node(NodeKind::Trigger { name: "Farm".into(), repeat: 1 }, 0.0, 0.0);
+        m.add_node(NodeKind::Trigger { name: String::new(), repeat: 1 }, 0.0, 0.0);
+        assert_eq!(m.triggers(), vec![(t, "Farm".to_string())]);
+        assert_eq!(m.trigger_named(" farm "), Some(t));
+        assert_eq!(m.trigger_named("collect"), None);
+    }
+
+    #[test]
+    fn trigger_names_become_valid_commands() {
+        assert_eq!(command_name("/Collect Gold!"), "collect-gold");
+        assert_eq!(command_name("  farm_2 "), "farm_2");
+        assert_eq!(command_name(&"x".repeat(40)).len(), 32);
+        assert_eq!(command_name("!!"), "");
+        // Older triggers with spaces / capitals still answer to their command.
+        let mut m = Macro::default();
+        let t = m.add_node(NodeKind::Trigger { name: "My Farm".into(), repeat: 1 }, 0.0, 0.0);
+        assert_eq!(m.trigger_named("my-farm"), Some(t));
+        assert_eq!(m.trigger_named("/My-Farm"), Some(t));
+    }
+
+    #[test]
+    fn a_trigger_cant_take_a_bot_command_name() {
+        let mut m = Macro::default();
+        let t = m.add_node(NodeKind::Trigger { name: "stop".into(), repeat: 1 }, 0.0, 0.0);
+        assert!(m.problems().iter().any(|p| p.step == t && p.text.contains("bot's own commands")));
+    }
+
+    #[test]
+    fn a_trigger_only_macro_can_run() {
+        let mut m = Macro::default();
+        let t = m.add_node(NodeKind::Trigger { name: "farm".into(), repeat: 1 }, 0.0, 0.0);
+        let w = m.add_node(NodeKind::Wait { ms: 10, jitter_ms: 0 }, 0.0, 0.0);
+        m.connect(t, 0, w);
+        // Start isn't connected, but that's only a warning while a trigger is.
+        assert!(m.problems().iter().all(|p| !p.serious));
+        // Steps after a trigger aren't "never runs".
+        assert!(!m.problems().iter().any(|p| p.step == w));
+        assert!(!NodeKind::Trigger { name: String::new(), repeat: 1 }.has_input());
+    }
+
+    #[test]
+    fn new_steps_open_from_minimal_json() {
+        let k: NodeKind = serde_json::from_str(r#"{"type":"Webhook"}"#).unwrap();
+        assert_eq!(
+            k,
+            NodeKind::Webhook {
+                url: String::new(),
+                format: HookFormat::Discord,
+                message: String::new(),
+                body: String::new(),
+                screenshot: false,
+                save_to: String::new(),
+            }
+        );
+        let t: NodeKind = serde_json::from_str(r#"{"type":"Trigger","name":"go"}"#).unwrap();
+        assert_eq!(t, NodeKind::Trigger { name: "go".into(), repeat: 1 });
+        assert_eq!(url_host("https://discord.com/api/webhooks/1/secret"), "discord.com");
     }
 }

@@ -40,6 +40,15 @@ fn main() {
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR not set"));
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
 
+    if target_os == "windows" {
+        // The app icon, for the .exe, the taskbar and the window.
+        println!("cargo:rerun-if-changed=assets/macroflow.rc");
+        println!("cargo:rerun-if-changed=assets/macroflow.ico");
+        #[cfg(windows)]
+        if let Err(e) = embed_resource::compile("assets/macroflow.rc", embed_resource::NONE).manifest_optional() {
+            println!("cargo:warning=Couldn't build in the app icon ({e}); MacroFlow will use the default icon.");
+        }
+    }
     if target_os != "macos" {
         println!("cargo:rustc-env=MACROFLOW_OCR_HELPER=");
         println!("cargo:rustc-env=MACROFLOW_SELECT_HELPER=");

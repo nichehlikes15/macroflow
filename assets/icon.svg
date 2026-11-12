@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <!-- MacroFlow's app icon: two steps joined by a connection, on the accent colour. -->
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#9a80ff"/>
+      <stop offset="1" stop-color="#5636e0"/>
+    </linearGradient>
+    <linearGradient id="gloss" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.22"/>
+      <stop offset="0.55" stop-color="#ffffff" stop-opacity="0"/>
+    </linearGradient>
+  </defs>
+  <rect x="100" y="100" width="824" height="824" rx="190" fill="url(#bg)"/>
+  <rect x="100" y="100" width="824" height="824" rx="190" fill="url(#gloss)"/>
+  <!-- The connection -->
+  <path d="M372 430 V580 Q372 660 452 660 H520" fill="none" stroke="#ffffff" stroke-opacity="0.85" stroke-width="44" stroke-linecap="round"/>
+  <!-- First step: play -->
+  <rect x="232" y="232" width="280" height="200" rx="52" fill="#ffffff"/>
+  <path d="M342 286 L432 332 L342 378 Z" fill="#6446ee" stroke="#6446ee" stroke-width="18" stroke-linejoin="round"/>
+  <!-- Second step: a lightning bolt (triggers) -->
+  <rect x="512" y="560" width="280" height="200" rx="52" fill="#ffffff"/>
+  <path d="M668 592 L596 672 H646 L630 728 L704 646 H652 Z" fill="#6446ee" stroke="#6446ee" stroke-width="10" stroke-linejoin="round"/>
+</svg>

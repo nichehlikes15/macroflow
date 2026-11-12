@@ -4,6 +4,7 @@ use crate::engine::{self, AreaPurpose, EndKind, Hotkey, LogEntry, LogLevel, RunE
 use crate::keys;
 use crate::marker;
 use crate::model::*;
+use crate::remote::{self, Bot, BotState, RemoteCmd, RemoteSettings, Reply};
 use crate::vision;
 use gpui::{
     canvas, div, fill, img, point, prelude::*, px, rgb, rgba, AnyElement, Bounds, ClickEvent,
@@ -180,6 +181,8 @@ enum SideTab {
     Edit,
     Macro,
     Log,
+    /// Webhooks and the Discord bot.
+    Remote,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -237,13 +240,36 @@ enum Field {
     StepMouseSpeed,
     MouseSpeed,
     ScrollStrength,
+    TriggerName,
+    TriggerRepeat,
+    HookUrl,
+    HookMessage,
+    HookBody,
+    HookSaveTo,
+    /// Remote tab (app settings, not part of the macro).
+    RemoteWebhook,
+    RemoteToken,
+    RemoteUsers,
 }
 
 impl Field {
+    /// Shown as dots unless you're editing it.
+    fn is_secret(self) -> bool {
+        matches!(self, Field::RemoteWebhook | Field::RemoteToken)
+    }
+
     fn is_text(self) -> bool {
         matches!(
             self,
-            Field::MacroName
+            Field::TriggerName
+                | Field::HookUrl
+                | Field::HookMessage
+                | Field::HookBody
+                | Field::HookSaveTo
+                | Field::RemoteWebhook
+                | Field::RemoteToken
+                | Field::RemoteUsers
+                | Field::MacroName
                 | Field::Note
                 | Field::Text
                 | Field::CompareValue
@@ -381,6 +407,32 @@ pub struct MacroApp {
     preview_toast: Option<std::process::Child>,
     /// Why the last run ended; its step is highlighted in red until the next run.
     last_end: Option<RunEnd>,
+    /// Webhook and Discord bot settings (saved apart from macros).
+    remote: RemoteSettings,
+    /// The Discord bot, while it's turned on.
+    bot: Option<Bot>,
+    bot_state: BotState,
+    /// The trigger names the bot last heard about.
+    bot_triggers: Vec<String>,
+    /// The Discord command that started the current run (told when it ends).
+    remote_origin: Option<Reply>,
+    /// The "How it works" sheet showing over the app, if any.
+    info: Option<InfoTopic>,
+}
+
+/// A "How it works" sheet: explanations that would crowd the settings panel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InfoTopic {
+    Trigger,
+    Webhook,
+    Remote,
+}
+
+/// One block of a sheet: a heading and its lines (numbered when `steps`).
+struct InfoSection {
+    heading: &'static str,
+    steps: bool,
+    lines: Vec<String>,
 }
 
 impl MacroApp {
@@ -420,7 +472,17 @@ impl MacroApp {
             }
         });
         let first_doc = fresh_macro();
+        let remote = RemoteSettings::load();
+        let bot_triggers = trigger_names(&first_doc);
+        let bot = (remote.bot_enabled && !remote.bot_token.is_empty())
+            .then(|| Bot::start(&remote.bot_token, remote.allowed_ids(), bot_triggers.clone(), tx.clone()));
         MacroApp {
+            remote,
+            bot_state: if bot.is_some() { BotState::Connecting } else { BotState::Off },
+            bot,
+            bot_triggers,
+            remote_origin: None,
+            info: None,
             focus,
             doc: first_doc.clone(),
             path: None,
@@ -517,7 +579,15 @@ impl MacroApp {
                     self.paused.store(false, Ordering::Relaxed);
                     self.step_mode.store(false, Ordering::Relaxed);
                     self.status = end.message.clone();
+                    self.report_run_end(&end);
                     self.last_end = Some(end);
+                }
+                WorkerMsg::Remote { cmd, reply } => self.on_remote(cmd, reply),
+                WorkerMsg::Bot(state) => {
+                    if let BotState::Failed(why) = &state {
+                        self.status = format!("Discord bot: {why}");
+                    }
+                    self.bot_state = state;
                 }
                 WorkerMsg::Log(entry) => {
                     if self.log.len() < 5000 {
@@ -1191,6 +1261,235 @@ impl MacroApp {
     /// Play the macro once, starting at this step (from the right-click menu).
     fn start_run_from(&mut self, id: u64) {
         self.start_run_with(Some(id), false);
+    }
+
+    // -----------------------------------------------------------------------
+    // Remote control (Discord) and webhooks
+    // -----------------------------------------------------------------------
+
+    /// Save new Remote settings, and reconnect the bot if what it uses changed.
+    fn set_remote(&mut self, next: RemoteSettings) {
+        if next == self.remote {
+            return;
+        }
+        let bot_changed = next.bot_enabled != self.remote.bot_enabled
+            || next.bot_token != self.remote.bot_token
+            || next.allowed_users != self.remote.allowed_users;
+        self.remote = next;
+        if let Err(e) = self.remote.save() {
+            self.status = e;
+        }
+        if bot_changed {
+            self.restart_bot();
+        }
+    }
+
+    fn restart_bot(&mut self) {
+        // Dropping the old bot disconnects it.
+        self.bot = None;
+        self.bot_state = BotState::Off;
+        if self.remote.bot_enabled && !self.remote.bot_token.trim().is_empty() {
+            self.bot_triggers = trigger_names(&self.doc);
+            self.bot = Some(Bot::start(
+                &self.remote.bot_token,
+                self.remote.allowed_ids(),
+                self.bot_triggers.clone(),
+                self.tx.clone(),
+            ));
+            self.bot_state = BotState::Connecting;
+        }
+    }
+
+    /// A Discord user pressed a button or ran a slash command.
+    fn on_remote(&mut self, cmd: RemoteCmd, reply: Reply) {
+        match cmd {
+            RemoteCmd::Run(which) => {
+                if self.mode == Mode::Running {
+                    reply.answer("A macro is already running. Use `/stop` (or the Stop button) first.");
+                    return;
+                }
+                if !self.idle() {
+                    reply.answer("MacroFlow is busy (recording or picking something). Try again in a moment.");
+                    return;
+                }
+                let from = match &which {
+                    None => None,
+                    Some(name) => match self.doc.trigger_named(name) {
+                        Some(id) => Some(id),
+                        None => {
+                            let names = trigger_names(&self.doc);
+                            let list = if names.is_empty() {
+                                "This macro has no Trigger steps yet.".to_string()
+                            } else {
+                                let cmds: Vec<String> = names.iter().map(|n| format!("/{}", command_name(n))).collect();
+                                format!("Its triggers: {}", cmds.join("  "))
+                            };
+                            reply.answer(&format!(
+                                "/{name} isn't a trigger in “{}” (the macro open in MacroFlow). {list}",
+                                self.doc.name
+                            ));
+                            return;
+                        }
+                    },
+                };
+                // Like F8: MacroFlow may be hidden, so problems show as a pop-up too.
+                self.hotkey_start = true;
+                self.start_run_with(from, false);
+                let what = match &which {
+                    Some(n) => format!("⚡ {n}"),
+                    None => "Start".to_string(),
+                };
+                if self.mode == Mode::Running {
+                    reply.answer(&format!("▶ Running “{}” from {what}. I'll tell you when it ends.", self.doc.name));
+                    self.status = format!("Started from Discord ({what}).");
+                    self.remote_origin = Some(reply);
+                } else if let Some(check) = &self.run_check {
+                    let lines: Vec<String> = check.problems.iter().take(3).map(|p| {
+                        let step = self.doc.node(p.step).map(|n| n.label()).unwrap_or_default();
+                        format!("• {step}: {}", p.text)
+                    }).collect();
+                    reply.answer(&format!(
+                        "Didn't start: {} step(s) would go wrong.\n{}",
+                        check.problems.len(),
+                        lines.join("\n")
+                    ));
+                } else {
+                    reply.answer("Couldn't start the macro.");
+                }
+            }
+            RemoteCmd::Stop => {
+                if self.mode == Mode::Running {
+                    self.stop_worker();
+                    reply.answer("■ Stopping.");
+                } else {
+                    reply.answer("Nothing is running.");
+                }
+            }
+            RemoteCmd::Pause => {
+                if self.mode == Mode::Running {
+                    self.toggle_pause();
+                    let now = self.paused.load(Ordering::Relaxed);
+                    reply.answer(if now { "❚❚ Paused. Use `/pause` again to carry on." } else { "▶ Resumed." });
+                } else {
+                    reply.answer("Nothing is running.");
+                }
+            }
+            RemoteCmd::Status => reply.answer(&self.remote_status()),
+        }
+    }
+
+    fn remote_status(&self) -> String {
+        let state = match self.mode {
+            Mode::Running if self.paused.load(Ordering::Relaxed) => "❚❚ Paused",
+            Mode::Running => "▶ Running",
+            Mode::Idle => "Idle",
+            _ => "Busy",
+        };
+        let step = self
+            .active_node
+            .and_then(|id| self.doc.node(id))
+            .map(|n| format!("\nStep: {}", n.label()))
+            .unwrap_or_default();
+        let vars: Vec<String> = self
+            .live_vars
+            .iter()
+            .take(10)
+            .map(|(k, v)| format!("{k} = {}", v.chars().take(40).collect::<String>()))
+            .collect();
+        let vars = if vars.is_empty() { String::new() } else { format!("\nVariables: {}", vars.join(", ")) };
+        let triggers = trigger_names(&self.doc);
+        let triggers = if triggers.is_empty() { String::new() } else { format!("\nTriggers: {}", triggers.join(", ")) };
+        format!(
+            "**{}** · {state}{step}\n{}{vars}{triggers}",
+            self.doc.name,
+            self.status.chars().take(300).collect::<String>()
+        )
+    }
+
+    /// Tell Discord how a run ended: the person who started it from Discord, and
+    /// the default webhook if the Remote tab asks for that.
+    fn report_run_end(&mut self, end: &RunEnd) {
+        let bad = end.unexpected();
+        let icon = match end.kind {
+            _ if bad => "⚠️",
+            EndKind::Stopped => "■",
+            _ => "✅",
+        };
+        let text = format!("{icon} “{}”: {}", self.doc.name, end.message);
+        if let Some(reply) = self.remote_origin.take() {
+            if reply.is_fresh() {
+                reply.follow_up(&text);
+            } else if let Some(bot) = &self.bot {
+                bot.post_channel(&reply.channel_id, &reply.user_id, &text);
+            }
+        }
+        let url = self.remote.webhook_url.trim().to_string();
+        // You pressing Stop isn't news; finishing or going wrong is.
+        let wanted = if bad {
+            self.remote.notify_stop
+        } else {
+            self.remote.notify_finish && end.kind == EndKind::Finished
+        };
+        if wanted && !url.is_empty() {
+            std::thread::spawn(move || {
+                let _ = remote::send_discord(&url, &text, None);
+            });
+        }
+    }
+
+    /// Post a test message to the default webhook.
+    fn test_webhook(&mut self) {
+        self.commit_edit();
+        let url = self.remote.webhook_url.trim().to_string();
+        if url.is_empty() {
+            self.status = "Paste a webhook URL first.".into();
+            return;
+        }
+        let tx = self.tx.clone();
+        self.status = "Sending a test message…".into();
+        std::thread::spawn(move || {
+            let msg = match remote::send_discord(&url, "👋 MacroFlow is connected to this channel.", None) {
+                Ok(()) => "Test message sent. Check the Discord channel.".to_string(),
+                Err(e) => format!("The test message didn't send: {e}"),
+            };
+            let _ = tx.send(WorkerMsg::Status(msg));
+        });
+    }
+
+    /// Send a Webhook step once, without running the macro.
+    fn test_webhook_step(&mut self, id: u64) {
+        self.commit_edit();
+        let Some(NodeKind::Webhook { url, format, message, body, screenshot, .. }) =
+            self.doc.node(id).map(|n| n.kind.clone())
+        else {
+            return;
+        };
+        let url = if url.trim().is_empty() { self.remote.webhook_url.trim().to_string() } else { url.trim().to_string() };
+        if url.is_empty() {
+            self.status = "No URL: paste one into the step, or set a default webhook in the Remote tab.".into();
+            return;
+        }
+        if url.contains('{') {
+            self.status = "The URL uses a variable, so it can only be sent during a run.".into();
+            return;
+        }
+        let tx = self.tx.clone();
+        self.status = "Sending a test…".into();
+        std::thread::spawn(move || {
+            let result = match format {
+                HookFormat::Discord => {
+                    let png = if screenshot { remote::screenshot_png().ok() } else { None };
+                    remote::send_discord(&url, &format!("(test) {message}"), png).map(|_| String::new())
+                }
+                HookFormat::Custom => remote::send_custom(&url, &body).map(|r| r.body),
+            };
+            let msg = match result {
+                Ok(r) if r.trim().is_empty() => "Sent. Variables aren't filled in for a test.".to_string(),
+                Ok(r) => format!("Sent. The server answered: {}", r.trim().chars().take(120).collect::<String>()),
+                Err(e) => format!("Didn't send: {e}"),
+            };
+            let _ = tx.send(WorkerMsg::Status(msg));
+        });
     }
 
     fn toggle_breakpoint(&mut self, id: u64) {
@@ -2743,7 +3042,10 @@ impl MacroApp {
 
     fn commit_edit(&mut self) {
         if let Some((f, buf)) = self.editing.take() {
+            // Remote settings are saved on their own, not in the macro.
+            let app_setting = matches!(f, Field::RemoteWebhook | Field::RemoteToken | Field::RemoteUsers);
             match self.set_field(f, &buf) {
+                Ok(()) if app_setting => {}
                 Ok(()) => self.dirty = true,
                 Err(e) => self.status = e,
             }
@@ -2761,6 +3063,9 @@ impl MacroApp {
             Field::BulkDelay => return self.bulk_delay.to_string(),
             Field::SnipSize => return self.snip_size.to_string(),
             Field::MouseSpeed => return d.mouse_speed.to_string(),
+            Field::RemoteWebhook => return self.remote.webhook_url.clone(),
+            Field::RemoteToken => return self.remote.bot_token.clone(),
+            Field::RemoteUsers => return self.remote.allowed_users.clone(),
             _ => {}
         }
         let Some(n) = self.selected.and_then(|id| d.node(id)) else {
@@ -2768,6 +3073,12 @@ impl MacroApp {
         };
         match (f, &n.kind) {
             (Field::StepName, _) => n.name.clone(),
+            (Field::TriggerName, NodeKind::Trigger { name, .. }) => name.clone(),
+            (Field::TriggerRepeat, NodeKind::Trigger { repeat, .. }) => repeat.to_string(),
+            (Field::HookUrl, NodeKind::Webhook { url, .. }) => url.clone(),
+            (Field::HookMessage, NodeKind::Webhook { message, .. }) => message.clone(),
+            (Field::HookBody, NodeKind::Webhook { body, .. }) => body.clone(),
+            (Field::HookSaveTo, NodeKind::Webhook { save_to, .. }) => save_to.clone(),
             (Field::Note, _) => n.note.clone(),
             (Field::Delay, _) => n.delay_ms.to_string(),
             (
@@ -2902,12 +3213,45 @@ impl MacroApp {
                 self.doc.mouse_speed = int()?.clamp(10, 1000) as u32;
                 return Ok(());
             }
+            Field::RemoteWebhook | Field::RemoteToken | Field::RemoteUsers => {
+                let mut next = self.remote.clone();
+                match f {
+                    Field::RemoteWebhook => {
+                        if !s.is_empty() && !s.starts_with("https://") {
+                            return Err("A webhook URL starts with https:// (Discord: channel → Edit → Integrations → Webhooks → Copy URL).".into());
+                        }
+                        next.webhook_url = s.to_string();
+                    }
+                    Field::RemoteToken => next.bot_token = s.trim_start_matches("Bot ").trim().to_string(),
+                    _ => next.allowed_users = s.to_string(),
+                }
+                self.set_remote(next);
+                return Ok(());
+            }
             _ => {}
         }
         let Some(id) = self.selected else { return Ok(()) };
         let Some(n) = self.doc.node_mut(id) else { return Ok(()) };
         match (f, &mut n.kind) {
             (Field::StepName, _) => n.name = raw.trim().to_string(),
+            (Field::TriggerName, NodeKind::Trigger { name, .. }) => {
+                let clean = command_name(raw);
+                if !raw.trim().trim_start_matches('/').is_empty() && clean.is_empty() {
+                    return Err("A command name needs letters or numbers, e.g. farm or collect-gold.".into());
+                }
+                *name = clean
+            }
+            (Field::TriggerRepeat, NodeKind::Trigger { repeat, .. }) => *repeat = int()?.max(0) as u32,
+            (Field::HookUrl, NodeKind::Webhook { url, .. }) => *url = raw.trim().to_string(),
+            (Field::HookMessage, NodeKind::Webhook { message, .. }) => *message = raw.to_string(),
+            (Field::HookBody, NodeKind::Webhook { body, .. }) => *body = raw.to_string(),
+            (Field::HookSaveTo, NodeKind::Webhook { save_to, .. }) => {
+                let t = raw.trim();
+                if !t.is_empty() && !is_ident(t) {
+                    return Err(format!("“{t}” can't be a variable name. Use letters, numbers and _ (e.g. reply)."));
+                }
+                *save_to = t.to_string()
+            }
             (Field::Note, _) => n.note = raw.to_string(),
             (Field::Delay, _) => n.delay_ms = int()?.max(0) as u64,
             (
@@ -3136,6 +3480,14 @@ impl MacroApp {
         }
         if self.quick.is_some() {
             self.quick_key(ev, cx);
+            return;
+        }
+        if self.info.is_some() {
+            if matches!(key, "escape" | "enter" | "return") {
+                self.info = None;
+            }
+            cx.stop_propagation();
+            cx.notify();
             return;
         }
         if self.run_check.is_some() {
@@ -3823,14 +4175,7 @@ impl MacroApp {
                         .gap_2()
                         .rounded_md()
                         .hover(|s| s.bg(rgba((ACCENT << 8) | 0x3d)).text_color(rgb(0xffffff)))
-                        .child(
-                            div()
-                                .w(px(18.))
-                                .flex_none()
-                                .text_color(rgb(color))
-                                .font_weight(FontWeight::BOLD)
-                                .child(kind.icon()),
-                        )
+                        .child(div().w(px(18.)).flex_none().child(icon(kind.icon(), 14., color)))
                         .child(div().flex_1().truncate().child(kind.title()))
                         // Acts on mouse-down: the click also counts as "outside the menu",
                         // which closes it, but this handler still gets the click.
@@ -4433,6 +4778,7 @@ impl MacroApp {
             },
             SideTab::Macro => self.macro_settings(cx),
             SideTab::Log => self.log_tab(cx),
+            SideTab::Remote => self.remote_tab(cx),
         };
         let mut content = div()
             .id("sidebar-content")
@@ -4470,6 +4816,7 @@ impl MacroApp {
             (SideTab::Edit, "Edit"),
             (SideTab::Macro, "Macro"),
             (SideTab::Log, "Log"),
+            (SideTab::Remote, "Remote"),
         ];
         let current = self.side_tab;
         div().flex_none().px_4().pt_3().pb_3().child(
@@ -4577,12 +4924,13 @@ impl MacroApp {
                 .into_any_element(),
         );
 
-        let groups: [(&'static str, usize); 7] = [
+        let groups: [(&'static str, usize); 8] = [
             ("Mouse", 0),
             ("Keyboard", 1),
             ("Smart checks", 2),
             ("Variables", 6),
             ("Notify", 5),
+            ("Remote & webhooks", 7),
             ("Flow & timing", 3),
             ("Recording", 4),
         ];
@@ -4617,10 +4965,7 @@ impl MacroApp {
                                 .justify_center()
                                 .rounded_md()
                                 .bg(rgba((color << 8) | 0x1f))
-                                .text_size(px(12.))
-                                .text_color(rgb(color))
-                                .font_weight(FontWeight::BOLD)
-                                .child(kind.icon()),
+                                .child(icon(kind.icon(), 15., color)),
                         )
                         .child(
                             div()
@@ -5911,10 +6256,7 @@ impl MacroApp {
                             .justify_center()
                             .rounded_md()
                             .bg(rgba((k.color() << 8) | 0x1f))
-                            .text_size(px(12.))
-                            .text_color(rgb(k.color()))
-                            .font_weight(FontWeight::BOLD)
-                            .child(k.icon()),
+                            .child(icon(k.icon(), 15., k.color())),
                     )
                     .child(
                         div()
@@ -6103,6 +6445,318 @@ impl MacroApp {
                                     })),
                             ),
                     ),
+            )
+    }
+
+    /// What a "How it works" sheet says: (icon, colour, title, intro, sections).
+    fn info_page(&self, topic: InfoTopic) -> (&'static str, u32, &'static str, String, Vec<InfoSection>) {
+        let s = |heading, steps, lines: &[&str]| InfoSection {
+            heading,
+            steps,
+            lines: lines.iter().map(|l| l.to_string()).collect(),
+        };
+        let triggers = trigger_names(&self.doc);
+        match topic {
+            InfoTopic::Trigger => {
+                let name = self
+                    .selected
+                    .and_then(|id| self.doc.node(id))
+                    .and_then(|n| match &n.kind {
+                        NodeKind::Trigger { name, .. } if !name.is_empty() => Some(name.clone()),
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| "farm".into());
+                (
+                    "icons/trigger.svg",
+                    0x5865f2,
+                    "Trigger",
+                    "A second way into the macro. Start is where a normal run begins; a Trigger is a named start point you can run on its own, from Discord or from here.".into(),
+                    vec![
+                        s("Using it", true, &[
+                            "Give it a command name, for example farm.",
+                            "Connect its dot to the steps it should run, just like Start.",
+                            &format!("In Discord, type /{name}, or press the ⚡ /{name} button that /panel posts."),
+                        ]),
+                        s("Good to know", false, &[
+                            "“Times to run” repeats everything after the trigger. 0 keeps going until it's stopped.",
+                            "Command names are lower case, with letters, numbers, - and _ only. Spaces become dashes.",
+                            "The bot's own commands (start, stop, pause, status, screenshot, panel) can't be used as names.",
+                            "Discord picks up new or renamed triggers a few seconds after you change them.",
+                            "Right-click the trigger → Run from here to try it without Discord.",
+                            "Triggers only work at the top level of the macro, not inside a group.",
+                        ]),
+                    ],
+                )
+            }
+            InfoTopic::Webhook => (
+                "icons/webhook.svg",
+                0x00a8fc,
+                "Webhook",
+                "Sends a message when the macro reaches this step: to a Discord channel, or to any web address that accepts a POST.".into(),
+                vec![
+                    s("Discord", true, &[
+                        "In Discord: channel settings → Integrations → Webhooks → New Webhook → Copy Webhook URL.",
+                        "Paste it into the step, or once into the Remote tab as the default and leave the step's URL empty.",
+                        "Write the message. Variables work: “Gold is {gold} after run {run}”.",
+                        "Turn on “Attach a screenshot” to include a picture of the main screen.",
+                    ]),
+                    s("Other services", false, &[
+                        "Choose “Other (POST)” for IFTTT, Home Assistant, ntfy, Zapier, Make and similar.",
+                        "If the body is JSON it's sent as JSON, and variables inside it are escaped, e.g. {\"gold\": \"{gold}\"}.",
+                        "“Save reply into” stores what the server answered in a variable.",
+                    ]),
+                    s("Good to know", false, &[
+                        "A webhook URL is a password for that channel. The Remote tab's default keeps it out of macro files you share.",
+                        "If sending fails (no internet, wrong URL), the run log gets a warning and the macro carries on.",
+                        "“Send a test” sends it once now, without variables filled in.",
+                    ]),
+                ],
+            ),
+            InfoTopic::Remote => {
+                let list = if triggers.is_empty() {
+                    "This macro has no triggers yet. Add a Trigger step to get a /command of your own.".to_string()
+                } else {
+                    format!("This macro's triggers: {}", triggers.iter().map(|t| format!("/{}", command_name(t))).collect::<Vec<_>>().join("  "))
+                };
+                (
+                    "icons/webhook.svg",
+                    0x5865f2,
+                    "Control MacroFlow from Discord",
+                    "A Discord bot that runs on your own computer: it lets you start, stop and check on macros from your phone, with slash commands or buttons.".into(),
+                    vec![
+                        s("Set up the bot (once)", true, &[
+                            "Go to discord.com/developers/applications → New Application. Name it, e.g. MacroFlow.",
+                            "Open Bot → Reset Token → Copy, and paste it into “Bot token”.",
+                            "Open OAuth2 → URL Generator, tick “bot” and “applications.commands”, then open the link and add the bot to your server.",
+                            "In Discord: Settings → Advanced → Developer Mode on. Right-click your name → Copy User ID, and paste it into “Allowed user IDs”.",
+                            "Turn on “Connect the bot”. The dot turns green, and the slash commands can take a minute to appear the first time.",
+                        ]),
+                        InfoSection {
+                            heading: "Commands",
+                            steps: false,
+                            lines: vec![
+                                "/start runs the macro from Start.  /stop · /pause · /status".into(),
+                                "/screenshot shows the main screen right now (only to you).".into(),
+                                "/panel posts buttons: Start, Pause, Stop, Status, Screenshot and one per trigger.".into(),
+                                "Every Trigger step adds its own command, e.g. /farm.".into(),
+                                list,
+                            ],
+                        },
+                        s("Safety", false, &[
+                            "Only the user IDs you list can control MacroFlow. Anyone else is told no (and shown their ID, so you can add a friend on purpose).",
+                            "The bot only connects out to Discord. MacroFlow never opens a port on your computer.",
+                            "The token and webhook URL are saved for your user only, never in macro files. If the token leaks, reset it in the Developer Portal.",
+                            "When a run started from Discord ends, the bot pings whoever started it.",
+                        ]),
+                    ],
+                )
+            }
+        }
+    }
+
+    /// The "How it works" sheet over the whole window.
+    fn render_info(&self, topic: InfoTopic, vh: f32, cx: &mut Context<Self>) -> Stateful<Div> {
+        let (icon_path, color, title, intro, sections) = self.info_page(topic);
+        let mut body = div().flex().flex_col().gap_4();
+        for sec in sections {
+            let mut lines = div().flex().flex_col().gap_1p5();
+            for (i, line) in sec.lines.into_iter().enumerate() {
+                let mark = if sec.steps { format!("{}", i + 1) } else { "•".to_string() };
+                lines = lines.child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_start()
+                        .gap_2p5()
+                        .child(
+                            div()
+                                .flex_none()
+                                .mt(px(1.))
+                                .size(px(18.))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .rounded_full()
+                                .when(sec.steps, |d| d.bg(rgba((color << 8) | 0x2e)).text_color(rgb(color)))
+                                .when(!sec.steps, |d| d.text_color(rgb(UI_FAINT)))
+                                .text_size(px(10.5))
+                                .font_weight(FontWeight::BOLD)
+                                .child(mark),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.))
+                                .text_sm()
+                                .line_height(px(20.))
+                                .text_color(rgb(if sec.steps { TEXT } else { MUTED }))
+                                .child(line),
+                        ),
+                );
+            }
+            body = body.child(div().flex().flex_col().gap_2().child(section_head(sec.heading)).child(lines));
+        }
+        let card = div()
+            .w(px(560.))
+            .max_h(px((vh - 80.0).max(240.0)))
+            .flex()
+            .flex_col()
+            .rounded_xl()
+            .bg(rgb(UI_RAISED))
+            .border_1()
+            .border_color(rgb(UI_EDGE))
+            .shadow_lg()
+            .text_color(rgb(TEXT))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(
+                div()
+                    .flex_none()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_3()
+                    .px_5()
+                    .pt_5()
+                    .pb_3()
+                    .child(
+                        div()
+                            .size(px(34.))
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded_lg()
+                            .bg(rgba((color << 8) | 0x26))
+                            .child(icon(icon_path, 18., color)),
+                    )
+                    .child(div().flex_1().text_base().font_weight(FontWeight::SEMIBOLD).child(title))
+                    .child(
+                        div()
+                            .id("info-close")
+                            .px_2()
+                            .py_0p5()
+                            .rounded_md()
+                            .cursor_pointer()
+                            .text_color(rgb(MUTED))
+                            .hover(|s| s.bg(rgb(UI_HOVER)).text_color(rgb(TEXT)))
+                            .child("×")
+                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                this.info = None;
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .child(
+                div()
+                    .id("info-scroll")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .px_5()
+                    .pb_4()
+                    .flex()
+                    .flex_col()
+                    .gap_4()
+                    .child(div().text_sm().line_height(px(20.)).text_color(rgb(MUTED)).child(intro))
+                    .child(body),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .flex()
+                    .flex_row()
+                    .justify_end()
+                    .px_5()
+                    .py_3()
+                    .border_t_1()
+                    .border_color(rgb(UI_LINE))
+                    .child(
+                        small_btn("info-ok", "Got it  (Esc)")
+                            .bg(rgb(ACCENT))
+                            .text_color(rgb(0xffffff))
+                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                this.info = None;
+                                cx.notify();
+                            })),
+                    ),
+            );
+        div()
+            .id("info-sheet")
+            .occlude()
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(rgba((CANVAS_BG << 8) | 0xcc))
+            // A click outside the card closes it.
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                    cx.stop_propagation();
+                    this.info = None;
+                    cx.notify();
+                }),
+            )
+            .child(card)
+    }
+
+    /// A quiet "ⓘ How it works" link that opens a sheet over the app.
+    fn info_link(&self, id: &'static str, label: &'static str, topic: InfoTopic, cx: &mut Context<Self>) -> Stateful<Div> {
+        div()
+            .id(id)
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_1p5()
+            .mx(px(-6.))
+            .px_1p5()
+            .h(px(26.))
+            .rounded_md()
+            .cursor_pointer()
+            .text_xs()
+            .text_color(rgb(ACCENT))
+            .hover(|s| s.bg(rgb(UI_HOVER)))
+            .child(icon("icons/info.svg", 14., ACCENT))
+            .child(label)
+            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                this.commit_edit();
+                this.info = Some(topic);
+                cx.notify();
+            }))
+    }
+
+    /// A text box with fixed text in front that can't be edited (the "/" of a command).
+    fn prefixed_field(&self, label: &str, prefix: &'static str, field: Field, cx: &mut Context<Self>) -> Div {
+        div()
+            .flex()
+            .flex_col()
+            .gap_1p5()
+            .child(field_label(label))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .child(
+                        div()
+                            .flex_none()
+                            .min_h(px(28.))
+                            .px_2p5()
+                            .flex()
+                            .items_center()
+                            .rounded_l_md()
+                            .bg(rgb(UI_RAISED))
+                            .border_1()
+                            .border_r_0()
+                            .border_color(rgb(UI_EDGE))
+                            .text_color(rgb(MUTED))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .cursor_default()
+                            .child(prefix),
+                    )
+                    .child(self.value_box(field, 0.0, cx).rounded_l_none()),
             )
     }
 
@@ -6390,19 +7044,16 @@ impl MacroApp {
         // Disabled itself, or inside a disabled group: runs skip it.
         let skipped = self.doc.is_skipped(id);
 
+        // The card is two layers: the bordered body, and everything that sits on its
+        // edge (ports, ⚠ badge, breakpoint dot) added after it. GPUI paints a div's
+        // border after its children, so those can't be children of the bordered div,
+        // or the border would be drawn across them.
         let mut el = div()
             .absolute()
             .left(px(n.x * z + pan_x))
             .top(px(n.y * z + pan_y))
             .w(s(NODE_W))
             .h(s(NODE_H))
-            .flex()
-            .flex_col()
-            .bg(rgb(NODE_BG))
-            .rounded(s(8.))
-            .border(line(2.))
-            .border_color(border)
-            .shadow_md()
             .text_size(s(14.))
             .cursor_move()
             .on_mouse_down(
@@ -6423,7 +7074,19 @@ impl MacroApp {
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(move |this, _: &MouseUpEvent, _, cx| this.node_mouse_up(id, cx)),
-            )
+            );
+        let body = div()
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+            .flex()
+            .flex_col()
+            .bg(rgb(NODE_BG))
+            .rounded(s(8.))
+            .border(line(2.))
+            .border_color(border)
+            .shadow_md()
             .child(
                 div()
                     .flex()
@@ -6435,12 +7098,11 @@ impl MacroApp {
                     .flex_none()
                     .rounded_t(s(6.))
                     .bg(if skipped { rgba((MUTED << 8) | 0x1c) } else { rgba((color << 8) | 0x2e) })
-                    .child(
-                        div()
-                            .flex_none()
-                            .text_color(rgb(if skipped { MUTED } else { color }))
-                            .child(if n.disabled { "⊘" } else { n.kind.icon() }),
-                    )
+                    .child(icon(
+                        if n.disabled { "icons/disabled.svg" } else { n.kind.icon() },
+                        15. * z,
+                        if skipped { MUTED } else { color },
+                    ))
                     .child(
                         div()
                             .min_w(px(0.))
@@ -6494,6 +7156,7 @@ impl MacroApp {
                     .truncate()
                     .child(subtitle),
             );
+        el = el.child(body);
 
         if n.kind.has_input() {
             el = el.child(
@@ -6667,6 +7330,125 @@ impl MacroApp {
     // -----------------------------------------------------------------------
     // Rendering: inspector
     // -----------------------------------------------------------------------
+
+    /// Webhooks and the Discord bot (app settings, shared by every macro).
+    fn remote_tab(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let r = &self.remote;
+        let mut out: Vec<AnyElement> = vec![
+            section_head("Discord webhook").into_any_element(),
+            self.info_link("rm-info", "How Discord control works", InfoTopic::Remote, cx).into_any_element(),
+            self.text_field("Default webhook URL", Field::RemoteWebhook, cx).into_any_element(),
+            help("For Webhook steps with no URL of their own.").into_any_element(),
+            div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(toggle("rm-finish", "Post when a run finishes", r.notify_finish).on_click(cx.listener(
+                    |this, _: &ClickEvent, _, cx| {
+                        let mut n = this.remote.clone();
+                        n.notify_finish = !n.notify_finish;
+                        this.set_remote(n);
+                        cx.notify();
+                    },
+                )))
+                .child(toggle("rm-stop", "Post when a run goes wrong", r.notify_stop).on_click(cx.listener(
+                    |this, _: &ClickEvent, _, cx| {
+                        let mut n = this.remote.clone();
+                        n.notify_stop = !n.notify_stop;
+                        this.set_remote(n);
+                        cx.notify();
+                    },
+                )))
+                .into_any_element(),
+            small_btn("rm-test", "Send a test message")
+                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                    this.test_webhook();
+                    cx.notify();
+                }))
+                .into_any_element(),
+            section_title("Discord bot").into_any_element(),
+        ];
+        let (dot, state) = match &self.bot_state {
+            BotState::Online(name) => (GREEN, format!("Online as {name}")),
+            BotState::Connecting => (YELLOW, "Connecting…".to_string()),
+            BotState::Retrying(why) => (YELLOW, format!("Reconnecting: {why}")),
+            BotState::Failed(why) => (RED, why.clone()),
+            BotState::Off => (UI_FAINT, "Off".to_string()),
+        };
+        out.push(
+            div()
+                .flex()
+                .flex_row()
+                .items_start()
+                .gap_2()
+                .text_xs()
+                .child(div().mt(px(4.)).size(px(8.)).flex_none().rounded_full().bg(rgb(dot)))
+                .child(div().flex_1().min_w(px(0.)).text_color(rgb(TEXT)).child(state))
+                .into_any_element(),
+        );
+        out.push(
+            toggle("rm-bot", "Connect the bot while MacroFlow is open", r.bot_enabled)
+                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                    this.commit_edit();
+                    let mut n = this.remote.clone();
+                    n.bot_enabled = !n.bot_enabled;
+                    if n.bot_enabled && n.allowed_ids().is_empty() {
+                        this.status = "Add your Discord user ID under “Allowed user IDs”, or the bot will refuse every command.".into();
+                    }
+                    this.set_remote(n);
+                    cx.notify();
+                }))
+                .into_any_element(),
+        );
+        out.push(self.text_field("Bot token", Field::RemoteToken, cx).into_any_element());
+        out.push(self.text_field("Allowed user IDs", Field::RemoteUsers, cx).into_any_element());
+        let ids = r.allowed_ids().len();
+        out.push(
+            help(&if ids == 0 {
+                "Nobody yet, so every command is refused.".to_string()
+            } else {
+                format!("{ids} user{} may control MacroFlow.", if ids == 1 { "" } else { "s" })
+            })
+            .into_any_element(),
+        );
+        if self.bot.is_some() {
+            out.push(
+                small_btn("rm-reconnect", "Reconnect")
+                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                        this.commit_edit();
+                        this.restart_bot();
+                        cx.notify();
+                    }))
+                    .into_any_element(),
+            );
+        }
+        // The commands this macro gives Discord, as chips.
+        out.push(section_title("Commands").into_any_element());
+        let chip_row = |names: Vec<String>, color: u32| {
+            names.into_iter().fold(div().flex().flex_row().flex_wrap().gap_1(), |row, n| {
+                row.child(
+                    div()
+                        .px_1p5()
+                        .h(px(20.))
+                        .flex()
+                        .items_center()
+                        .rounded_md()
+                        .bg(rgba((color << 8) | 0x24))
+                        .text_xs()
+                        .text_color(rgb(color))
+                        .child(n),
+                )
+            })
+        };
+        out.push(chip_row(BOT_COMMANDS.iter().map(|c| format!("/{c}")).collect(), MUTED).into_any_element());
+        let triggers: Vec<String> = trigger_names(&self.doc).iter().map(|t| format!("⚡ /{}", command_name(t))).collect();
+        if triggers.is_empty() {
+            out.push(help("Add a Trigger step to give Discord a command of your own.").into_any_element());
+        } else {
+            out.push(chip_row(triggers, 0x7984f5).into_any_element());
+        }
+        out
+    }
 
     fn macro_settings(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let mut out = vec![
@@ -7445,6 +8227,103 @@ impl MacroApp {
                 ..
             } => {
                 out.extend(self.notify_settings(id, *style, *position, *wait_for_click, *sound, cx));
+            }
+            NodeKind::Trigger { .. } => {
+                out.push(self.prefixed_field("Discord command", "/", Field::TriggerName, cx).into_any_element());
+                out.push(self.num_field("Times to run (0 = until stopped)", Field::TriggerRepeat, 1.0, cx).into_any_element());
+                // Whether Discord can use it right now, in one line.
+                let (dot, text) = match &self.bot_state {
+                    BotState::Online(_) => (GREEN, "Discord bot connected".to_string()),
+                    BotState::Connecting | BotState::Retrying(_) => (YELLOW, "Discord bot connecting…".to_string()),
+                    _ if !self.remote.bot_enabled => (UI_FAINT, "Discord bot is off".to_string()),
+                    _ => (RED, "Discord bot isn't connected".to_string()),
+                };
+                out.push(
+                    div()
+                        .id("trig-bot")
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_2()
+                        .mx(px(-6.))
+                        .px_1p5()
+                        .h(px(26.))
+                        .rounded_md()
+                        .cursor_pointer()
+                        .hover(|s| s.bg(rgb(UI_HOVER)))
+                        .text_xs()
+                        .text_color(rgb(MUTED))
+                        .child(div().flex_none().size(px(7.)).rounded_full().bg(rgb(dot)))
+                        .child(div().flex_1().child(text))
+                        .child(div().flex_none().text_color(rgb(UI_FAINT)).child("Remote ›"))
+                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                            this.commit_edit();
+                            this.side_tab = SideTab::Remote;
+                            cx.notify();
+                        }))
+                        .into_any_element(),
+                );
+                out.push(self.info_link("trig-info", "How triggers work", InfoTopic::Trigger, cx).into_any_element());
+            }
+            NodeKind::Webhook { format, screenshot, .. } => {
+                let fmt = *format;
+                out.push(
+                    labeled(
+                        "Send to",
+                        div().flex().flex_wrap().gap_1().children(HookFormat::ALL.into_iter().enumerate().map(
+                            |(i, v)| {
+                                chip(("hookfmt", i), v.label(), v == fmt).on_click(cx.listener(
+                                    move |this, _: &ClickEvent, _, cx| {
+                                        this.update_node(id, |k| {
+                                            if let NodeKind::Webhook { format, .. } = k {
+                                                *format = v;
+                                            }
+                                        });
+                                        cx.notify();
+                                    },
+                                ))
+                            },
+                        )),
+                    )
+                    .into_any_element(),
+                );
+                out.push(self.text_field("URL (empty = default webhook)", Field::HookUrl, cx).into_any_element());
+                match fmt {
+                    HookFormat::Discord => {
+                        out.push(self.text_field("Message", Field::HookMessage, cx).into_any_element());
+                        out.push(
+                            toggle("hook-shot", "Attach a screenshot", *screenshot)
+                                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                    this.update_node(id, |k| {
+                                        if let NodeKind::Webhook { screenshot, .. } = k {
+                                            *screenshot = !*screenshot;
+                                        }
+                                    });
+                                    cx.notify();
+                                }))
+                                .into_any_element(),
+                        );
+                    }
+                    HookFormat::Custom => {
+                        out.push(self.text_field("Body (POSTed as is)", Field::HookBody, cx).into_any_element());
+                        out.push(self.text_field("Save reply into", Field::HookSaveTo, cx).into_any_element());
+                    }
+                }
+                out.push(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .justify_between()
+                        .child(self.info_link("hook-info", "How webhooks work", InfoTopic::Webhook, cx))
+                        .child(small_btn("hook-test", "Send a test").on_click(cx.listener(
+                            move |this, _: &ClickEvent, _, cx| {
+                                this.test_webhook_step(id);
+                                cx.notify();
+                            },
+                        )))
+                        .into_any_element(),
+                );
             }
         }
         if !general.is_empty() {
@@ -8766,6 +9645,17 @@ impl MacroApp {
                 cx.listener(|this, _: &MouseUpEvent, _, _| this.field_drag = false),
             );
         base = match editing_buf {
+            None if field.is_secret() => {
+                let text = self.get_field(field);
+                let shown = if text.is_empty() {
+                    "not set".to_string()
+                } else {
+                    // Enough to recognise it, not enough to use it.
+                    let tail: String = text.chars().rev().take(4).collect::<Vec<_>>().into_iter().rev().collect();
+                    format!("•••••••• {tail}")
+                };
+                base.child(div().truncate().text_color(rgb(if text.is_empty() { UI_FAINT } else { TEXT })).child(shown))
+            }
             None => {
                 let text = self.get_field(field);
                 let known = |n: &str| self.is_known_var(n);
@@ -9064,6 +9954,14 @@ impl Render for MacroApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Remember the macro for undo whenever it has changed.
         self.checkpoint();
+        // Keep the Discord bot's trigger commands and buttons up to date.
+        if let Some(bot) = &self.bot {
+            let names = trigger_names(&self.doc);
+            if names != self.bot_triggers {
+                bot.set_triggers(names.clone());
+                self.bot_triggers = names;
+            }
+        }
         self.vars_known = self.doc.variables_set();
         self.vars_known.extend(BUILTIN_VARS.iter().map(|v| v.to_string()));
         // What's wrong with each step (badges on the cards, notes in the Edit tab).
@@ -9097,6 +9995,7 @@ impl Render for MacroApp {
         }
         let shape_edit = self.shape_edit.as_ref().map(|_| self.render_shape_edit(cx));
         let check = self.run_check.as_ref().map(|_| self.render_run_check(cx));
+        let info = self.info.map(|t| self.render_info(t, vh, cx));
         div()
             .relative()
             .on_action(cx.listener(Self::on_quit))
@@ -9130,6 +10029,7 @@ impl Render for MacroApp {
             .children(menu)
             .children(quick)
             .children(check)
+            .children(info)
             .children(shape_edit)
     }
 }
@@ -9940,9 +10840,15 @@ impl Field {
     /// How this box uses variables (None = it doesn't).
     fn var_mode(self) -> Option<VarMode> {
         match self {
-            Field::Text | Field::ToastTitle | Field::ToastText | Field::CompareValue => Some(VarMode::Text),
+            Field::Text
+            | Field::ToastTitle
+            | Field::ToastText
+            | Field::CompareValue
+            | Field::HookUrl
+            | Field::HookMessage
+            | Field::HookBody => Some(VarMode::Text),
             Field::VarExpr | Field::IfLeft | Field::IfRight => Some(VarMode::Expr),
-            Field::VarName | Field::ReadSaveTo => Some(VarMode::Name),
+            Field::VarName | Field::ReadSaveTo | Field::HookSaveTo => Some(VarMode::Name),
             _ => None,
         }
     }
@@ -10001,6 +10907,11 @@ fn help(text: &str) -> Stateful<Div> {
         .tooltip(tip_view(text.to_string()))
 }
 
+/// A built-in SVG icon (see assets/icons), tinted.
+fn icon(path: &'static str, size: f32, color: u32) -> gpui::Svg {
+    gpui::svg().path(path).flex_none().size(px(size)).text_color(rgb(color))
+}
+
 /// One line in the Tips list.
 fn tip(text: &'static str) -> Div {
     div()
@@ -10048,6 +10959,7 @@ fn step_group(k: &NodeKind) -> usize {
         NodeKind::FindImage { .. } | NodeKind::WindowCheck { .. } | NodeKind::ReadText { .. } => 2,
         NodeKind::Recording { .. } => 4,
         NodeKind::Notify { .. } => 5,
+        NodeKind::Trigger { .. } | NodeKind::Webhook { .. } => 7,
         NodeKind::SetVar { .. } | NodeKind::IfCompare { .. } => 6,
         NodeKind::PixelColor { .. } => 2,
         _ => 3,
@@ -10078,7 +10990,14 @@ fn step_blurb(k: &NodeKind) -> &'static str {
         NodeKind::SetVar { .. } => "Store a number, text or sum",
         NodeKind::IfCompare { .. } => "Branch on a comparison",
         NodeKind::PixelColor { .. } => "Branch on the colour of one spot",
+        NodeKind::Trigger { .. } => "A /command that starts the macro here",
+        NodeKind::Webhook { .. } => "Post to Discord or any web address",
     }
+}
+
+/// The macro's trigger names, as the Discord bot offers them.
+fn trigger_names(doc: &Macro) -> Vec<String> {
+    doc.triggers().into_iter().map(|(_, n)| n).collect()
 }
 
 /// A small accent tile with a flowchart mark, shown before the app name.
