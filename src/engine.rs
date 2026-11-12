@@ -65,6 +65,8 @@ pub enum WorkerMsg {
     Remote { cmd: remote::RemoteCmd, reply: remote::Reply },
     /// The Discord bot's connection changed.
     Bot(remote::BotState),
+    /// The update check finished (`manual` = you asked for it, so say "up to date").
+    Update { result: Result<Option<crate::update::UpdateInfo>, String>, manual: bool },
 }
 
 /// What a drag-a-box selection is for.
@@ -300,6 +302,7 @@ pub const RUN_THREAD: &str = "macroflow-run";
 /// Play the macro. With `from`, start at that step instead of Start and run once.
 /// `paused` pauses playback while it's set (F9). While `step_mode` is set, it pauses
 /// before every step (F10 runs one).
+/// `inputs` are variables set before the first step (a Trigger's command values).
 pub fn run_macro(
     doc: Macro,
     tx: Tx,
@@ -307,6 +310,7 @@ pub fn run_macro(
     paused: Arc<AtomicBool>,
     step_mode: Arc<AtomicBool>,
     from: Option<u64>,
+    inputs: Vec<(String, String)>,
 ) {
     // The playback thread gets its own copy of `tx`, so the one here can still report
     // a failure to start it.
@@ -323,6 +327,11 @@ pub fn run_macro(
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             match Runner::new(&doc, &tx, stop.clone(), paused.clone(), step_mode.clone(), tracked) {
                 Ok(mut r) => {
+                    for (k, v) in inputs {
+                        r.log(LogLevel::Info, format!("{k} = {v} (from the trigger)"));
+                        r.vars.insert(k, v);
+                    }
+                    r.send_vars();
                     let result = r.run(from);
                     r.describe_end(result)
                 }
@@ -995,7 +1004,7 @@ impl<'a> Runner<'a> {
                 }
             }
             self.note = None;
-            let result = self.exec(&node)?;
+            let result = self.exec_with_retries(&node)?;
             self.send_vars();
             match result {
                 Some(p) => {
@@ -1233,6 +1242,34 @@ impl<'a> Runner<'a> {
     }
 
     /// Run one step. Returns which output to follow (None = stop here).
+    /// Run a step, trying again (up to its "retries") when it goes wrong or, for a
+    /// check, when it doesn't find what it's looking for.
+    fn exec_with_retries(&mut self, node: &Node) -> Result<Option<usize>, String> {
+        let max = if node.kind.can_retry() { node.retries.min(100) } else { 0 };
+        let mut tries = 0u32;
+        loop {
+            let result = self.exec(node);
+            let why = match &result {
+                Err(e) if e != STOPPED && !self.stop.load(Ordering::Relaxed) => e.clone(),
+                Ok(Some(p)) if *p != 0 && node.kind.is_check() => {
+                    let outputs = node.kind.outputs();
+                    format!("went down “{}”", outputs.get(*p).copied().unwrap_or("?"))
+                }
+                _ => return result,
+            };
+            if tries >= max {
+                if tries > 0 {
+                    self.log(LogLevel::Warn, format!("↻ Gave up after {} tries", tries + 1));
+                }
+                return result;
+            }
+            tries += 1;
+            self.log(LogLevel::Warn, format!("↻ {why} – trying again ({}/{max})", tries));
+            self.status(format!("↻ Retrying “{}” ({tries}/{max})…", node.label()));
+            self.sleep(self.scaled(node.retry_wait_ms))?;
+        }
+    }
+
     fn exec(&mut self, node: &Node) -> Result<Option<usize>, String> {
         match &node.kind {
             NodeKind::Start | NodeKind::GroupIn | NodeKind::Group { .. } | NodeKind::Trigger { .. } => Ok(Some(0)),

@@ -5,6 +5,7 @@ use crate::keys;
 use crate::marker;
 use crate::model::*;
 use crate::remote::{self, Bot, BotState, RemoteCmd, RemoteSettings, Reply};
+use crate::update::{self, UpdateInfo, UpdateKind};
 use crate::vision;
 use gpui::{
     canvas, div, fill, img, point, prelude::*, px, rgb, rgba, AnyElement, Bounds, ClickEvent,
@@ -242,6 +243,10 @@ enum Field {
     ScrollStrength,
     TriggerName,
     TriggerRepeat,
+    TriggerInputs,
+    TriggerEvery,
+    Retries,
+    RetryWait,
     HookUrl,
     HookMessage,
     HookBody,
@@ -262,6 +267,7 @@ impl Field {
         matches!(
             self,
             Field::TriggerName
+                | Field::TriggerInputs
                 | Field::HookUrl
                 | Field::HookMessage
                 | Field::HookBody
@@ -413,11 +419,23 @@ pub struct MacroApp {
     bot: Option<Bot>,
     bot_state: BotState,
     /// The trigger names the bot last heard about.
-    bot_triggers: Vec<String>,
+    bot_triggers: Vec<remote::TriggerCmd>,
     /// The Discord command that started the current run (told when it ends).
     remote_origin: Option<Reply>,
     /// The "How it works" sheet showing over the app, if any.
     info: Option<InfoTopic>,
+    /// Values for the next run's trigger inputs (from a Discord command).
+    pending_inputs: Vec<(String, String)>,
+    /// Run triggers that have "every N minutes" set. Off each time MacroFlow opens,
+    /// so a macro never starts moving the mouse by surprise.
+    schedules_on: bool,
+    /// When each scheduled trigger runs next.
+    schedule_next: HashMap<u64, Instant>,
+    /// The countdown second last drawn in the status bar.
+    sched_shown: Option<u64>,
+    /// A newer MacroFlow found on GitHub.
+    update: Option<UpdateInfo>,
+    update_checking: bool,
 }
 
 /// A "How it works" sheet: explanations that would crowd the settings panel.
@@ -426,6 +444,8 @@ enum InfoTopic {
     Trigger,
     Webhook,
     Remote,
+    /// A newer MacroFlow is available.
+    Update,
 }
 
 /// One block of a sheet: a heading and its lines (numbered when `steps`).
@@ -473,16 +493,22 @@ impl MacroApp {
         });
         let first_doc = fresh_macro();
         let remote = RemoteSettings::load();
-        let bot_triggers = trigger_names(&first_doc);
+        let bot_triggers = trigger_cmds(&first_doc);
         let bot = (remote.bot_enabled && !remote.bot_token.is_empty())
             .then(|| Bot::start(&remote.bot_token, remote.allowed_ids(), bot_triggers.clone(), tx.clone()));
-        MacroApp {
+        let mut app = MacroApp {
             remote,
             bot_state: if bot.is_some() { BotState::Connecting } else { BotState::Off },
             bot,
             bot_triggers,
             remote_origin: None,
             info: None,
+            pending_inputs: Vec::new(),
+            schedules_on: false,
+            schedule_next: HashMap::new(),
+            sched_shown: None,
+            update: None,
+            update_checking: false,
             focus,
             doc: first_doc.clone(),
             path: None,
@@ -559,7 +585,9 @@ impl MacroApp {
             restore_after_test: false,
             preview_toast: None,
             last_end: None,
-        }
+        };
+        app.maybe_check_for_updates();
+        app
     }
 
     // -----------------------------------------------------------------------
@@ -567,7 +595,7 @@ impl MacroApp {
     // -----------------------------------------------------------------------
 
     fn drain(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let mut changed = false;
+        let mut changed = self.tick_schedules();
         while let Ok(msg) = self.rx.try_recv() {
             changed = true;
             match msg {
@@ -583,6 +611,7 @@ impl MacroApp {
                     self.last_end = Some(end);
                 }
                 WorkerMsg::Remote { cmd, reply } => self.on_remote(cmd, reply),
+                WorkerMsg::Update { result, manual } => self.on_update_result(result, manual),
                 WorkerMsg::Bot(state) => {
                     if let BotState::Failed(why) = &state {
                         self.status = format!("Discord bot: {why}");
@@ -1147,6 +1176,25 @@ impl MacroApp {
                 ),
                 (None, false) => "Starting…   (F8 stops · F9 pauses · F10 steps)".into(),
             };
+            // A trigger's inputs: what Discord sent, otherwise each input's default
+            // (an input with no default is left empty for a run started here).
+            let given = std::mem::take(&mut self.pending_inputs);
+            let inputs = match from {
+                Some(id) => {
+                    let mut out = Vec::new();
+                    for i in self.doc.trigger_inputs(id) {
+                        let v = given
+                            .iter()
+                            .find(|(k, _)| k.eq_ignore_ascii_case(&i.name))
+                            .map(|(_, v)| v.clone())
+                            .or(i.default)
+                            .unwrap_or_default();
+                        out.push((i.name, v));
+                    }
+                    out
+                }
+                None => Vec::new(),
+            };
             engine::run_macro(
                 self.doc.clone(),
                 self.tx.clone(),
@@ -1154,6 +1202,7 @@ impl MacroApp {
                 self.paused.clone(),
                 self.step_mode.clone(),
                 from,
+                inputs,
             );
         }
     }
@@ -1289,7 +1338,7 @@ impl MacroApp {
         self.bot = None;
         self.bot_state = BotState::Off;
         if self.remote.bot_enabled && !self.remote.bot_token.trim().is_empty() {
-            self.bot_triggers = trigger_names(&self.doc);
+            self.bot_triggers = trigger_cmds(&self.doc);
             self.bot = Some(Bot::start(
                 &self.remote.bot_token,
                 self.remote.allowed_ids(),
@@ -1300,10 +1349,169 @@ impl MacroApp {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // Updates
+    // -----------------------------------------------------------------------
+
+    /// Ask GitHub for a newer MacroFlow in the background. `manual` = you clicked
+    /// "Check now", so the answer is shown even when it's "up to date".
+    fn start_update_check(&mut self, manual: bool) {
+        if self.update_checking {
+            return;
+        }
+        self.update_checking = true;
+        if manual {
+            self.status = "Checking for updates…".into();
+        }
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(WorkerMsg::Update { result: update::check(), manual });
+        });
+    }
+
+    /// The daily check when MacroFlow opens (if it's turned on).
+    fn maybe_check_for_updates(&mut self) {
+        const DAY_MS: u64 = 20 * 60 * 60 * 1000;
+        if self.remote.check_updates && now_ms().saturating_sub(self.remote.last_update_check_ms) >= DAY_MS {
+            self.start_update_check(false);
+        }
+    }
+
+    fn on_update_result(&mut self, result: Result<Option<UpdateInfo>, String>, manual: bool) {
+        self.update_checking = false;
+        let mut next = self.remote.clone();
+        next.last_update_check_ms = now_ms();
+        self.set_remote(next);
+        match result {
+            Ok(Some(u)) => {
+                let skipped = !manual && u.version == self.remote.skipped_update;
+                if !skipped {
+                    self.status = match &u.kind {
+                        UpdateKind::Release => format!("MacroFlow {} is available.", u.version),
+                        UpdateKind::Commits(n) => {
+                            format!("{n} new change{} to MacroFlow on GitHub.", if *n == 1 { "" } else { "s" })
+                        }
+                    };
+                    if manual {
+                        self.info = Some(InfoTopic::Update);
+                    }
+                    self.update = Some(u);
+                }
+            }
+            Ok(None) => {
+                self.update = None;
+                if manual {
+                    self.status = format!("MacroFlow is up to date ({}).", update::version_label());
+                }
+            }
+            Err(e) => {
+                // A failed check when MacroFlow opens isn't worth interrupting you for.
+                if manual {
+                    self.status = format!("Couldn't check for updates: {e}");
+                }
+            }
+        }
+    }
+
+    /// Don't offer this version again.
+    fn skip_update(&mut self) {
+        if let Some(u) = self.update.take() {
+            let mut next = self.remote.clone();
+            next.skipped_update = u.version.clone();
+            self.set_remote(next);
+            self.status = "OK, that update won't be offered again. Check for updates in the Macro tab any time.".into();
+        }
+        self.info = None;
+    }
+
+    fn on_check_updates(&mut self, _: &crate::CheckForUpdates, _: &mut Window, cx: &mut Context<Self>) {
+        self.start_update_check(true);
+        cx.notify();
+    }
+
+    /// The top-level triggers that repeat on a timer: (id, command, minutes).
+    fn scheduled_triggers(&self) -> Vec<(u64, String, u32)> {
+        self.doc
+            .root
+            .nodes
+            .iter()
+            .filter(|n| !n.disabled)
+            .filter_map(|n| match &n.kind {
+                NodeKind::Trigger { name, every_min, .. } if *every_min > 0 => Some((n.id, command_name(name), *every_min)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Start any scheduled trigger that's due. Returns true if something changed.
+    fn tick_schedules(&mut self) -> bool {
+        if !self.schedules_on {
+            return false;
+        }
+        let now = Instant::now();
+        let due: Vec<(u64, String, u32)> = self.scheduled_triggers();
+        // Forget triggers that were deleted or had their timer turned off.
+        self.schedule_next.retain(|id, _| due.iter().any(|(d, _, _)| d == id));
+        let mut changed = false;
+        for (id, name, mins) in due {
+            let every = Duration::from_secs(mins as u64 * 60);
+            let next = self.schedule_next.entry(id).or_insert(now + every);
+            // The interval was shortened: don't wait out the old, longer one.
+            if *next > now + every {
+                *next = now + every;
+            }
+            if now < *next {
+                continue;
+            }
+            *next = now + every;
+            changed = true;
+            self.sched_shown = None;
+            let label = if name.is_empty() { "a trigger".to_string() } else { format!("/{name}") };
+            if self.mode != Mode::Idle || self.run_check.is_some() {
+                self.status = format!("⏱ Skipped {label}: something else is running. Next try in {mins} min.");
+                continue;
+            }
+            // Like F8: MacroFlow may be hidden, so problems show as a pop-up.
+            self.hotkey_start = true;
+            self.start_run_with(Some(id), false);
+            if self.mode == Mode::Running {
+                self.status = format!("⏱ Started {label} on its schedule ({}).", every_label(mins));
+            }
+        }
+        // Redraw once a second, for the countdown in the status bar.
+        let shown = self.next_scheduled().map(|(_, left)| left.as_secs());
+        if shown != self.sched_shown {
+            self.sched_shown = shown;
+            changed = true;
+        }
+        changed
+    }
+
+    fn set_schedules(&mut self, on: bool) {
+        self.schedules_on = on;
+        // Every trigger starts its countdown again from now.
+        self.schedule_next.clear();
+        let n = self.scheduled_triggers().len();
+        self.status = match (on, n) {
+            (true, 0) => "Schedules are on, but no trigger has “Also run every…” set.".into(),
+            (true, _) => format!("⏱ Schedules on: {n} trigger{} will run on their timers.", if n == 1 { "" } else { "s" }),
+            (false, _) => "Schedules off.".into(),
+        };
+    }
+
+    /// When the next scheduled run is, for the status bar.
+    fn next_scheduled(&self) -> Option<(String, Duration)> {
+        let now = Instant::now();
+        self.scheduled_triggers()
+            .into_iter()
+            .filter_map(|(id, name, _)| self.schedule_next.get(&id).map(|t| (name, t.saturating_duration_since(now))))
+            .min_by_key(|(_, d)| *d)
+    }
+
     /// A Discord user pressed a button or ran a slash command.
     fn on_remote(&mut self, cmd: RemoteCmd, reply: Reply) {
         match cmd {
-            RemoteCmd::Run(which) => {
+            RemoteCmd::Run(which, given) => {
                 if self.mode == Mode::Running {
                     reply.answer("A macro is already running. Use `/stop` (or the Stop button) first.");
                     return;
@@ -1332,11 +1540,34 @@ impl MacroApp {
                         }
                     },
                 };
+                // The values the command asked for (a button press sends none, so
+                // inputs without a default have to come from the slash command).
+                let mut shown = String::new();
+                if let Some(id) = from {
+                    match self.doc.resolve_inputs(id, &given) {
+                        Ok(values) => {
+                            shown = values.iter().map(|(k, v)| format!(" {k}={v}")).collect();
+                            self.pending_inputs = values;
+                        }
+                        Err(missing) => {
+                            let name = which.as_deref().map(command_name).unwrap_or_default();
+                            reply.answer(&format!(
+                                "/{name} needs a value for `{missing}`. Use the slash command and fill it in (buttons can't send values)."
+                            ));
+                            return;
+                        }
+                    }
+                }
                 // Like F8: MacroFlow may be hidden, so problems show as a pop-up too.
                 self.hotkey_start = true;
                 self.start_run_with(from, false);
+                if self.mode != Mode::Running && self.run_check.is_none() {
+                    // Didn't start (and isn't waiting on "Run anyway"): don't hand
+                    // these to some later run.
+                    self.pending_inputs.clear();
+                }
                 let what = match &which {
-                    Some(n) => format!("⚡ {n}"),
+                    Some(n) => format!("⚡ /{}{shown}", command_name(n)),
                     None => "Start".to_string(),
                 };
                 if self.mode == Mode::Running {
@@ -1398,9 +1629,19 @@ impl MacroApp {
             .collect();
         let vars = if vars.is_empty() { String::new() } else { format!("\nVariables: {}", vars.join(", ")) };
         let triggers = trigger_names(&self.doc);
-        let triggers = if triggers.is_empty() { String::new() } else { format!("\nTriggers: {}", triggers.join(", ")) };
+        let triggers = if triggers.is_empty() {
+            String::new()
+        } else {
+            let cmds: Vec<String> = triggers.iter().map(|t| format!("/{}", command_name(t))).collect();
+            format!("\nTriggers: {}", cmds.join("  "))
+        };
+        let schedules = match (self.schedules_on, self.next_scheduled()) {
+            (true, Some((name, left))) => format!("\nSchedules on · next /{name} in {} min", left.as_secs().div_ceil(60)),
+            (true, None) => "\nSchedules on".to_string(),
+            (false, _) => String::new(),
+        };
         format!(
-            "**{}** · {state}{step}\n{}{vars}{triggers}",
+            "**{}** · {state}{step}\n{}{vars}{triggers}{schedules}",
             self.doc.name,
             self.status.chars().take(300).collect::<String>()
         )
@@ -3075,6 +3316,10 @@ impl MacroApp {
             (Field::StepName, _) => n.name.clone(),
             (Field::TriggerName, NodeKind::Trigger { name, .. }) => name.clone(),
             (Field::TriggerRepeat, NodeKind::Trigger { repeat, .. }) => repeat.to_string(),
+            (Field::TriggerInputs, NodeKind::Trigger { inputs, .. }) => inputs.clone(),
+            (Field::TriggerEvery, NodeKind::Trigger { every_min, .. }) => every_min.to_string(),
+            (Field::Retries, _) => n.retries.to_string(),
+            (Field::RetryWait, _) => n.retry_wait_ms.to_string(),
             (Field::HookUrl, NodeKind::Webhook { url, .. }) => url.clone(),
             (Field::HookMessage, NodeKind::Webhook { message, .. }) => message.clone(),
             (Field::HookBody, NodeKind::Webhook { body, .. }) => body.clone(),
@@ -3242,6 +3487,13 @@ impl MacroApp {
                 *name = clean
             }
             (Field::TriggerRepeat, NodeKind::Trigger { repeat, .. }) => *repeat = int()?.max(0) as u32,
+            (Field::TriggerInputs, NodeKind::Trigger { inputs, .. }) => {
+                parse_inputs(raw)?;
+                *inputs = raw.trim().to_string()
+            }
+            (Field::TriggerEvery, NodeKind::Trigger { every_min, .. }) => *every_min = int()?.clamp(0, 7 * 24 * 60) as u32,
+            (Field::Retries, _) => n.retries = int()?.clamp(0, 100) as u32,
+            (Field::RetryWait, _) => n.retry_wait_ms = int()?.clamp(0, 600_000) as u64,
             (Field::HookUrl, NodeKind::Webhook { url, .. }) => *url = raw.trim().to_string(),
             (Field::HookMessage, NodeKind::Webhook { message, .. }) => *message = raw.to_string(),
             (Field::HookBody, NodeKind::Webhook { body, .. }) => *body = raw.to_string(),
@@ -4429,6 +4681,36 @@ impl MacroApp {
                             .child("MacroFlow"),
                     ),
             )
+            // A newer MacroFlow is out: a small pill that opens the details.
+            .when(self.update.is_some(), |d| {
+                d.child(
+                    div()
+                        .id("tb-update")
+                        .flex()
+                        .flex_none()
+                        .items_center()
+                        .gap_1()
+                        .mr_1()
+                        .px_2()
+                        .h(px(22.))
+                        .rounded_full()
+                        .bg(rgba((ACCENT << 8) | 0x2e))
+                        .border_1()
+                        .border_color(rgba((ACCENT << 8) | 0x99))
+                        .text_size(px(11.))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(rgb(0xffffff))
+                        .cursor_pointer()
+                        .hover(|s| s.bg(rgba((ACCENT << 8) | 0x55)))
+                        .child("↑ Update")
+                        .tooltip(tip_view("A newer MacroFlow is available"))
+                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                            this.commit_edit();
+                            this.info = Some(InfoTopic::Update);
+                            cx.notify();
+                        })),
+                )
+            })
             .child(
                 div()
                     .id("tb-sidebar")
@@ -5295,6 +5577,37 @@ impl MacroApp {
                     .child(div().size(px(6.)).rounded_full().bg(rgb(color)))
                     .child(badge.trim_start_matches(['●', '◎', ' '])),
             )
+            // Schedules are armed: say so, with the next one due (click → Remote).
+            .when(self.schedules_on, |d| {
+                let next = match self.next_scheduled() {
+                    Some((name, left)) => {
+                        let m = left.as_secs() / 60;
+                        let s = left.as_secs() % 60;
+                        format!("⏱ /{name} in {m}:{s:02}")
+                    }
+                    None => "⏱ Schedules on".to_string(),
+                };
+                d.child(
+                    div()
+                        .id("status-schedules")
+                        .flex_none()
+                        .px_2()
+                        .h(px(18.))
+                        .flex()
+                        .items_center()
+                        .rounded_full()
+                        .bg(rgba((0xfeca57 << 8) | 0x1f))
+                        .text_size(px(10.5))
+                        .text_color(rgb(0xfeca57))
+                        .cursor_pointer()
+                        .child(next)
+                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                            this.side_tab = SideTab::Remote;
+                            this.sidebar_open = true;
+                            cx.notify();
+                        })),
+                )
+            })
             .child(
                 div()
                     .flex_1()
@@ -5547,11 +5860,14 @@ impl MacroApp {
             );
         }
 
+        // The step cards are built first but added after the lines' × buttons, so
+        // a card always covers a × that ends up underneath it.
+        let mut cards: Vec<AnyElement> = Vec::new();
         for n in &view.nodes {
             // Groups look like a little stack of cards.
             if n.kind.is_group() {
                 for off in [8.0, 4.0] {
-                    graph = graph.child(
+                    cards.push(
                         div()
                             .when(n.disabled, |d| d.opacity(0.5))
                             .absolute()
@@ -5562,11 +5878,12 @@ impl MacroApp {
                             .rounded(px(8. * z))
                             .bg(rgb(NODE_BG))
                             .border_1()
-                            .border_color(rgba((GROUP_COLOR << 8) | 0x66)),
+                            .border_color(rgba((GROUP_COLOR << 8) | 0x66))
+                            .into_any_element(),
                     );
                 }
             }
-            graph = graph.child(self.render_node(n, pan_x, pan_y, z, cx));
+            cards.push(self.render_node(n, pan_x, pan_y, z, cx).into_any_element());
         }
 
         for (mx, my, from, port) in handles {
@@ -5600,6 +5917,7 @@ impl MacroApp {
                     ),
             );
         }
+        graph = graph.children(cards);
 
         if let Drag::Select { x, y } = self.drag {
             let (x0, y0) = (x - ox, y - oy);
@@ -5683,9 +6001,6 @@ impl MacroApp {
         }
         if self.log_sel.is_some() && !self.show_start {
             graph = graph.child(self.render_replay(cx));
-        }
-        if self.show_start && !inside {
-            graph = graph.child(self.render_start(cx));
         }
         graph
     }
@@ -6180,17 +6495,7 @@ impl MacroApp {
                 ),
         );
 
-        div()
-            .id("start-screen")
-            .occlude()
-            .absolute()
-            .top_0()
-            .left_0()
-            .size_full()
-            .flex()
-            .items_center()
-            .justify_center()
-            .bg(rgba((CANVAS_BG << 8) | 0xcc))
+        modal_backdrop("start-screen", (CANVAS_BG << 8) | 0xcc)
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .child(card)
     }
@@ -6389,17 +6694,7 @@ impl MacroApp {
         if n > 6 {
             list = list.child(help(&format!("…and {} more.", n - 6)));
         }
-        div()
-            .id("run-check")
-            .occlude()
-            .absolute()
-            .top_0()
-            .left_0()
-            .size_full()
-            .flex()
-            .items_center()
-            .justify_center()
-            .bg(rgba(0x0000_0088))
+        modal_backdrop("run-check", 0x0000_0088)
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .child(
                 div()
@@ -6457,6 +6752,44 @@ impl MacroApp {
         };
         let triggers = trigger_names(&self.doc);
         match topic {
+            InfoTopic::Update => {
+                let Some(u) = &self.update else {
+                    return (
+                        "icons/info.svg",
+                        ACCENT,
+                        "MacroFlow is up to date",
+                        format!("You have version {}.", update::version_label()),
+                        Vec::new(),
+                    );
+                };
+                let (intro, how) = match u.kind {
+                    UpdateKind::Release => (
+                        format!("Version {} is out. You have {}.", u.version, update::version_label()),
+                        vec![
+                            "Download opens the release page. Get the file for your computer: MacroFlow-macos.zip on a Mac, macroflow.exe on Windows.".to_string(),
+                            "Quit MacroFlow, then replace the old app with the new one. Your macros, images and Remote settings are kept.".to_string(),
+                            "On a Mac, you may need to allow Accessibility and Screen Recording again for the new app.".to_string(),
+                        ],
+                    ),
+                    UpdateKind::Commits(n) => (
+                        format!(
+                            "{n} change{} landed on GitHub since this build ({}). No release has been published yet, so these come straight from the source.",
+                            if n == 1 { "" } else { "s" },
+                            update::version_label()
+                        ),
+                        vec![
+                            "Built from the source? Run git pull, then cargo run --release.".to_string(),
+                            "Or Download opens the latest automatic build: pick the top run, then the file for your computer under Artifacts (you need to be signed in to GitHub).".to_string(),
+                        ],
+                    ),
+                };
+                let mut sections = Vec::new();
+                if !u.notes.is_empty() {
+                    sections.push(InfoSection { heading: "What's new", steps: false, lines: u.notes.clone() });
+                }
+                sections.push(InfoSection { heading: "Updating", steps: true, lines: how });
+                return ("icons/info.svg", ACCENT, "Update available", intro, sections);
+            }
             InfoTopic::Trigger => {
                 let name = self
                     .selected
@@ -6476,6 +6809,17 @@ impl MacroApp {
                             "Give it a command name, for example farm.",
                             "Connect its dot to the steps it should run, just like Start.",
                             &format!("In Discord, type /{name}, or press the ⚡ /{name} button that /panel posts."),
+                        ]),
+                        s("Inputs", false, &[
+                            "Inputs let the command ask for values, e.g. times:number=1, message.",
+                            &format!("Discord then shows them as boxes: /{name} times:5 message:hi. Each is stored in a variable of the same name, so steps can use {{times}} or {{message}}."),
+                            "Add :number for numbers only, and =value for a default. An input without a default must be filled in.",
+                            "Buttons from /panel and “Run from here” use the defaults.",
+                        ]),
+                        s("Schedules", false, &[
+                            "“Also run every” runs the trigger on a timer, e.g. every 120 minutes.",
+                            "Timers only run while schedules are on (Remote tab, or the button that appears here). They're off each time MacroFlow opens, so nothing starts by surprise.",
+                            "If a run is due while another one is going, it's skipped until the next time.",
                         ]),
                         s("Good to know", false, &[
                             "“Times to run” repeats everything after the trigger. 0 keeps going until it's stopped.",
@@ -6670,27 +7014,10 @@ impl MacroApp {
                     .py_3()
                     .border_t_1()
                     .border_color(rgb(UI_LINE))
-                    .child(
-                        small_btn("info-ok", "Got it  (Esc)")
-                            .bg(rgb(ACCENT))
-                            .text_color(rgb(0xffffff))
-                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                                this.info = None;
-                                cx.notify();
-                            })),
-                    ),
+                    .gap_2()
+                    .children(self.info_buttons(topic, cx)),
             );
-        div()
-            .id("info-sheet")
-            .occlude()
-            .absolute()
-            .top_0()
-            .left_0()
-            .size_full()
-            .flex()
-            .items_center()
-            .justify_center()
-            .bg(rgba((CANVAS_BG << 8) | 0xcc))
+        modal_backdrop("info-sheet", (CANVAS_BG << 8) | 0xcc)
             // A click outside the card closes it.
             .on_mouse_down(
                 MouseButton::Left,
@@ -6701,6 +7028,36 @@ impl MacroApp {
                 }),
             )
             .child(card)
+    }
+
+    /// The buttons along the bottom of a sheet.
+    fn info_buttons(&self, topic: InfoTopic, cx: &mut Context<Self>) -> Vec<Stateful<Div>> {
+        let close = |label: &'static str| {
+            small_btn("info-ok", label).on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                this.info = None;
+                cx.notify();
+            }))
+        };
+        let Some(u) = self.update.as_ref().filter(|_| topic == InfoTopic::Update) else {
+            return vec![close("Got it  (Esc)").bg(rgb(ACCENT)).text_color(rgb(0xffffff))];
+        };
+        let url = u.url.clone();
+        vec![
+            small_btn("update-skip", "Skip this version").on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                this.skip_update();
+                cx.notify();
+            })),
+            close("Later"),
+            small_btn("update-download", "Download")
+                .bg(rgb(ACCENT))
+                .text_color(rgb(0xffffff))
+                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                    cx.open_url(&url);
+                    this.info = None;
+                    this.status = "Opened the download page in your browser.".into();
+                    cx.notify();
+                })),
+        ]
     }
 
     /// A quiet "ⓘ How it works" link that opens a sheet over the app.
@@ -7447,6 +7804,29 @@ impl MacroApp {
         } else {
             out.push(chip_row(triggers, 0x7984f5).into_any_element());
         }
+
+        out.push(section_title("Schedules").into_any_element());
+        out.push(
+            toggle("rm-sched", "Run triggers on their timers", self.schedules_on)
+                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                    this.commit_edit();
+                    let on = !this.schedules_on;
+                    this.set_schedules(on);
+                    cx.notify();
+                }))
+                .into_any_element(),
+        );
+        let timed: Vec<String> = self
+            .scheduled_triggers()
+            .into_iter()
+            .map(|(_, name, mins)| format!("⏱ /{name} {}", every_label(mins)))
+            .collect();
+        if timed.is_empty() {
+            out.push(help("Set “Also run every” on a Trigger step to schedule it.").into_any_element());
+        } else {
+            out.push(chip_row(timed, 0xfeca57).into_any_element());
+            out.push(help("Off whenever MacroFlow opens. A run that's due while another is going is skipped.").into_any_element());
+        }
         out
     }
 
@@ -7760,6 +8140,66 @@ impl MacroApp {
                     .into_any_element(),
             );
         }
+
+        // About and updates (app-wide, not part of the macro).
+        out.push(section_title("About MacroFlow").into_any_element());
+        let state = if self.update_checking {
+            "Checking…".to_string()
+        } else {
+            match &self.update {
+                Some(u) => match u.kind {
+                    UpdateKind::Release => format!("Version {} is available", u.version),
+                    UpdateKind::Commits(n) => format!("{n} new change{} on GitHub", if n == 1 { "" } else { "s" }),
+                },
+                None if self.remote.last_update_check_ms > 0 => "Up to date".to_string(),
+                None => "Not checked yet".to_string(),
+            }
+        };
+        out.push(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.))
+                        .flex()
+                        .flex_col()
+                        .child(div().text_sm().text_color(rgb(TEXT)).child(format!("Version {}", update::version_label())))
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(if self.update.is_some() { ACCENT } else { UI_FAINT }))
+                                .child(state),
+                        ),
+                )
+                .child(if self.update.is_some() {
+                    small_btn("about-see-update", "See what's new").on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                        this.commit_edit();
+                        this.info = Some(InfoTopic::Update);
+                        cx.notify();
+                    }))
+                } else {
+                    small_btn("about-check", "Check now").on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                        this.commit_edit();
+                        this.start_update_check(true);
+                        cx.notify();
+                    }))
+                })
+                .into_any_element(),
+        );
+        out.push(
+            toggle("about-auto", "Check for updates when MacroFlow opens", self.remote.check_updates)
+                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                    let mut next = this.remote.clone();
+                    next.check_updates = !next.check_updates;
+                    this.set_remote(next);
+                    cx.notify();
+                }))
+                .into_any_element(),
+        );
         out
     }
 
@@ -7856,6 +8296,20 @@ impl MacroApp {
         if !matches!(n.kind, NodeKind::GroupIn | NodeKind::GroupOut) {
             general.push(self.text_field("Note", Field::Note, cx).into_any_element());
             general.push(self.num_field("Delay before (ms)", Field::Delay, 50.0, cx).into_any_element());
+            if n.kind.can_retry() {
+                general.push(self.num_field("Retries if it fails", Field::Retries, 1.0, cx).into_any_element());
+                if n.retries > 0 {
+                    general.push(self.num_field("Wait between tries (ms)", Field::RetryWait, 250.0, cx).into_any_element());
+                    general.push(
+                        help(if n.kind.is_check() {
+                            "Tries again if it goes wrong or doesn't find it."
+                        } else {
+                            "Tries again if it goes wrong."
+                        })
+                        .into_any_element(),
+                    );
+                }
+            }
             general.push(
                 toggle("n-breakpoint", "Breakpoint: pause before this step", n.breakpoint)
                     .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
@@ -8230,7 +8684,23 @@ impl MacroApp {
             }
             NodeKind::Trigger { .. } => {
                 out.push(self.prefixed_field("Discord command", "/", Field::TriggerName, cx).into_any_element());
+                out.push(self.text_field("Inputs (optional)", Field::TriggerInputs, cx).into_any_element());
+                out.push(help("e.g. times:number=1, message").into_any_element());
                 out.push(self.num_field("Times to run (0 = until stopped)", Field::TriggerRepeat, 1.0, cx).into_any_element());
+                out.push(self.num_field("Also run every (minutes, 0 = off)", Field::TriggerEvery, 5.0, cx).into_any_element());
+                if let NodeKind::Trigger { every_min, .. } = &n.kind {
+                    if *every_min > 0 && !self.schedules_on {
+                        out.push(
+                            small_btn("trig-sched-on", "Turn schedules on")
+                                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                    this.commit_edit();
+                                    this.set_schedules(true);
+                                    cx.notify();
+                                }))
+                                .into_any_element(),
+                        );
+                    }
+                }
                 // Whether Discord can use it right now, in one line.
                 let (dot, text) = match &self.bot_state {
                     BotState::Online(_) => (GREEN, "Discord bot connected".to_string()),
@@ -9956,7 +10426,7 @@ impl Render for MacroApp {
         self.checkpoint();
         // Keep the Discord bot's trigger commands and buttons up to date.
         if let Some(bot) = &self.bot {
-            let names = trigger_names(&self.doc);
+            let names = trigger_cmds(&self.doc);
             if names != self.bot_triggers {
                 bot.set_triggers(names.clone());
                 self.bot_triggers = names;
@@ -9996,9 +10466,12 @@ impl Render for MacroApp {
         let shape_edit = self.shape_edit.as_ref().map(|_| self.render_shape_edit(cx));
         let check = self.run_check.as_ref().map(|_| self.render_run_check(cx));
         let info = self.info.map(|t| self.render_info(t, vh, cx));
+        // The welcome screen sits over the whole window, centred in it.
+        let start = (self.show_start && self.view.is_empty()).then(|| self.render_start(cx));
         div()
             .relative()
             .on_action(cx.listener(Self::on_quit))
+            .on_action(cx.listener(Self::on_check_updates))
             .on_key_down(cx.listener(Self::on_key))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
             .on_mouse_up(
@@ -10026,6 +10499,7 @@ impl Render for MacroApp {
                     .child(self.render_graph(cx)),
             )
             .child(self.render_statusbar(cx))
+            .children(start)
             .children(menu)
             .children(quick)
             .children(check)
@@ -10907,6 +11381,33 @@ fn help(text: &str) -> Stateful<Div> {
         .tooltip(tip_view(text.to_string()))
 }
 
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// The dimmed backdrop behind a pop-up card (welcome screen, sheets, run check).
+/// It covers everything below the title bar, so the window can still be dragged and
+/// closed, and the bottom padding matches the title bar so the card sits in the
+/// middle of the whole window.
+fn modal_backdrop(id: &'static str, dim: u32) -> Stateful<Div> {
+    div()
+        .id(id)
+        .occlude()
+        .absolute()
+        .top(px(TITLEBAR_H))
+        .left_0()
+        .right_0()
+        .bottom_0()
+        .pb(px(TITLEBAR_H))
+        .flex()
+        .items_center()
+        .justify_center()
+        .bg(rgba(dim))
+}
+
 /// A built-in SVG icon (see assets/icons), tinted.
 fn icon(path: &'static str, size: f32, color: u32) -> gpui::Svg {
     gpui::svg().path(path).flex_none().size(px(size)).text_color(rgb(color))
@@ -10996,6 +11497,11 @@ fn step_blurb(k: &NodeKind) -> &'static str {
 }
 
 /// The macro's trigger names, as the Discord bot offers them.
+/// The macro's triggers with the values they ask for, as the bot registers them.
+fn trigger_cmds(doc: &Macro) -> Vec<remote::TriggerCmd> {
+    doc.triggers().into_iter().map(|(id, n)| (n, doc.trigger_inputs(id))).collect()
+}
+
 fn trigger_names(doc: &Macro) -> Vec<String> {
     doc.triggers().into_iter().map(|(_, n)| n).collect()
 }

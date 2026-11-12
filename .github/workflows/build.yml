@@ -8,6 +8,12 @@ on:
   pull_request:
   workflow_dispatch:
 
+# Pushing a version tag (e.g. `git tag v0.2.0 && git push origin v0.2.0`) also
+# publishes a GitHub Release with both downloads. MacroFlow's update check offers
+# it to everyone on an older version.
+permissions:
+  contents: write
+
 jobs:
   build:
     name: ${{ matrix.name }}
@@ -44,11 +50,15 @@ jobs:
         shell: bash
         run: |
           mkdir -p dist
-          cp "target/release/${{ matrix.exe }}" dist/
-          # The macOS text reader helper is built next to the other build outputs.
           if [ "${{ runner.os }}" = "macOS" ]; then
-            helper=$(find target/release/build -name macroflow-ocr -type f | head -n 1)
-            if [ -n "$helper" ]; then cp "$helper" dist/; fi
+            # A real MacroFlow.app with its icon and all four helpers, zipped so
+            # the download keeps the app's structure and signature.
+            ./scripts/bundle-macos.sh
+            ditto -c -k --keepParent dist/MacroFlow.app dist/MacroFlow-macos.zip
+            rm -rf dist/MacroFlow.app
+          else
+            # The .exe has the app icon built in (build.rs).
+            cp "target/release/${{ matrix.exe }}" dist/
           fi
           cp README.md dist/
 
@@ -56,3 +66,23 @@ jobs:
         with:
           name: ${{ matrix.artifact }}
           path: dist/
+
+      - name: Check the tag matches Cargo.toml
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
+          if [ "v$version" != "${GITHUB_REF_NAME}" ]; then
+            echo "::error::Tag ${GITHUB_REF_NAME} doesn't match Cargo.toml version $version. Bump the version first, so the update check compares the right numbers."
+            exit 1
+          fi
+
+      - name: Publish the release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            dist/MacroFlow-macos.zip
+            dist/macroflow.exe
+          fail_on_unmatched_files: false

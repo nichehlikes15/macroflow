@@ -571,6 +571,68 @@ pub fn command_name(raw: &str) -> String {
         .collect()
 }
 
+/// One value a Trigger's Discord command asks for.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TriggerInput {
+    /// Also the variable it's stored in.
+    pub name: String,
+    pub number: bool,
+    /// Used when it isn't given. None = Discord requires it.
+    pub default: Option<String>,
+}
+
+/// Read a Trigger's inputs: comma-separated `name`, `name:number`, `name=default`
+/// or `name:number=default`. Names are variable names (lower case for Discord).
+pub fn parse_inputs(s: &str) -> Result<Vec<TriggerInput>, String> {
+    let mut out: Vec<TriggerInput> = Vec::new();
+    for part in s.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+        let (head, default) = match part.split_once('=') {
+            Some((h, d)) => (h.trim(), Some(d.trim().to_string())),
+            None => (part, None),
+        };
+        let (name, kind) = match head.split_once(':') {
+            Some((n, k)) => (n.trim(), k.trim().to_lowercase()),
+            None => (head, String::new()),
+        };
+        let name = name.to_lowercase();
+        if !is_ident(&name) || name.chars().count() > 32 {
+            return Err(format!("“{name}” can't be an input name (letters, numbers and _ only, e.g. times)."));
+        }
+        if BUILTIN_VARS.contains(&name.as_str()) {
+            return Err(format!("“{name}” is a built-in variable; pick another input name."));
+        }
+        let number = match kind.as_str() {
+            "" | "text" => false,
+            "number" | "num" => true,
+            k => return Err(format!("“{k}” isn't an input type. Use text or number, e.g. times:number.")),
+        };
+        if number {
+            if let Some(d) = &default {
+                if d.parse::<f64>().is_err() {
+                    return Err(format!("{name}'s default “{d}” isn't a number."));
+                }
+            }
+        }
+        if out.iter().any(|i| i.name == name) {
+            return Err(format!("“{name}” is listed twice."));
+        }
+        out.push(TriggerInput { name, number, default });
+    }
+    if out.len() > 25 {
+        return Err("Discord allows at most 25 inputs.".into());
+    }
+    Ok(out)
+}
+
+/// "5 min", "2 h", "1 h 30 min".
+pub fn every_label(min: u32) -> String {
+    match (min / 60, min % 60) {
+        (0, m) => format!("every {m} min"),
+        (h, 0) => format!("every {h} h"),
+        (h, m) => format!("every {h} h {m} min"),
+    }
+}
+
 /// What a Webhook step sends.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum HookFormat {
@@ -1121,6 +1183,13 @@ pub enum NodeKind {
         /// How many times to run from here (0 = until stopped).
         #[serde(default = "default_one")]
         repeat: u32,
+        /// Values the Discord command asks for, stored in variables before the run:
+        /// `times:number=1, message` (see `parse_inputs`).
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        inputs: String,
+        /// Also run every this many minutes while schedules are on (0 = never).
+        #[serde(default, skip_serializing_if = "is_zero")]
+        every_min: u32,
     },
     /// Send a message to a Discord webhook, or POST to any other URL.
     Webhook {
@@ -1217,6 +1286,8 @@ impl NodeKind {
             NodeKind::Trigger {
                 name: "my-action".into(),
                 repeat: 1,
+                inputs: String::new(),
+                every_min: 0,
             },
             NodeKind::Scroll {
                 amount: 3,
@@ -1406,6 +1477,29 @@ impl NodeKind {
 
     pub fn has_input(&self) -> bool {
         !self.is_entry()
+    }
+
+    /// A check whose second output means "didn't find it" (so a retry makes sense).
+    pub fn is_check(&self) -> bool {
+        matches!(
+            self,
+            NodeKind::FindImage { .. } | NodeKind::WindowCheck { .. } | NodeKind::ReadText { .. } | NodeKind::PixelColor { .. }
+        )
+    }
+
+    /// Steps that can be tried again when they go wrong.
+    pub fn can_retry(&self) -> bool {
+        !matches!(
+            self,
+            NodeKind::Start
+                | NodeKind::End
+                | NodeKind::Group { .. }
+                | NodeKind::GroupIn
+                | NodeKind::GroupOut
+                | NodeKind::Trigger { .. }
+                | NodeKind::Loop { .. }
+                | NodeKind::IfCompare { .. }
+        )
     }
 
     /// Where a run can begin: Start, a group's start, or a Trigger.
@@ -1698,16 +1792,22 @@ impl NodeKind {
                 format!("{} · “{short}{more}” · {how}", style.label())
             }
             NodeKind::GroupOut => "Leave the group and carry on".into(),
-            NodeKind::Trigger { name, repeat } => {
+            NodeKind::Trigger { name, repeat, inputs, every_min } => {
                 let times = match repeat {
                     0 => " · until stopped".to_string(),
                     1 => String::new(),
                     n => format!(" · {n}×"),
                 };
+                let args: String = parse_inputs(inputs)
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|i| format!(" {}", i.name))
+                    .collect();
+                let every = if *every_min > 0 { format!(" · ⏱ {}", every_label(*every_min)) } else { String::new() };
                 if name.trim().is_empty() {
                     "Name its command to run it from Discord".into()
                 } else {
-                    format!("/{}{times}", name.trim())
+                    format!("/{}{args}{times}{every}", name.trim())
                 }
             }
             NodeKind::Webhook { url, format, message, body, screenshot, .. } => {
@@ -1758,6 +1858,22 @@ pub struct Node {
     /// Optional, so older macros still open.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub disabled: bool,
+    /// Try the step again this many times if it goes wrong, or (for checks such as
+    /// Find image) if it doesn't find what it's looking for. Optional, so older
+    /// macros still open.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub retries: u32,
+    /// How long to wait before each new try.
+    #[serde(default = "default_retry_wait", skip_serializing_if = "is_default_retry_wait")]
+    pub retry_wait_ms: u64,
+}
+
+pub fn default_retry_wait() -> u64 {
+    1000
+}
+
+fn is_default_retry_wait(v: &u64) -> bool {
+    *v == default_retry_wait()
 }
 
 impl Node {
@@ -2120,6 +2236,8 @@ fn blank_node(id: u64, kind: NodeKind, x: f32, y: f32) -> Node {
         name: String::new(),
         breakpoint: false,
         disabled: false,
+        retries: 0,
+        retry_wait_ms: default_retry_wait(),
     }
 }
 
@@ -3239,9 +3357,45 @@ impl Macro {
             NodeKind::ReadText { save_to, .. } | NodeKind::Webhook { save_to, .. } if is_ident(save_to.trim()) => {
                 out.insert(save_to.trim().to_string());
             }
+            NodeKind::Trigger { inputs, .. } => {
+                for i in parse_inputs(inputs).unwrap_or_default() {
+                    out.insert(i.name);
+                }
+            }
             _ => {}
         });
         out
+    }
+
+    #[cfg(test)]
+    fn summary_for_test(&self, id: u64) -> String {
+        self.node(id).map(|n| n.kind.summary()).unwrap_or_default()
+    }
+
+    /// The values a Trigger's command asks for (empty for anything else).
+    pub fn trigger_inputs(&self, id: u64) -> Vec<TriggerInput> {
+        match self.node(id).map(|n| &n.kind) {
+            Some(NodeKind::Trigger { inputs, .. }) => parse_inputs(inputs).unwrap_or_default(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Fill in a Trigger's inputs from what was given (by name), using defaults for
+    /// the rest. Err names an input that has no value and no default.
+    pub fn resolve_inputs(&self, id: u64, given: &[(String, String)]) -> Result<Vec<(String, String)>, String> {
+        let mut out = Vec::new();
+        for i in self.trigger_inputs(id) {
+            let value = given
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(&i.name))
+                .map(|(_, v)| v.clone())
+                .or_else(|| i.default.clone());
+            match value {
+                Some(v) => out.push((i.name, v)),
+                None => return Err(i.name),
+            }
+        }
+        Ok(out)
     }
 
     /// Every variable some step reads.
@@ -3645,7 +3799,10 @@ fn graph_problems(g: &Graph, top: bool, has_find: bool, known: &dyn Fn(&str) -> 
             NodeKind::Drag { taps, tap_in_area, tap_area, .. } if *taps > 0 && *tap_in_area && tap_area.is_none() => {
                 push(id, true, "It taps round a shape, but no area is selected yet.".into());
             }
-            NodeKind::Trigger { name, .. } => {
+            NodeKind::Trigger { name, inputs, .. } => {
+                if let Err(e) = parse_inputs(inputs) {
+                    push(id, false, format!("Inputs: {e}"));
+                }
                 if !top {
                     push(id, false, "Triggers only work at the top level of the macro, not inside a group.".into());
                 } else if name.trim().is_empty() {
@@ -4550,8 +4707,8 @@ mod tests {
     #[test]
     fn triggers_are_found_by_name() {
         let mut m = Macro::default();
-        let t = m.add_node(NodeKind::Trigger { name: "Farm".into(), repeat: 1 }, 0.0, 0.0);
-        m.add_node(NodeKind::Trigger { name: String::new(), repeat: 1 }, 0.0, 0.0);
+        let t = m.add_node(NodeKind::Trigger { name: "Farm".into(), repeat: 1, inputs: String::new(), every_min: 0 }, 0.0, 0.0);
+        m.add_node(NodeKind::Trigger { name: String::new(), repeat: 1, inputs: String::new(), every_min: 0 }, 0.0, 0.0);
         assert_eq!(m.triggers(), vec![(t, "Farm".to_string())]);
         assert_eq!(m.trigger_named(" farm "), Some(t));
         assert_eq!(m.trigger_named("collect"), None);
@@ -4565,29 +4722,90 @@ mod tests {
         assert_eq!(command_name("!!"), "");
         // Older triggers with spaces / capitals still answer to their command.
         let mut m = Macro::default();
-        let t = m.add_node(NodeKind::Trigger { name: "My Farm".into(), repeat: 1 }, 0.0, 0.0);
+        let t = m.add_node(NodeKind::Trigger { name: "My Farm".into(), repeat: 1, inputs: String::new(), every_min: 0 }, 0.0, 0.0);
         assert_eq!(m.trigger_named("my-farm"), Some(t));
         assert_eq!(m.trigger_named("/My-Farm"), Some(t));
     }
 
     #[test]
+    fn trigger_inputs_parse_and_resolve() {
+        let i = parse_inputs("times:number=1, Message ,  gold:num").unwrap();
+        assert_eq!(i.len(), 3);
+        assert_eq!(i[0], TriggerInput { name: "times".into(), number: true, default: Some("1".into()) });
+        assert_eq!(i[1], TriggerInput { name: "message".into(), number: false, default: None });
+        assert!(i[2].number);
+        assert!(parse_inputs("").unwrap().is_empty());
+        assert!(parse_inputs("two words").is_err());
+        assert!(parse_inputs("times:number=lots").is_err());
+        assert!(parse_inputs("text").is_err(), "built-in variable");
+        assert!(parse_inputs("a, a").is_err());
+        assert!(parse_inputs("x:colour").is_err());
+
+        let mut m = Macro::default();
+        let t = m.add_node(
+            NodeKind::Trigger { name: "farm".into(), repeat: 1, inputs: "times:number=1, message".into(), every_min: 0 },
+            0.0,
+            0.0,
+        );
+        // A required input that's missing is named; defaults fill the rest.
+        assert_eq!(m.resolve_inputs(t, &[]), Err("message".into()));
+        assert_eq!(
+            m.resolve_inputs(t, &[("MESSAGE".into(), "hi".into())]),
+            Ok(vec![("times".into(), "1".into()), ("message".into(), "hi".into())])
+        );
+        // Inputs count as variables the macro sets.
+        assert!(m.variables_set().contains("times"));
+        assert!(m.summary_for_test(t).contains("/farm times message"));
+    }
+
+    #[test]
+    fn retries_save_only_when_used() {
+        let mut m = Macro::default();
+        let w = m.add_node(NodeKind::Wait { ms: 1, jitter_ms: 0 }, 0.0, 0.0);
+        let json = serde_json::to_string(&m).unwrap();
+        assert!(!json.contains("retries") && !json.contains("retry_wait_ms"));
+        m.node_mut(w).unwrap().retries = 3;
+        let back: Macro = serde_json::from_str(&serde_json::to_string(&m).unwrap()).unwrap();
+        assert_eq!(back.node(w).unwrap().retries, 3);
+        assert_eq!(back.node(w).unwrap().retry_wait_ms, default_retry_wait());
+        assert!(NodeKind::FindImage {
+            template: None,
+            threshold: 0.9,
+            timeout_ms: 0,
+            interval_ms: 100,
+            click_when_found: false,
+            search_area: None,
+            until_gone: false
+        }
+        .is_check());
+        assert!(!NodeKind::Loop { count: 1 }.can_retry());
+    }
+
+    #[test]
+    fn every_label_reads_well() {
+        assert_eq!(every_label(5), "every 5 min");
+        assert_eq!(every_label(120), "every 2 h");
+        assert_eq!(every_label(90), "every 1 h 30 min");
+    }
+
+    #[test]
     fn a_trigger_cant_take_a_bot_command_name() {
         let mut m = Macro::default();
-        let t = m.add_node(NodeKind::Trigger { name: "stop".into(), repeat: 1 }, 0.0, 0.0);
+        let t = m.add_node(NodeKind::Trigger { name: "stop".into(), repeat: 1, inputs: String::new(), every_min: 0 }, 0.0, 0.0);
         assert!(m.problems().iter().any(|p| p.step == t && p.text.contains("bot's own commands")));
     }
 
     #[test]
     fn a_trigger_only_macro_can_run() {
         let mut m = Macro::default();
-        let t = m.add_node(NodeKind::Trigger { name: "farm".into(), repeat: 1 }, 0.0, 0.0);
+        let t = m.add_node(NodeKind::Trigger { name: "farm".into(), repeat: 1, inputs: String::new(), every_min: 0 }, 0.0, 0.0);
         let w = m.add_node(NodeKind::Wait { ms: 10, jitter_ms: 0 }, 0.0, 0.0);
         m.connect(t, 0, w);
         // Start isn't connected, but that's only a warning while a trigger is.
         assert!(m.problems().iter().all(|p| !p.serious));
         // Steps after a trigger aren't "never runs".
         assert!(!m.problems().iter().any(|p| p.step == w));
-        assert!(!NodeKind::Trigger { name: String::new(), repeat: 1 }.has_input());
+        assert!(!NodeKind::Trigger { name: String::new(), repeat: 1, inputs: String::new(), every_min: 0 }.has_input());
     }
 
     #[test]
@@ -4605,7 +4823,7 @@ mod tests {
             }
         );
         let t: NodeKind = serde_json::from_str(r#"{"type":"Trigger","name":"go"}"#).unwrap();
-        assert_eq!(t, NodeKind::Trigger { name: "go".into(), repeat: 1 });
+        assert_eq!(t, NodeKind::Trigger { name: "go".into(), repeat: 1, inputs: String::new(), every_min: 0 });
         assert_eq!(url_host("https://discord.com/api/webhooks/1/secret"), "discord.com");
     }
 }

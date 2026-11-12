@@ -7,6 +7,7 @@
 //! only the Discord users listed in the Remote tab are obeyed.
 
 use crate::engine::{Tx, WorkerMsg};
+use crate::model::TriggerInput;
 use crate::vision;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -35,7 +36,7 @@ const EPHEMERAL: u64 = 64;
 // Settings (kept outside the macro files, since they hold secrets)
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RemoteSettings {
     /// Used by Webhook steps with no URL of their own, and by the run notifications.
@@ -49,6 +50,33 @@ pub struct RemoteSettings {
     pub bot_token: String,
     /// Discord user IDs allowed to control MacroFlow (separated by commas or spaces).
     pub allowed_users: String,
+    /// Look for a newer MacroFlow when it opens (at most once a day).
+    #[serde(default = "yes")]
+    pub check_updates: bool,
+    /// When that last happened (ms since 1970).
+    pub last_update_check_ms: u64,
+    /// A version you chose to skip: it isn't offered again.
+    pub skipped_update: String,
+}
+
+fn yes() -> bool {
+    true
+}
+
+impl Default for RemoteSettings {
+    fn default() -> Self {
+        RemoteSettings {
+            webhook_url: String::new(),
+            notify_finish: false,
+            notify_stop: false,
+            bot_enabled: false,
+            bot_token: String::new(),
+            allowed_users: String::new(),
+            check_updates: true,
+            last_update_check_ms: 0,
+            skipped_update: String::new(),
+        }
+    }
 }
 
 impl RemoteSettings {
@@ -179,6 +207,23 @@ fn request(method: Method, url: &str, auth: Option<&str>, content_type: &str, bo
         return Ok(HttpReply { status, body: text });
     }
     Err("Discord is rate limiting MacroFlow; try again in a moment.".into())
+}
+
+/// A plain GET (used by the update check), with extra headers.
+pub fn http_get(url: &str, headers: &[(&str, &str)]) -> Result<HttpReply, String> {
+    if !url.starts_with("https://") {
+        return Err("Only https addresses are fetched.".into());
+    }
+    let mut r = agent()
+        .get(url)
+        .header("User-Agent", concat!("MacroFlow/", env!("CARGO_PKG_VERSION")));
+    for (k, v) in headers {
+        r = r.header(*k, *v);
+    }
+    let mut resp = r.call().map_err(http_err)?;
+    let status = resp.status().as_u16();
+    let body = resp.body_mut().read_to_string().unwrap_or_default();
+    Ok(HttpReply { status, body })
 }
 
 fn post_json(url: &str, auth: Option<&str>, body: &Value) -> Result<HttpReply, String> {
@@ -314,7 +359,7 @@ fn short(s: &str, n: usize) -> String {
 #[derive(Clone, Debug, PartialEq)]
 pub enum RemoteCmd {
     /// Start the macro (None) or one of its triggers.
-    Run(Option<String>),
+    Run(Option<String>, Vec<(String, String)>),
     Stop,
     Pause,
     Status,
@@ -394,10 +439,13 @@ pub enum BotState {
 
 /// The trigger command names, shared with the bot's thread.
 struct Triggers {
-    names: Vec<String>,
+    cmds: Vec<TriggerCmd>,
     /// When they last changed and haven't been sent to Discord yet.
     changed: Option<Instant>,
 }
+
+/// A Trigger as a Discord command: its name and the values it asks for.
+pub type TriggerCmd = (String, Vec<TriggerInput>);
 
 /// Wait this long after the last change before updating Discord's command list
 /// (renaming a trigger letter by letter shouldn't update it every keystroke).
@@ -411,12 +459,12 @@ pub struct Bot {
 }
 
 /// Trigger names as Discord commands: valid, without duplicates or the bot's own names.
-fn command_names(triggers: &[String]) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    for t in triggers {
+fn command_names(triggers: &[TriggerCmd]) -> Vec<TriggerCmd> {
+    let mut out: Vec<TriggerCmd> = Vec::new();
+    for (t, inputs) in triggers {
         let c = crate::model::command_name(t);
-        if !c.is_empty() && !crate::model::BOT_COMMANDS.contains(&c.as_str()) && !out.contains(&c) {
-            out.push(c);
+        if !c.is_empty() && !crate::model::BOT_COMMANDS.contains(&c.as_str()) && !out.iter().any(|(n, _)| *n == c) {
+            out.push((c, inputs.clone()));
         }
     }
     out
@@ -424,9 +472,9 @@ fn command_names(triggers: &[String]) -> Vec<String> {
 
 impl Bot {
     /// Connect to Discord in the background. Each trigger becomes a slash command.
-    pub fn start(token: &str, allowed: Vec<String>, triggers: Vec<String>, tx: Tx) -> Bot {
+    pub fn start(token: &str, allowed: Vec<String>, triggers: Vec<TriggerCmd>, tx: Tx) -> Bot {
         let stop = Arc::new(AtomicBool::new(false));
-        let shared = Arc::new(Mutex::new(Triggers { names: command_names(&triggers), changed: None }));
+        let shared = Arc::new(Mutex::new(Triggers { cmds: command_names(&triggers), changed: None }));
         let token = token.trim().trim_start_matches("Bot ").to_string();
         let ctx = BotCtx {
             token: token.clone(),
@@ -443,11 +491,11 @@ impl Bot {
 
     /// Tell the bot the macro's triggers changed: their slash commands are updated
     /// a few seconds later.
-    pub fn set_triggers(&self, names: Vec<String>) {
-        let names = command_names(&names);
+    pub fn set_triggers(&self, cmds: Vec<TriggerCmd>) {
+        let cmds = command_names(&cmds);
         if let Ok(mut t) = self.triggers.lock() {
-            if t.names != names {
-                t.names = names;
+            if t.cmds != cmds {
+                t.cmds = cmds;
                 t.changed = Some(Instant::now());
             }
         }
@@ -505,8 +553,13 @@ impl BotCtx {
         !self.stopped()
     }
 
+    /// The trigger command names (for the panel).
     fn triggers(&self) -> Vec<String> {
-        self.triggers.lock().map(|t| t.names.clone()).unwrap_or_default()
+        self.trigger_cmds().into_iter().map(|(n, _)| n).collect()
+    }
+
+    fn trigger_cmds(&self) -> Vec<TriggerCmd> {
+        self.triggers.lock().map(|t| t.cmds.clone()).unwrap_or_default()
     }
 
     /// Triggers changed a while ago and Discord hasn't heard yet?
@@ -697,10 +750,8 @@ fn session(ctx: &mut BotCtx) -> SessionEnd {
 }
 
 /// The slash commands MacroFlow offers (replaces whatever it set up before).
-fn register_commands(ctx: &BotCtx) -> Result<(), String> {
-    if ctx.app_id.is_empty() {
-        return Err("Discord didn't say which app this is".into());
-    }
+/// The command list for Discord: the bot's own commands, then one per trigger.
+fn commands_json(triggers: Vec<TriggerCmd>) -> Value {
     let cmd = |name: &str, description: &str| {
         json!({ "name": name, "description": short(description, 100), "type": 1, "contexts": [0, 1] })
     };
@@ -713,10 +764,41 @@ fn register_commands(ctx: &BotCtx) -> Result<(), String> {
         cmd("panel", "Post buttons that control MacroFlow"),
     ];
     // Each Trigger step is a command of its own (Discord allows 100).
-    for t in ctx.triggers().into_iter().take(90) {
-        commands.push(cmd(&t, &format!("⚡ Run the “{t}” trigger in MacroFlow")));
+    for (t, inputs) in triggers.into_iter().take(90) {
+        let mut c = cmd(&t, &format!("⚡ Run the “{t}” trigger in MacroFlow"));
+        // Discord wants the required values listed before the optional ones.
+        let mut inputs = inputs;
+        inputs.sort_by_key(|i| i.default.is_some());
+        let options: Vec<Value> = inputs
+            .iter()
+            .map(|i| {
+                let description = match &i.default {
+                    Some(d) if !d.is_empty() => format!("Stored in {{{}}} (default {d})", i.name),
+                    _ => format!("Stored in {{{}}}", i.name),
+                };
+                json!({
+                    // 10 = number, 3 = text
+                    "type": if i.number { 10 } else { 3 },
+                    "name": i.name,
+                    "description": short(&description, 100),
+                    "required": i.default.is_none(),
+                })
+            })
+            .collect();
+        if !options.is_empty() {
+            c["options"] = Value::Array(options);
+        }
+        commands.push(c);
     }
-    let commands = Value::Array(commands);
+    Value::Array(commands)
+}
+
+/// Send the command list to Discord (replacing what it had).
+fn register_commands(ctx: &BotCtx) -> Result<(), String> {
+    if ctx.app_id.is_empty() {
+        return Err("Discord didn't say which app this is".into());
+    }
+    let commands = commands_json(ctx.trigger_cmds());
     let url = format!("{API}/applications/{}/commands", ctx.app_id);
     let auth = format!("Bot {}", ctx.token);
     let r = request(Method::Put, &url, Some(&auth), "application/json", commands.to_string().as_bytes())?;
@@ -757,7 +839,7 @@ fn on_interaction(ctx: &BotCtx, d: &Value) {
         2 => {
             let name = d["data"]["name"].as_str().unwrap_or("");
             match name {
-                "start" => Action::Cmd(RemoteCmd::Run(None)),
+                "start" => Action::Cmd(RemoteCmd::Run(None, Vec::new())),
                 "stop" => Action::Cmd(RemoteCmd::Stop),
                 "pause" => Action::Cmd(RemoteCmd::Pause),
                 "status" => Action::Cmd(RemoteCmd::Status),
@@ -765,20 +847,43 @@ fn on_interaction(ctx: &BotCtx, d: &Value) {
                 "panel" => Action::Panel,
                 // Anything else is a trigger's own command (the editor checks it
                 // still exists in the open macro).
-                trigger if !trigger.is_empty() => Action::Cmd(RemoteCmd::Run(Some(trigger.to_string()))),
+                trigger if !trigger.is_empty() => {
+                    // The values typed into the command's options, as text.
+                    let given: Vec<(String, String)> = d["data"]["options"]
+                        .as_array()
+                        .map(|opts| {
+                            opts.iter()
+                                .filter_map(|o| {
+                                    let name = o["name"].as_str()?.to_string();
+                                    let value = match &o["value"] {
+                                        Value::String(s) => s.clone(),
+                                        Value::Number(n) => match n.as_f64() {
+                                            Some(f) if f.fract() == 0.0 && f.abs() < 1e15 => format!("{}", f as i64),
+                                            _ => n.to_string(),
+                                        },
+                                        Value::Bool(b) => b.to_string(),
+                                        _ => return None,
+                                    };
+                                    Some((name, value))
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    Action::Cmd(RemoteCmd::Run(Some(trigger.to_string()), given))
+                }
                 _ => return,
             }
         }
         3 => {
             let custom = d["data"]["custom_id"].as_str().unwrap_or("");
             match custom {
-                "mf:start" => Action::Cmd(RemoteCmd::Run(None)),
+                "mf:start" => Action::Cmd(RemoteCmd::Run(None, Vec::new())),
                 "mf:stop" => Action::Cmd(RemoteCmd::Stop),
                 "mf:pause" => Action::Cmd(RemoteCmd::Pause),
                 "mf:status" => Action::Cmd(RemoteCmd::Status),
                 "mf:shot" => Action::Screenshot,
                 c => match c.strip_prefix("mf:run:") {
-                    Some(name) => Action::Cmd(RemoteCmd::Run(Some(name.to_string()))),
+                    Some(name) => Action::Cmd(RemoteCmd::Run(Some(name.to_string()), Vec::new())),
                     None => return,
                 },
             }
@@ -883,8 +988,26 @@ mod tests {
     }
 
     #[test]
+    fn trigger_inputs_become_command_options() {
+        let inputs = crate::model::parse_inputs("times:number=1, message").unwrap();
+        let cmds = commands_json(vec![("farm".into(), inputs)]);
+        let farm = cmds.as_array().unwrap().iter().find(|c| c["name"] == "farm").unwrap();
+        let opts = farm["options"].as_array().unwrap();
+        // Required first, as Discord insists.
+        assert_eq!(opts[0]["name"], "message");
+        assert_eq!(opts[0]["type"], 3);
+        assert_eq!(opts[0]["required"], true);
+        assert_eq!(opts[1]["name"], "times");
+        assert_eq!(opts[1]["type"], 10);
+        assert_eq!(opts[1]["required"], false);
+        // The bot's own commands are always there.
+        assert!(cmds.as_array().unwrap().iter().any(|c| c["name"] == "start"));
+    }
+
+    #[test]
     fn trigger_commands_are_cleaned_up() {
-        let names = command_names(&["Farm".into(), "farm".into(), "stop".into(), "!!".into(), "Collect gold".into()]);
+        let t = |n: &str| (n.to_string(), Vec::new());
+        let names: Vec<String> = command_names(&[t("Farm"), t("farm"), t("stop"), t("!!"), t("Collect gold")]).into_iter().map(|(n, _)| n).collect();
         assert_eq!(names, vec!["farm".to_string(), "collect-gold".to_string()]);
     }
 

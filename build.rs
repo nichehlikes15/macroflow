@@ -40,6 +40,22 @@ fn main() {
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR not set"));
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
 
+    // The commit this is built from, so the update check can compare it with GitHub.
+    // (Rebuilt when HEAD moves; empty when not building from a git checkout.)
+    println!("cargo:rerun-if-changed=.git/HEAD");
+    if Path::new(".git/logs/HEAD").exists() {
+        println!("cargo:rerun-if-changed=.git/logs/HEAD");
+    }
+    let sha = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|s| s.len() == 40 && s.chars().all(|c| c.is_ascii_hexdigit()))
+        .unwrap_or_default();
+    println!("cargo:rustc-env=MACROFLOW_GIT_SHA={sha}");
+
     if target_os == "windows" {
         // The app icon, for the .exe, the taskbar and the window.
         println!("cargo:rerun-if-changed=assets/macroflow.rc");

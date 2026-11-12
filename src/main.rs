@@ -5,6 +5,7 @@ mod marker;
 mod model;
 mod remote;
 mod ui;
+mod update;
 mod vision;
 
 use gpui::{
@@ -12,7 +13,7 @@ use gpui::{
     TitlebarOptions, WindowBounds, WindowOptions,
 };
 
-actions!(macroflow, [Quit]);
+actions!(macroflow, [Quit, CheckForUpdates]);
 
 /// If MacroFlow itself crashes, say so with a red pop-up. The pop-up is a separate
 /// little program, so it still appears even though MacroFlow is closing.
@@ -58,7 +59,11 @@ fn main() {
         cx.bind_keys([KeyBinding::new("secondary-q", Quit, None)]);
         cx.set_menus(vec![Menu {
             name: "MacroFlow".into(),
-            items: vec![MenuItem::action("Quit MacroFlow", Quit)],
+            items: vec![
+                MenuItem::action("Check for Updates…", CheckForUpdates),
+                MenuItem::separator(),
+                MenuItem::action("Quit MacroFlow", Quit),
+            ],
         }]);
         // Quit when the last window closes (the area-selection window closing doesn't count).
         cx.on_window_closed(|cx| {
