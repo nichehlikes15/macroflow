@@ -324,9 +324,32 @@ pub fn run_macro(
         let last_step = Arc::new(AtomicU64::new(0));
         let tracked = last_step.clone();
         // Catch crashes inside playback, so they're reported instead of killing MacroFlow.
+        // The default Discord webhook hears about this run (start, pop-ups, end).
+        let settings = remote::RemoteSettings::load();
+        let hook = settings.webhook_url.trim().to_string();
+        let started_from = match from.and_then(|f| doc.node(f)) {
+            Some(n) => match &n.kind {
+                NodeKind::Trigger { name, .. } => format!("⚡ /{}", command_name(name)),
+                _ => format!("“{}”", n.label()),
+            },
+            None => "Start".to_string(),
+        };
+        let live = (!hook.is_empty())
+            .then(|| remote::LiveRun::start(hook.clone(), settings.one_message, doc.name.clone(), started_from.clone(), tx.clone()));
+        if let (Some(l), true) = (&live, settings.notify_start) {
+            l.send(remote::LiveEvent::Line {
+                icon: "▶",
+                title: "Run started".into(),
+                text: format!("from {started_from}"),
+                color: remote::BLURPLE,
+                png: None,
+            });
+        }
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             match Runner::new(&doc, &tx, stop.clone(), paused.clone(), step_mode.clone(), tracked) {
                 Ok(mut r) => {
+                    r.live = live.as_ref();
+                    r.settings = settings.clone();
                     for (k, v) in inputs {
                         r.log(LogLevel::Info, format!("{k} = {v} (from the trigger)"));
                         r.vars.insert(k, v);
@@ -381,6 +404,15 @@ pub fn run_macro(
                 },
             }),
         );
+        if let Some(l) = &live {
+            let bad = end.unexpected();
+            let (title, color, post) = match end.kind {
+                _ if bad => (format!("⚠️ {} went wrong", doc.name), remote::BAD, settings.notify_stop),
+                EndKind::Stopped => (format!("■ {} stopped", doc.name), remote::QUIET, false),
+                _ => (format!("✅ {} finished", doc.name), remote::GOOD, settings.notify_finish),
+            };
+            l.send(remote::LiveEvent::End { title, text: end.message.clone(), color, post });
+        }
         if doc.alert_on_stop && end.unexpected() {
             alert(&end);
         } else if doc.alert_on_finish && end.kind == EndKind::Finished && !end.unexpected() {
@@ -574,6 +606,10 @@ struct Runner<'a> {
     note: Option<String>,
     /// The variables as last sent to the editor.
     sent_vars: Vec<(String, String)>,
+    /// This run's Discord message (when a default webhook is set).
+    live: Option<&'a remote::LiveRun>,
+    /// The Remote settings when the run started.
+    settings: remote::RemoteSettings,
 }
 
 impl<'a> Runner<'a> {
@@ -628,6 +664,8 @@ impl<'a> Runner<'a> {
             rng: now_ms() | 1,
             note: None,
             sent_vars: Vec::new(),
+            live: None,
+            settings: remote::RemoteSettings::default(),
         })
     }
 
@@ -1801,6 +1839,16 @@ impl<'a> Runner<'a> {
                     wait: *wait_for_click,
                     sound: *sound,
                 };
+                // The same pop-up in Discord, if the Remote tab asks for it.
+                if let (Some(live), true) = (self.live, self.settings.mirror_popups) {
+                    live.send(remote::LiveEvent::Line {
+                        icon: "✦",
+                        title: toast.title.clone(),
+                        text: toast.message.clone(),
+                        color: style.color(),
+                        png: None,
+                    });
+                }
                 // A new pop-up replaces the one already showing.
                 if let Some(mut old) = self.toast.take() {
                     let _ = old.kill();
@@ -1828,7 +1876,27 @@ impl<'a> Runner<'a> {
 
             NodeKind::Webhook { url, format, message, body, screenshot, save_to } => {
                 let own = self.fill_text(url).trim().to_string();
-                let url = if own.is_empty() { remote::RemoteSettings::load().webhook_url.trim().to_string() } else { own };
+                // To the default webhook while it keeps one message per run: add a
+                // line to that message instead of posting a new one.
+                if own.is_empty() && *format == HookFormat::Discord && self.settings.one_message {
+                    if let Some(live) = self.live {
+                        let text = self.fill_text(message);
+                        let png = if *screenshot {
+                            self.status("↗ Taking a screenshot for Discord…".into());
+                            remote::screenshot_png().map_err(|e| self.log(LogLevel::Warn, format!("No screenshot: {e}"))).ok()
+                        } else {
+                            None
+                        };
+                        live.send(remote::LiveEvent::Line { icon: "↗", title: String::new(), text, color: remote::BLURPLE, png });
+                        self.log(LogLevel::Good, "↗ Added to this run's Discord message".into());
+                        self.note = Some("↗ sent".into());
+                        if is_ident(save_to.trim()) {
+                            self.vars.insert(save_to.trim().to_string(), String::new());
+                        }
+                        return Ok(Some(0));
+                    }
+                }
+                let url = if own.is_empty() { self.settings.webhook_url.trim().to_string() } else { own };
                 if url.is_empty() {
                     return Err("This Webhook step has no URL. Paste one into the step, or set a default webhook in the Remote tab.".into());
                 }

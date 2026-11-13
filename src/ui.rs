@@ -1647,8 +1647,7 @@ impl MacroApp {
         )
     }
 
-    /// Tell Discord how a run ended: the person who started it from Discord, and
-    /// the default webhook if the Remote tab asks for that.
+    /// Tell the person who started this run from Discord how it ended.
     fn report_run_end(&mut self, end: &RunEnd) {
         let bad = end.unexpected();
         let icon = match end.kind {
@@ -1664,18 +1663,7 @@ impl MacroApp {
                 bot.post_channel(&reply.channel_id, &reply.user_id, &text);
             }
         }
-        let url = self.remote.webhook_url.trim().to_string();
-        // You pressing Stop isn't news; finishing or going wrong is.
-        let wanted = if bad {
-            self.remote.notify_stop
-        } else {
-            self.remote.notify_finish && end.kind == EndKind::Finished
-        };
-        if wanted && !url.is_empty() {
-            std::thread::spawn(move || {
-                let _ = remote::send_discord(&url, &text, None);
-            });
-        }
+        // The default webhook hears about it from the run itself (its live message).
     }
 
     /// Post a test message to the default webhook.
@@ -6851,6 +6839,8 @@ impl MacroApp {
                     ]),
                     s("Good to know", false, &[
                         "A webhook URL is a password for that channel. The Remote tab's default keeps it out of macro files you share.",
+                        "With an empty URL and “One message per run” on (Remote tab), the step adds a line to the run's Discord message instead of posting a new one.",
+                        "The Remote tab can also post automatically when a run starts, finishes or goes wrong, and copy every Pop-up step to Discord.",
                         "If sending fails (no internet, wrong URL), the run log gets a warning and the macro carries on.",
                         "“Send a test” sends it once now, without variables filled in.",
                     ]),
@@ -7696,27 +7686,37 @@ impl MacroApp {
             self.info_link("rm-info", "How Discord control works", InfoTopic::Remote, cx).into_any_element(),
             self.text_field("Default webhook URL", Field::RemoteWebhook, cx).into_any_element(),
             help("For Webhook steps with no URL of their own.").into_any_element(),
-            div()
-                .flex()
-                .flex_col()
-                .gap_1()
-                .child(toggle("rm-finish", "Post when a run finishes", r.notify_finish).on_click(cx.listener(
-                    |this, _: &ClickEvent, _, cx| {
+            field_label("Post automatically when…").into_any_element(),
+            {
+                // One switch per setting; `flip` changes it.
+                let row = |id: &'static str, label: &'static str, on: bool, flip: fn(&mut RemoteSettings)| {
+                    toggle(id, label, on).on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                         let mut n = this.remote.clone();
-                        n.notify_finish = !n.notify_finish;
+                        flip(&mut n);
                         this.set_remote(n);
                         cx.notify();
-                    },
-                )))
-                .child(toggle("rm-stop", "Post when a run goes wrong", r.notify_stop).on_click(cx.listener(
-                    |this, _: &ClickEvent, _, cx| {
-                        let mut n = this.remote.clone();
-                        n.notify_stop = !n.notify_stop;
-                        this.set_remote(n);
-                        cx.notify();
-                    },
-                )))
-                .into_any_element(),
+                    }))
+                };
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_0p5()
+                    .child(row("rm-start", "A run starts", r.notify_start, |n| n.notify_start = !n.notify_start))
+                    .child(row("rm-popup", "A Pop-up step shows", r.mirror_popups, |n| n.mirror_popups = !n.mirror_popups))
+                    .child(row("rm-finish", "A run finishes", r.notify_finish, |n| n.notify_finish = !n.notify_finish))
+                    .child(row("rm-stop", "A run goes wrong", r.notify_stop, |n| n.notify_stop = !n.notify_stop))
+                    .child(div().h(px(4.)))
+                    .child(row("rm-one", "One message per run, kept up to date", r.one_message, |n| {
+                        n.one_message = !n.one_message
+                    }))
+                    .into_any_element()
+            },
+            help(if r.one_message {
+                "Each run gets one message that's edited as it goes, so the channel doesn't fill up."
+            } else {
+                "Everything is posted as a message of its own."
+            })
+            .into_any_element(),
             small_btn("rm-test", "Send a test message")
                 .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                     this.test_webhook();

@@ -45,6 +45,13 @@ pub struct RemoteSettings {
     pub notify_finish: bool,
     /// Post to the default webhook when a run stops unexpectedly or fails.
     pub notify_stop: bool,
+    /// Post to the default webhook when a run starts.
+    pub notify_start: bool,
+    /// Also send every Pop-up step to the default webhook.
+    pub mirror_popups: bool,
+    /// Keep one message per run up to date instead of posting a new one each time.
+    #[serde(default = "yes")]
+    pub one_message: bool,
     /// Keep the Discord bot connected while MacroFlow is open.
     pub bot_enabled: bool,
     pub bot_token: String,
@@ -69,6 +76,9 @@ impl Default for RemoteSettings {
             webhook_url: String::new(),
             notify_finish: false,
             notify_stop: false,
+            notify_start: false,
+            mirror_popups: false,
+            one_message: true,
             bot_enabled: false,
             bot_token: String::new(),
             allowed_users: String::new(),
@@ -284,25 +294,366 @@ fn discord_text(text: &str) -> String {
 
 /// Post a message (and maybe a screenshot) to a Discord webhook.
 pub fn send_discord(url: &str, text: &str, png: Option<Vec<u8>>) -> Result<(), String> {
-    let text = if text.trim().is_empty() && png.is_none() { "(empty message)" } else { text };
+    let card = Card {
+        title: String::new(),
+        text: if text.trim().is_empty() && png.is_none() { "(empty message)".into() } else { text.to_string() },
+        color: BLURPLE,
+        fields: Vec::new(),
+        footer: "MacroFlow".into(),
+    };
+    post_card(url, &card, png).map(|_| ())
+}
+
+// ---------------------------------------------------------------------------
+// Discord embeds ("cards") and the live message for a run
+// ---------------------------------------------------------------------------
+
+pub const BLURPLE: u32 = 0x5865f2;
+pub const GOOD: u32 = 0x34c77b;
+pub const WARN: u32 = 0xf5b84a;
+pub const BAD: u32 = 0xef5b5b;
+pub const QUIET: u32 = 0x7f8796;
+
+/// One Discord embed.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Card {
+    pub title: String,
+    pub text: String,
+    pub color: u32,
+    /// Short name / value pairs shown side by side.
+    pub fields: Vec<(String, String)>,
+    pub footer: String,
+}
+
+/// The picture on a card.
+#[derive(Clone, Copy)]
+enum Picture<'a> {
+    None,
+    /// A new screenshot uploaded with this message.
+    New,
+    /// The one the message already has (its address, as Discord gave it back).
+    Kept(&'a str),
+}
+
+/// The JSON for a webhook message made of one card.
+fn card_payload(card: &Card, pic: Picture) -> Value {
+    let mut embed = json!({
+        "color": card.color,
+        "timestamp": iso_now(),
+        "footer": { "text": short(&card.footer, 2000) },
+    });
+    if !card.title.trim().is_empty() {
+        embed["title"] = json!(short(card.title.trim(), 256));
+    }
+    if !card.text.trim().is_empty() {
+        embed["description"] = json!(short(card.text.trim(), 4000));
+    }
+    if !card.fields.is_empty() {
+        embed["fields"] = Value::Array(
+            card.fields
+                .iter()
+                .take(25)
+                .map(|(n, v)| json!({ "name": short(n, 256), "value": short(if v.is_empty() { "–" } else { v }, 1024), "inline": true }))
+                .collect(),
+        );
+    }
     let mut payload = json!({
-        "content": discord_text(text),
         "username": "MacroFlow",
         // Never ping @everyone / roles from a macro by accident.
         "allowed_mentions": { "parse": [] },
     });
-    let reply = match png {
-        Some(png) => {
+    match pic {
+        Picture::New => {
+            embed["image"] = json!({ "url": "attachment://screen.png" });
             payload["attachments"] = json!([{ "id": 0, "filename": "screen.png" }]);
-            let (ct, body) = multipart(&payload, Some(&png));
-            request(Method::Post, url, None, &ct, &body)?
         }
-        None => post_json(url, None, &payload)?,
-    };
-    if reply.ok() {
-        Ok(())
+        // No "attachments": an edit then keeps the file the message already has.
+        Picture::Kept(url) => embed["image"] = json!({ "url": url }),
+        Picture::None => payload["attachments"] = json!([]),
+    }
+    payload["embeds"] = json!([embed]);
+    payload
+}
+
+/// `url` with `?wait=true` (or `&wait=true`) added, keeping any query it had.
+fn with_wait(url: &str) -> String {
+    if url.contains('?') {
+        format!("{url}&wait=true")
     } else {
-        Err(explain(&reply))
+        format!("{url}?wait=true")
+    }
+}
+
+/// The address of one message sent through a webhook (for editing it).
+fn message_url(url: &str, id: &str) -> String {
+    let (base, query) = match url.split_once('?') {
+        Some((b, q)) => (b.trim_end_matches('/'), format!("?{q}")),
+        None => (url.trim_end_matches('/'), String::new()),
+    };
+    format!("{base}/messages/{id}{query}")
+}
+
+/// A message Discord accepted.
+#[derive(Clone, Debug, Default)]
+pub struct Sent {
+    pub id: String,
+    /// Where its picture is, to keep it on later edits.
+    pub image: Option<String>,
+}
+
+fn send_card(method: Method, target: &str, card: &Card, png: Option<Vec<u8>>, kept: Option<&str>) -> Result<Sent, String> {
+    let pic = match (&png, kept) {
+        (Some(_), _) => Picture::New,
+        (None, Some(u)) => Picture::Kept(u),
+        (None, None) => Picture::None,
+    };
+    let payload = card_payload(card, pic);
+    let reply = match &png {
+        Some(png) => {
+            let (ct, body) = multipart(&payload, Some(png));
+            request(method, target, None, &ct, &body)?
+        }
+        None => request(method, target, None, "application/json", payload.to_string().as_bytes())?,
+    };
+    if !reply.ok() {
+        return Err(explain(&reply));
+    }
+    let v: Value = serde_json::from_str(&reply.body).unwrap_or(Value::Null);
+    Ok(Sent {
+        id: v["id"].as_str().unwrap_or_default().to_string(),
+        image: v["embeds"][0]["image"]["url"].as_str().map(String::from),
+    })
+}
+
+/// Post a card as a new message.
+pub fn post_card(url: &str, card: &Card, png: Option<Vec<u8>>) -> Result<Sent, String> {
+    send_card(Method::Post, &with_wait(url), card, png, None)
+}
+
+/// Replace a message posted earlier with this card. Without a new screenshot,
+/// `kept` (the picture it already has) stays on it.
+fn edit_card(url: &str, id: &str, card: &Card, png: Option<Vec<u8>>, kept: Option<&str>) -> Result<Sent, String> {
+    send_card(Method::Patch, &message_url(url, id), card, png, kept)
+}
+
+/// Now as Discord wants it: "2026-11-12T16:51:00Z".
+fn iso_now() -> String {
+    let secs = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    iso_utc(secs)
+}
+
+fn iso_utc(secs: u64) -> String {
+    let days = (secs / 86_400) as i64;
+    let rem = secs % 86_400;
+    // Days since 1970 to a calendar date (Howard Hinnant's civil_from_days).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + if m <= 2 { 1 } else { 0 };
+    format!("{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z", rem / 3600, rem % 3600 / 60, rem % 60)
+}
+
+/// "<t:1794253517:T>": Discord shows it as a time in each reader's own time zone.
+fn discord_time() -> String {
+    let secs = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    format!("<t:{secs}:T>")
+}
+
+/// Something that happened during a run, for its Discord message.
+#[derive(Clone, Debug)]
+pub enum LiveEvent {
+    /// A line for the message (and, posting separately, a card of its own).
+    Line { icon: &'static str, title: String, text: String, color: u32, png: Option<Vec<u8>> },
+    /// The run ended. `post` = the settings ask for the end to be posted; a live
+    /// message that already exists is always brought up to date.
+    End { title: String, text: String, color: u32, post: bool },
+}
+
+/// The Discord side of one run: a background thread that posts what happens to
+/// the default webhook, either as one message it keeps editing, or one message per
+/// event. The macro never waits for Discord.
+pub struct LiveRun {
+    tx: std::sync::mpsc::Sender<LiveEvent>,
+}
+
+impl LiveRun {
+    /// `edit` = keep one message per run up to date instead of posting new ones.
+    pub fn start(url: String, edit: bool, macro_name: String, from: String, log: Tx) -> LiveRun {
+        let (tx, rx) = std::sync::mpsc::channel::<LiveEvent>();
+        let _ = thread::Builder::new().name("macroflow-webhook".into()).spawn(move || {
+            live_main(url, edit, macro_name, from, rx, log);
+        });
+        LiveRun { tx }
+    }
+
+    pub fn send(&self, ev: LiveEvent) {
+        let _ = self.tx.send(ev);
+    }
+}
+
+/// What the live message shows.
+struct LiveState {
+    macro_name: String,
+    from: String,
+    started: Instant,
+    lines: Vec<String>,
+    title: String,
+    color: u32,
+    end_text: Option<String>,
+    /// The screenshot already on the message (kept on later edits).
+    image: Option<String>,
+}
+
+impl LiveState {
+    fn card(&self) -> Card {
+        // Newest last; Discord's limit is 4096 characters, so the oldest lines go first.
+        let mut lines: Vec<&String> = self.lines.iter().collect();
+        let mut text = loop {
+            let text = lines.iter().map(|l| l.as_str()).collect::<Vec<_>>().join("\n");
+            if text.chars().count() <= 3500 || lines.len() <= 1 {
+                break text;
+            }
+            lines.remove(0);
+        };
+        if lines.len() < self.lines.len() {
+            text = format!("…\n{text}");
+        }
+        if let Some(end) = &self.end_text {
+            text = format!("{text}\n\n**{}**", short(end, 400));
+        }
+        let secs = self.started.elapsed().as_secs();
+        let took = if secs >= 3600 {
+            format!("{}h {:02}m", secs / 3600, secs % 3600 / 60)
+        } else {
+            format!("{}m {:02}s", secs / 60, secs % 60)
+        };
+        Card {
+            title: self.title.clone(),
+            text,
+            color: self.color,
+            fields: vec![("Started from".into(), self.from.clone()), ("Time".into(), took)],
+            footer: format!("MacroFlow · {}", self.macro_name),
+        }
+    }
+}
+
+fn live_main(url: String, edit: bool, macro_name: String, from: String, rx: std::sync::mpsc::Receiver<LiveEvent>, log: Tx) {
+    let warn = |e: String| {
+        let _ = log.send(WorkerMsg::Status(format!("Discord webhook: {e}")));
+    };
+    let mut state = LiveState {
+        title: format!("▶ {macro_name}"),
+        macro_name,
+        from,
+        started: Instant::now(),
+        lines: Vec::new(),
+        color: BLURPLE,
+        end_text: None,
+        image: None,
+    };
+    let mut message: Option<String> = None;
+    let mut last_send: Option<Instant> = None;
+    // Discord lets a webhook send about 5 messages every 2 seconds.
+    let gap = Duration::from_millis(800);
+    let pace = |last: &mut Option<Instant>| {
+        if let Some(t) = *last {
+            let since = t.elapsed();
+            if since < gap {
+                thread::sleep(gap - since);
+            }
+        }
+        *last = Some(Instant::now());
+    };
+
+    while let Ok(first) = rx.recv() {
+        let mut batch = vec![first];
+        if edit {
+            // Changes that arrive together become one edit.
+            thread::sleep(Duration::from_millis(250));
+            batch.extend(rx.try_iter());
+        }
+        let mut png: Option<Vec<u8>> = None;
+        let mut ended = false;
+        let mut post_end = false;
+        for ev in batch {
+            match ev {
+                LiveEvent::Line { icon, title, text, color, png: pic } => {
+                    let line = match (title.trim().is_empty(), text.trim().is_empty()) {
+                        (false, false) => format!("{} {icon} **{}** {}", discord_time(), title.trim(), text.trim()),
+                        (false, true) => format!("{} {icon} **{}**", discord_time(), title.trim()),
+                        _ => format!("{} {icon} {}", discord_time(), text.trim()),
+                    };
+                    state.lines.push(line);
+                    if !edit {
+                        // One message per event.
+                        let card = Card {
+                            title: format!("{icon} {}", if title.trim().is_empty() { "MacroFlow" } else { title.trim() }),
+                            text,
+                            color,
+                            fields: Vec::new(),
+                            footer: format!("MacroFlow · {}", state.macro_name),
+                        };
+                        pace(&mut last_send);
+                        if let Err(e) = post_card(&url, &card, pic) {
+                            warn(e);
+                        }
+                    } else if pic.is_some() {
+                        png = pic;
+                    }
+                }
+                LiveEvent::End { title, text, color, post } => {
+                    state.title = title.clone();
+                    state.color = color;
+                    state.end_text = Some(text.clone());
+                    ended = true;
+                    post_end = post;
+                    if !edit && post {
+                        let card = Card {
+                            title,
+                            text,
+                            color,
+                            fields: state.card().fields,
+                            footer: format!("MacroFlow · {}", state.macro_name),
+                        };
+                        pace(&mut last_send);
+                        if let Err(e) = post_card(&url, &card, None) {
+                            warn(e);
+                        }
+                    }
+                }
+            }
+        }
+        if edit && (!ended || post_end || message.is_some()) {
+            pace(&mut last_send);
+            let result = match &message {
+                Some(id) => edit_card(&url, id, &state.card(), png, state.image.as_deref()),
+                None => post_card(&url, &state.card(), png),
+            };
+            match result {
+                Ok(sent) => {
+                    if !sent.id.is_empty() {
+                        message = Some(sent.id);
+                    }
+                    if sent.image.is_some() {
+                        state.image = sent.image;
+                    }
+                }
+                Err(e) => {
+                    // The message may have been deleted: post a fresh one next time.
+                    message = None;
+                    state.image = None;
+                    warn(e);
+                }
+            }
+        }
+        if ended {
+            break;
+        }
     }
 }
 
@@ -985,6 +1336,69 @@ mod tests {
         assert!(text.contains("name=\"files[0]\"; filename=\"screen.png\""));
         assert!(text.contains("PNGDATA"));
         assert!(text.ends_with(&format!("--{boundary}--\r\n")));
+    }
+
+    #[test]
+    fn times_are_utc_iso() {
+        assert_eq!(iso_utc(0), "1970-01-01T00:00:00Z");
+        assert_eq!(iso_utc(951_782_400), "2000-02-29T00:00:00Z");
+        assert_eq!(iso_utc(1_794_253_517), "2026-11-09T19:45:17Z");
+    }
+
+    #[test]
+    fn webhook_urls_for_wait_and_edit() {
+        let u = "https://discord.com/api/webhooks/1/abc";
+        assert_eq!(with_wait(u), "https://discord.com/api/webhooks/1/abc?wait=true");
+        assert_eq!(message_url(u, "99"), "https://discord.com/api/webhooks/1/abc/messages/99");
+        // A webhook into a thread keeps its thread.
+        let t = "https://discord.com/api/webhooks/1/abc?thread_id=5";
+        assert_eq!(with_wait(t), "https://discord.com/api/webhooks/1/abc?thread_id=5&wait=true");
+        assert_eq!(message_url(t, "99"), "https://discord.com/api/webhooks/1/abc/messages/99?thread_id=5");
+    }
+
+    #[test]
+    fn cards_become_embeds() {
+        let card = Card {
+            title: "✅ Farm finished".into(),
+            text: "All done".into(),
+            color: GOOD,
+            fields: vec![("Time".into(), "2m 03s".into())],
+            footer: "MacroFlow · Farm".into(),
+        };
+        let p = card_payload(&card, Picture::None);
+        let e = &p["embeds"][0];
+        assert_eq!(e["title"], "✅ Farm finished");
+        assert_eq!(e["color"], GOOD);
+        assert_eq!(e["fields"][0]["name"], "Time");
+        assert!(e["timestamp"].as_str().unwrap().ends_with('Z'));
+        assert!(p.get("content").is_none());
+        // A new screenshot is attached; a kept one is linked and its file left alone.
+        let new = card_payload(&card, Picture::New);
+        assert_eq!(new["embeds"][0]["image"]["url"], "attachment://screen.png");
+        assert_eq!(new["attachments"][0]["filename"], "screen.png");
+        let kept = card_payload(&card, Picture::Kept("https://cdn/x.png"));
+        assert_eq!(kept["embeds"][0]["image"]["url"], "https://cdn/x.png");
+        assert!(kept.get("attachments").is_none());
+    }
+
+    #[test]
+    fn a_long_live_message_drops_its_oldest_lines() {
+        let mut s = LiveState {
+            macro_name: "Farm".into(),
+            from: "Start".into(),
+            started: Instant::now(),
+            lines: (0..400).map(|i| format!("line {i} {}", "x".repeat(20))).collect(),
+            title: "▶ Farm".into(),
+            color: BLURPLE,
+            end_text: None,
+            image: None,
+        };
+        let card = s.card();
+        assert!(card.text.chars().count() <= 4000);
+        assert!(card.text.starts_with('…'));
+        assert!(card.text.contains("line 399"));
+        s.end_text = Some("Finished.".into());
+        assert!(s.card().text.ends_with("**Finished.**"));
     }
 
     #[test]
