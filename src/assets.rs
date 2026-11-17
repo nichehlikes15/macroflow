@@ -12,7 +12,7 @@ macro_rules! icons {
 
 const ICONS: &[(&str, &[u8])] = icons![
     "bell", "click", "disabled", "drag", "end", "find", "gone", "group", "group_in", "group_out", "if",
-    "info", "key", "loop", "move", "pixel", "read", "record", "scroll", "start", "trigger", "type",
+    "info", "key", "keycheck", "loop", "move", "pixel", "read", "record", "runmacro", "scroll", "start", "trigger", "type",
     "variable", "wait", "webhook", "window",
 ];
 

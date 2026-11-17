@@ -1,8 +1,10 @@
 mod assets;
+mod cli;
 mod engine;
 mod keys;
 mod marker;
 mod model;
+mod platform;
 mod remote;
 mod ui;
 mod update;
@@ -50,7 +52,14 @@ fn install_crash_alert() {
 }
 
 fn main() {
+    // `macroflow run my-macro.json` plays a macro without the editor.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if let Some(code) = cli::main(&args) {
+        std::process::exit(code);
+    }
     install_crash_alert();
+    // The old version an in-app update moved aside isn't needed any more.
+    update::clean_up_after_update();
     Application::new().with_assets(assets::Assets).run(|cx: &mut App| {
         #[cfg(target_os = "macos")]
         assets::set_dock_icon();

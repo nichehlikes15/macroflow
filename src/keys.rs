@@ -355,3 +355,13 @@ pub fn modifier_keys(mods: &Mods) -> Vec<Key> {
     }
     v
 }
+
+/// Does the key the recorder calls `pressed` count as `wanted`? The same key, or the
+/// right-hand one of a modifier ("shift" also matches the right Shift key).
+pub fn same_key(pressed: &str, wanted: &str) -> bool {
+    let wanted = wanted.trim();
+    if pressed.eq_ignore_ascii_case(wanted) {
+        return true;
+    }
+    is_modifier(wanted) && pressed.strip_prefix('r').is_some_and(|p| p.eq_ignore_ascii_case(wanted))
+}

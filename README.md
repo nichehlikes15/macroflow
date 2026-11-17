@@ -18,7 +18,22 @@ single action, or build one step by step, and you can edit every delay afterward
 Every push is built on macOS and Windows by GitHub Actions (`.github/workflows/build.yml`).
 Built apps can be downloaded from each run's **Artifacts**.
 
-## Setup
+## Download
+
+Get the newest version from the [Releases page](https://github.com/nichehlikes15/macroflow/releases/latest):
+
+- **macOS (Apple Silicon):** `MacroFlow-macos-arm64.dmg`. Open it and drag MacroFlow into Applications. The app isn't notarised by Apple, so the first time, right-click it and choose **Open**.
+- **Windows (x64):** `MacroFlow-windows-x64.exe`. Put it in a folder of its own (e.g. `Documents\MacroFlow`) and run it. If SmartScreen warns you, choose **More info → Run anyway**.
+
+### Updating
+
+MacroFlow checks for a new version when it opens (you can turn that off in the Macro tab). When there is one, an **↑ Update** button appears in the title bar. Click it, then **Update now**: MacroFlow downloads the new version, checks it against the release's checksum, puts it in place of the old one and restarts. It asks to save first if you have unsaved changes. Your macros, images and settings are kept.
+
+- On a Mac, macOS may ask you to allow Accessibility and Screen Recording again for the new version.
+- On Windows, the folder the .exe is in has to be one you can write to (not `Program Files`).
+- A copy you built yourself with `cargo run` can't replace itself. Use `git pull` instead.
+
+## Building from source
 
 You need **Rust 1.85 or newer** (`rustup update stable`) on both platforms.
 
@@ -97,19 +112,23 @@ If you close the window or quit with unsaved changes, MacroFlow asks whether to 
 | **Type text** | next | Types a string, optionally followed by Return. |
 | **Wait** | next | Fixed wait plus optional random extra time. |
 | **Scroll** | next | Scrolls up/down or left/right by a number of **wheel clicks**, sent one at a time like turning the wheel by hand (many apps and games count one big scroll as a single click). **Strength** makes each click go further if it still scrolls less than your mouse. **Test (scrolls in 3 s)** scrolls wherever you point the mouse, so you can tune it. |
-| **Recording** | next | A recorded sequence of raw events. Each event has its own delay, which you can edit, nudge with −/+ (Shift-click for ×10), or delete. You can also halve or double all delays, set them all to one value, remove mouse moves, or change the playback speed. |
-| **Find image** | **found** / **not found** | Looks for an image on every display until it appears or the timeout runs out. After it runs (or after **Test now**), the picture at the top shows **what it saw**: the search area (or the screen around the best match) with a green box round the match, or an amber box round the closest thing if it wasn't found. **Image to find** switches back to the picture it looks for. **Drag a box on screen** around what to find, snip the area around the pointer, or choose a PNG. **Look in → One area** limits the search to part of the screen you drag a box around: much faster, and it can't match the same picture somewhere else. "Test now" checks it straight away. You can make it click the image when found. Later Click / Move steps can target the found image. |
+| **Recording** | next | A recorded sequence of raw events. Each event has its own delay, which you can edit, nudge with −/+ (Shift-click for ×10), or delete. You can also halve or double all delays, set them all to one value, remove mouse moves, or change the playback speed. Scroll-wheel turns are recorded too. **Turn into separate steps** replaces the recording with a group of Click, Drag, Key press, Type text, Scroll and Wait steps in the same place, so you can edit each one or add checks between them. |
+| **Find image** | **found** / **not found** | Looks for an image on every display until it appears or the timeout runs out. After it runs (or after **Test now**), the picture at the top shows **what it saw**: the search area (or the screen around the best match) with a green box round the match, or an amber box round the closest thing if it wasn't found. **Image to find** switches back to the picture it looks for. **Drag a box on screen** around what to find, snip the area around the pointer, or choose a PNG. **Look in → One area** limits the search to part of the screen you drag a box around: much faster, and it can't match the same picture somewhere else. "Test now" checks it straight away. You can make it click the image when found. Later Click / Move steps can target the found image. **Or any of these** adds more pictures to look for at the same time (drag a box or choose PNGs): the first one found counts, and the `found_image` variable says which (1 = the main picture, 2 = the next…, 0 = none). |
 | **Window check** | **yes** / **no** | Checks whether the **current window** (the front window of the app you're using) or **any open window** has a title / app name that contains, equals or starts with some text. Optional match case, "keep checking for N ms" (to wait for a window to open or come to the front) and "bring it to the front if found". **Show open windows** lists what's open right now. Click one to fill in the text. |
 | **Read text** | **match** / **no match** | Reads the text in a screen area using the OCR built into the system (Apple Vision on macOS, Windows OCR on Windows). Numbers drawn the way games often do (a white or coloured fill with a thick dark outline, on a busy background) are handled by first keeping only the letters' fill colour and throwing away the outline and background, so they read as plain black digits. After it runs (or after **Read now**), the picture at the top shows **what it actually read at that moment**, with **what the reader was given** (the cleaned-up version) underneath, with what it read underneath (green border = match, amber = no match). Switch between **Last run** and **When selected** to compare it with the area as it looked when you selected it. Each read cleans the image up (enlarges it, boosts contrast, flips light-on-dark text, adds a margin), reads three versions at once and takes the answer they agree on, re-reading if they don't. Number comparisons (and **Only read a number**) fix common misreads (O→0, l→1, S→5), join split digits and handle thousands separators. Click **Select area (drag a box)**: MacroFlow minimises and you drag a box around the text or number anywhere on your screen. Compare as **text** (contains, is exactly, starts with, matches regex, has any text, has changed) or as a **number** (=, ≠, >, ≥, <, ≤, using the first number in the area). "Read now" shows what it reads. "Keep reading for N ms" waits for the condition. A Type text step can type what was read with `{text}`. |
-| **Set variable** | next | Stores a value in a named variable: a number (`0`), a sum (`gold + 1000`, `(a + b) / 2`, `count * 3`, `total % 10`), another variable, or text with `{name}` in it. Unset variables count as 0 in sums, so `count = count + 1` works straight away. Built-in variables: `text` (last Read text), `run` (which repeat this is), `found_x` / `found_y` (last found image). Use any variable as `{name}` in Type text and Pop-up steps. Read text can also **save what it reads into a variable**. Variables show up as purple **`# name` tags** wherever they're used: on the step cards and in text boxes. Typing the closing `}` of `{name}` turns it into a tag, which then moves and deletes as one piece. While you edit a box that takes variables, the variables you already have are listed under it, so a click puts one in. Read text's **Compare with** can use `{name}` too (e.g. `{gold_before}`). The **Macro** tab lists every variable. An **amber** tag is a variable that no step sets, which is usually a typo. |
+| **Set variable** | next | Stores a value in a named variable: a number (`0`), a sum (`gold + 1000`, `(a + b) / 2`, `count * 3`, `total % 10`), another variable, or text with `{name}` in it. Unset variables count as 0 in sums, so `count = count + 1` works straight away. Sums can use `random(1, 10)` (a whole number from 1 to 10), `min(a, b)`, `max(a, b)`, `abs(x)`, `round(x)`, `floor(x)` and `ceil(x)`. Built-in variables: `text` (last Read text), `run` (which repeat this is), `found_x` / `found_y` (last found image), `found_image` (which of a Find image step's pictures it found). Use any variable as `{name}` in Type text and Pop-up steps. Read text can also **save what it reads into a variable**. Variables show up as purple **`# name` tags** wherever they're used: on the step cards and in text boxes. Typing the closing `}` of `{name}` turns it into a tag, which then moves and deletes as one piece. While you edit a box that takes variables, the variables you already have are listed under it, so a click puts one in. Read text's **Compare with** can use `{name}` too (e.g. `{gold_before}`). The **Macro** tab lists every variable. An **amber** tag is a variable that no step sets, which is usually a typo. |
 | **If** | **yes** / **no** | Compares two values (numbers, variables, sums or text) with =, ≠, >, ≥, <, ≤, contains or doesn't contain, e.g. `gold ≥ gold_before + 1000`. Numbers compare as numbers; text ignores case. |
 | **Pixel colour** | **match** / **no match** | Checks the colour of one spot, e.g. a health bar or a button turning green. **Pick spot & colour** samples it after 3 s; tolerance allows small differences; "Keep checking for" waits for the colour. Much faster than Find image. |
 | **Pop-up** | next | Shows a small card at the top of the screen (top centre or top right) with a title, message and style (Info / Success / Warning / Error), optionally with a sound. It never takes focus, so it doesn't interrupt what the macro is typing or clicking. It fades out after a set time, or with **Pause until I click it** the macro waits for you to click it. `{text}` shows what the last Read text step read. **Preview pop-up** shows it without running the macro. |
 | **Group** | next | A collapsed run of steps that shows as one step (a little stack of cards). Double-click it to open it. See **Groups** below. |
 | **Loop** | **repeat** / **done** | Runs the "repeat" branch N times (0 = forever), then follows "done". Connect the last step of the loop back into the Loop step. |
+| **Key check** | **pressed** / **not pressed** | Checks whether a key is held down right now (e.g. hold Shift during a run to take a different path), or with **Keep checking for** waits up to that long for it to be pressed. Pick the key with **Capture key from keyboard**, or the Shift / Ctrl / Alt / Cmd / Space chips. |
+| **Run macro file** | next | Runs another saved macro from its Start (or a trigger you name) until it ends, then carries on here. It shares this run's variables. Use it for steps several macros need, so one fix covers them all. Files can run other files up to 8 deep. |
+| **Trigger** | next | Another way into the macro. It can run as a Discord `/command`, every N minutes, at **times of day** (`08:30, 17:00`), or from its own **hotkey** in any app. Timers and times of day only run while schedules are on (Remote tab). |
+| **Webhook** | next | Posts a message (optionally with a screenshot) to Discord, or POSTs to any URL. |
 | **End** | none | Stops the macro. A step with nothing connected also stops it. |
 
-Every step also has a **Note** and a **Delay before** field.
+Every step also has a **Note** and a **Delay before** field. Most steps also have **Retries if it fails** (a check also retries when it doesn't find what it's looking for) and **If it goes wrong, carry on**: when the step still goes wrong after its retries, the macro carries on with the next step instead of stopping (a check goes down its last path, such as "not found"). On a **Group**, retries run the whole group again from its start if a step inside it goes wrong, and "carry on" continues after the group.
 
 ### Start screen, templates and autosave
 
@@ -188,7 +207,7 @@ Turn it off with **Show a green dot where it clicks** in the **Macro** tab.
 
 ### Hotkeys, pausing and alerts
 
-- **F8** starts the macro from any app, and stops it while it runs. **F10** runs one step (see Debugging above). **F9** pauses and resumes (the ❚❚ Pause button in the title bar does the same). **Esc** still stops.
+- **F8** starts the macro from any app, and stops it while it runs. A Trigger step can have its own hotkey that starts the macro at that trigger. **F10** runs one step (see Debugging above). **F9** pauses and resumes (the ❚❚ Pause button in the title bar does the same). **Esc** still stops.
 - If a run ends **unexpectedly** (a step went wrong, or it reached a path with nothing connected), a **red pop-up** appears at the top of the screen saying why, even when MacroFlow is minimised. Reaching an End step or pressing Stop doesn't count. Turn it off in the **Macro** tab.
 - Turn on **Green pop-up when it finishes** (Macro tab → When it stops) to get a pop-up when it reaches an End step or has done every repeat. Pressing Stop / Esc never shows one.
 - When it pauses at a **breakpoint**, a pop-up says which step it stopped before and which keys to press, so you notice even if MacroFlow is hidden. Turn it off with **Pop-up when it pauses at a breakpoint**. Step-by-step mode doesn't show one for every step.
@@ -220,6 +239,8 @@ A group turns a long run of steps into one step, so a big macro stays readable.
 
 ### Saved file compatibility
 
+Macro files now carry a `format_version` number. Files without one (from older versions) open and run as before: every setting added since then has a default that behaves the way the old version did, and new settings that are switched off aren't written to the file. If a file contains a step this version doesn't know (made by a newer MacroFlow, or a damaged file), it still opens: that step shows as **Unknown step**, runs skip it and carry on with whatever it's connected to, and saving keeps it exactly as it was. Opening such a file says so in the status bar.
+
 Macros saved by older versions of MacroFlow still open: the file layout hasn't changed, only new step types were added. A macro that *uses* groups needs this version or newer to open.
 
 ### Selecting an area (drag a box)
@@ -234,6 +255,16 @@ Macros saved by older versions of MacroFlow still open: the file layout hasn't c
 **Cancelling:** Esc, the toolbar's **✕**, a right-click (when you're not drawing a box), MacroFlow's **■ Stop** button, or clicking back on MacroFlow (taskbar / Dock) all cancel. After 3 minutes it gives up on its own.
 
 It covers the display the mouse is on. **Shift-click** the button to get 3 seconds to switch windows (or move the mouse to another display) first. On macOS the selector is a small native helper (`helpers/select.swift`, built by `build.rs`). On Windows it's a WinForms window run through PowerShell (`helpers/select.ps1`, embedded in the app). The first time on Windows it takes a second or two to start; after that it's quicker.
+
+### Running a macro from the command line
+
+```sh
+macroflow run my-macro.json                    # play it, printing the log
+macroflow run my-macro.json --trigger farm     # start at the /farm trigger
+macroflow run my-macro.json --repeat 3 --var gold=100 --no-wait
+```
+
+It plays the macro without opening the editor and exits when the macro ends. **Esc** stops it as usual. `--quiet` prints only why it ended. The exit code is 0 when it finished, 1 when a step went wrong (or it reached a path with nothing connected), 2 for a bad argument or file, and 130 when you stopped it. Use it with Task Scheduler, cron or a script. While developing, use `cargo run --release -- run my-macro.json`.
 
 ### Example: wait for a game/app number, then act
 
@@ -280,12 +311,18 @@ In a text or number box: click to put the cursor there, drag (or Shift-click) to
 
 ```
 src/
-  main.rs    app start-up, menu, window
-  ui.rs      the editor: toolbar, palette, flowchart canvas, inspector
-  model.rs   macro document (steps, connections, delays), saved as JSON
-  engine.rs  background threads: playback, recording, position picking, snipping
-  vision.rs  screen capture, area selection, OCR, window list, template matching
-  marker.rs  the green dot showing where a running macro clicks
+  main.rs     app start-up, menu, window
+  cli.rs      `macroflow run …` (playing a macro without the editor)
+  ui.rs       the editor: toolbar, palette, flowchart canvas, inspector
+  model.rs    macro document (steps, connections, delays), saved as JSON
+  engine.rs   background threads: playback, recording, position picking, snipping
+  vision.rs   screen capture, area selection, OCR, window list, template matching
+  marker.rs   the green dot showing where a running macro clicks
+  keys.rs     key names ↔ macOS key codes ↔ recorder/GPUI key names
+  platform.rs scroll-wheel recording, Windows multi-monitor mouse moves, local time
+  remote.rs   webhooks and the Discord bot
+  update.rs   the update check and installing updates from inside the app
+  assets.rs   step icons and the app icon
 helpers/
   notify.swift macOS pop-up helper, compiled by build.rs
   notify.ps1   Windows pop-up helper (WinForms), embedded into the app
@@ -293,9 +330,10 @@ helpers/
   marker.ps1   Windows green click-marker dot (WinForms), embedded into the app
   ocr.swift  macOS OCR helper (Apple Vision), compiled by build.rs
   ocr.ps1    Windows OCR helper (Windows.Media.Ocr), embedded into the app
-build.rs     compiles the macOS OCR helper
+scripts/bundle-macos.sh  builds dist/MacroFlow.app
+scripts/dmg-macos.sh     packs it into dist/MacroFlow-macos-arm64.dmg
+build.rs     compiles the macOS Swift helpers (OCR, pop-ups, click marker, area selector) and the Windows icon
 .github/workflows/build.yml   builds + tests on macOS and Windows
-  keys.rs    key names ↔ macOS key codes ↔ recorder/GPUI key names
 ```
 
 Main libraries: `gpui` (UI), `enigo` (sending input), `device_query` (reading input while recording),
@@ -324,9 +362,8 @@ Main libraries: `gpui` (UI), `enigo` (sending input), `device_query` (reading in
 - **Window check never sees window titles** (only app names): turn on Screen Recording for your terminal and restart it.
 - **MacroFlow stayed minimised after Select area**: click its icon in the Dock / taskbar.
 
-## Limits / ideas for next steps
+## Limits
 
-- On Windows, mouse playback is mapped to the primary display, so positions on other monitors may be off.
-- Scroll-wheel events aren't captured by the recorder. Add a Scroll step instead.
-- Possible additions: "If pixel colour" and "If key held" branches, variables/counters,
-  a global start hotkey, zoom on the canvas, converting a recording into separate steps, and undo/redo.
+- Scroll-wheel turns are recorded as wheel clicks. Very smooth trackpad scrolling on macOS is recorded only as far as it adds up to whole clicks.
+- Positions are saved for one screen layout. Turn on **Scale positions to the screen size** or **Follow a window** to move a macro to another computer.
+- Times of day use the computer's local time, and only run while MacroFlow is open with schedules on. For runs while MacroFlow is closed, use `macroflow run` from Task Scheduler or cron.

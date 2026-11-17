@@ -931,6 +931,16 @@ pub enum RecAction {
     Up { button: MouseBtn, x: i32, y: i32 },
     KeyDown { key: String },
     KeyUp { key: String },
+    /// Wheel clicks (positive = down / right), with the mouse at (x, y).
+    Scroll {
+        amount: i32,
+        #[serde(default)]
+        horizontal: bool,
+        #[serde(default)]
+        x: i32,
+        #[serde(default)]
+        y: i32,
+    },
 }
 
 impl RecAction {
@@ -941,6 +951,15 @@ impl RecAction {
             RecAction::Up { button, x, y } => format!("{} release at ({x}, {y})", button.label()),
             RecAction::KeyDown { key } => format!("Key down {}", crate::keys::label(key)),
             RecAction::KeyUp { key } => format!("Key up {}", crate::keys::label(key)),
+            RecAction::Scroll { amount, horizontal, x, y } => {
+                let dir = match (*horizontal, *amount < 0) {
+                    (false, false) => "down",
+                    (false, true) => "up",
+                    (true, false) => "right",
+                    (true, true) => "left",
+                };
+                format!("Scroll {dir} {}× at ({x}, {y})", amount.unsigned_abs())
+            }
         }
     }
 
@@ -1038,6 +1057,11 @@ pub enum NodeKind {
         /// Optional, so older macros still open.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         until_gone: bool,
+        /// More pictures to look for as well: whichever is found first wins (its
+        /// number goes in the `found_image` variable: 1 = `template`, 2 = the first of
+        /// these…). Optional, so older macros still open (and save as before).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        more_templates: Vec<PathBuf>,
     },
     Loop {
         count: u32,
@@ -1190,6 +1214,12 @@ pub enum NodeKind {
         /// Also run every this many minutes while schedules are on (0 = never).
         #[serde(default, skip_serializing_if = "is_zero")]
         every_min: u32,
+        /// A key that starts the macro here from any app (e.g. "f6"; empty = none).
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        hotkey: String,
+        /// Times of day to run, while schedules are on: "08:30, 17:00" (empty = none).
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        at_times: String,
     },
     /// Send a message to a Discord webhook, or POST to any other URL.
     Webhook {
@@ -1212,6 +1242,45 @@ pub enum NodeKind {
         #[serde(default)]
         save_to: String,
     },
+    /// Branch on whether a key is held down (or wait for it to be pressed).
+    KeyCheck {
+        #[serde(default)]
+        key: String,
+        /// Keep checking for this long (0 = only check right now).
+        #[serde(default)]
+        timeout_ms: u64,
+    },
+    /// Run another macro file, then carry on here.
+    RunMacro {
+        #[serde(default)]
+        path: Option<PathBuf>,
+        /// Start at this Trigger in that file instead of its Start (empty = Start).
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        trigger: String,
+    },
+    /// A step this version of MacroFlow doesn't know (from a newer version, or a
+    /// damaged file). It's kept exactly as it was, so saving doesn't lose it, and
+    /// runs skip it.
+    #[serde(skip)]
+    Unknown { raw: serde_json::Value },
+}
+
+/// Read and write a step's kind, keeping steps this version doesn't understand.
+mod kind_serde {
+    use super::NodeKind;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S: Serializer>(kind: &NodeKind, s: S) -> Result<S::Ok, S::Error> {
+        match kind {
+            NodeKind::Unknown { raw } => raw.serialize(s),
+            k => k.serialize(s),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<NodeKind, D::Error> {
+        let raw = serde_json::Value::deserialize(d)?;
+        Ok(NodeKind::deserialize(&raw).unwrap_or(NodeKind::Unknown { raw }))
+    }
 }
 
 impl NodeKind {
@@ -1288,6 +1357,8 @@ impl NodeKind {
                 repeat: 1,
                 inputs: String::new(),
                 every_min: 0,
+                hotkey: String::new(),
+                at_times: String::new(),
             },
             NodeKind::Scroll {
                 amount: 3,
@@ -1302,6 +1373,7 @@ impl NodeKind {
                 click_when_found: false,
                 search_area: None,
                 until_gone: false,
+                more_templates: Vec::new(),
             },
             NodeKind::FindImage {
                 template: None,
@@ -1311,6 +1383,7 @@ impl NodeKind {
                 click_when_found: false,
                 search_area: None,
                 until_gone: true,
+                more_templates: Vec::new(),
             },
             NodeKind::WindowCheck {
                 scope: WinScope::Frontmost,
@@ -1354,7 +1427,15 @@ impl NodeKind {
                 op: CmpOp::Ge,
                 right: "10".into(),
             },
+            NodeKind::KeyCheck {
+                key: "shift".into(),
+                timeout_ms: 0,
+            },
             NodeKind::Loop { count: 3 },
+            NodeKind::RunMacro {
+                path: None,
+                trigger: String::new(),
+            },
             NodeKind::Group {
                 name: String::new(),
                 graph: Graph::default(),
@@ -1393,6 +1474,9 @@ impl NodeKind {
             NodeKind::GroupOut => "Group end",
             NodeKind::Trigger { .. } => "Trigger",
             NodeKind::Webhook { .. } => "Webhook",
+            NodeKind::KeyCheck { .. } => "Key check",
+            NodeKind::RunMacro { .. } => "Run macro file",
+            NodeKind::Unknown { .. } => "Unknown step",
         }
     }
 
@@ -1423,6 +1507,9 @@ impl NodeKind {
             NodeKind::GroupOut => "icons/group_out.svg",
             NodeKind::Trigger { .. } => "icons/trigger.svg",
             NodeKind::Webhook { .. } => "icons/webhook.svg",
+            NodeKind::KeyCheck { .. } => "icons/keycheck.svg",
+            NodeKind::RunMacro { .. } => "icons/runmacro.svg",
+            NodeKind::Unknown { .. } => "icons/info.svg",
         }
     }
 
@@ -1455,6 +1542,9 @@ impl NodeKind {
             NodeKind::Notify { style, .. } => style.color(),
             NodeKind::Trigger { .. } => 0x5865f2,
             NodeKind::Webhook { .. } => 0x00a8fc,
+            NodeKind::KeyCheck { .. } => 0xffb142,
+            NodeKind::RunMacro { .. } => 0x7d5fff,
+            NodeKind::Unknown { .. } => 0x7f8796,
         }
     }
 
@@ -1471,6 +1561,7 @@ impl NodeKind {
             NodeKind::ReadText { .. } => &["match", "no match"],
             NodeKind::IfCompare { .. } => &["yes", "no"],
             NodeKind::PixelColor { .. } => &["match", "no match"],
+            NodeKind::KeyCheck { .. } => &["pressed", "not pressed"],
             _ => &["next"],
         }
     }
@@ -1483,7 +1574,11 @@ impl NodeKind {
     pub fn is_check(&self) -> bool {
         matches!(
             self,
-            NodeKind::FindImage { .. } | NodeKind::WindowCheck { .. } | NodeKind::ReadText { .. } | NodeKind::PixelColor { .. }
+            NodeKind::FindImage { .. }
+                | NodeKind::WindowCheck { .. }
+                | NodeKind::ReadText { .. }
+                | NodeKind::PixelColor { .. }
+                | NodeKind::KeyCheck { .. }
         )
     }
 
@@ -1493,12 +1588,12 @@ impl NodeKind {
             self,
             NodeKind::Start
                 | NodeKind::End
-                | NodeKind::Group { .. }
                 | NodeKind::GroupIn
                 | NodeKind::GroupOut
                 | NodeKind::Trigger { .. }
                 | NodeKind::Loop { .. }
                 | NodeKind::IfCompare { .. }
+                | NodeKind::Unknown { .. }
         )
     }
 
@@ -1653,13 +1748,20 @@ impl NodeKind {
                 threshold,
                 timeout_ms,
                 search_area,
+                more_templates,
                 ..
             } => {
+                let more = if more_templates.is_empty() {
+                    String::new()
+                } else {
+                    format!(" (+{} more)", more_templates.len())
+                };
                 let name = template
                     .as_ref()
                     .and_then(|p| p.file_name())
                     .map(|n| n.to_string_lossy().to_string())
                     .unwrap_or_else(|| "no image yet".into());
+                let name = format!("{name}{more}");
                 let area = if search_area.is_some() { " · in area" } else { "" };
                 if matches!(self, NodeKind::FindImage { until_gone: true, .. }) {
                     format!("until {name} is gone · up to {timeout_ms} ms{area}")
@@ -1792,7 +1894,7 @@ impl NodeKind {
                 format!("{} · “{short}{more}” · {how}", style.label())
             }
             NodeKind::GroupOut => "Leave the group and carry on".into(),
-            NodeKind::Trigger { name, repeat, inputs, every_min } => {
+            NodeKind::Trigger { name, repeat, inputs, every_min, hotkey, at_times } => {
                 let times = match repeat {
                     0 => " · until stopped".to_string(),
                     1 => String::new(),
@@ -1803,8 +1905,16 @@ impl NodeKind {
                     .iter()
                     .map(|i| format!(" {}", i.name))
                     .collect();
-                let every = if *every_min > 0 { format!(" · ⏱ {}", every_label(*every_min)) } else { String::new() };
-                if name.trim().is_empty() {
+                let mut every = if *every_min > 0 { format!(" · ⏱ {}", every_label(*every_min)) } else { String::new() };
+                if !at_times.trim().is_empty() {
+                    every.push_str(&format!(" · ⏰ {}", at_times.trim()));
+                }
+                if !hotkey.trim().is_empty() {
+                    every.push_str(&format!(" · ⌨ {}", crate::keys::label(hotkey.trim())));
+                }
+                if name.trim().is_empty() && !hotkey.trim().is_empty() {
+                    format!("Press {} to start here{times}{every}", crate::keys::label(hotkey.trim()))
+                } else if name.trim().is_empty() {
                     "Name its command to run it from Discord".into()
                 } else {
                     format!("/{}{args}{times}{every}", name.trim())
@@ -1824,6 +1934,31 @@ impl NodeKind {
                     HookFormat::Custom => format!("POST {to}"),
                 }
             }
+            NodeKind::KeyCheck { key, timeout_ms } => {
+                if key.trim().is_empty() {
+                    "Choose a key".into()
+                } else if *timeout_ms > 0 {
+                    format!("Wait up to {timeout_ms} ms for {}", crate::keys::label(key))
+                } else {
+                    format!("Is {} held down?", crate::keys::label(key))
+                }
+            }
+            NodeKind::RunMacro { path, trigger } => {
+                let name = path
+                    .as_ref()
+                    .and_then(|p| p.file_name())
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "Choose a macro file".into());
+                if trigger.trim().is_empty() {
+                    name
+                } else {
+                    format!("{name} · from /{}", trigger.trim())
+                }
+            }
+            NodeKind::Unknown { raw } => {
+                let t = raw.get("type").and_then(|t| t.as_str()).unwrap_or("?");
+                format!("“{t}” – made by another version, skipped when it runs")
+            }
         }
     }
 
@@ -1839,6 +1974,7 @@ impl NodeKind {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Node {
     pub id: u64,
+    #[serde(with = "kind_serde")]
     pub kind: NodeKind,
     pub x: f32,
     pub y: f32,
@@ -1866,6 +2002,11 @@ pub struct Node {
     /// How long to wait before each new try.
     #[serde(default = "default_retry_wait", skip_serializing_if = "is_default_retry_wait")]
     pub retry_wait_ms: u64,
+    /// If the step still goes wrong (after its retries), carry on along its first
+    /// output instead of stopping the macro. A group carries on after the group.
+    /// Optional, so older macros still open.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub continue_on_error: bool,
 }
 
 pub fn default_retry_wait() -> u64 {
@@ -2102,6 +2243,9 @@ pub struct Macro {
 /// versions of MacroFlow use, so their files still open.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct MacroFile {
+    /// Which layout the file uses. Files from before this existed have none (1).
+    #[serde(default = "legacy_format")]
+    format_version: u32,
     name: String,
     nodes: Vec<Node>,
     edges: Vec<Edge>,
@@ -2166,6 +2310,7 @@ impl From<MacroFile> for Macro {
 impl From<Macro> for MacroFile {
     fn from(m: Macro) -> Self {
         MacroFile {
+            format_version: FORMAT_VERSION,
             name: m.name,
             nodes: m.root.nodes,
             edges: m.root.edges,
@@ -2185,6 +2330,50 @@ impl From<Macro> for MacroFile {
             show_clicks: m.show_clicks,
         }
     }
+}
+
+/// The file layout this version writes. Older files (1, or none) open as they are;
+/// a newer one opens too, and any step this version doesn't know is kept but skipped.
+pub const FORMAT_VERSION: u32 = 2;
+
+fn legacy_format() -> u32 {
+    1
+}
+
+/// Open a macro from its JSON. Besides the macro, returns warnings worth showing
+/// (made by a newer MacroFlow, steps this version can't run).
+pub fn load_macro(text: &str) -> Result<(Macro, Vec<String>), String> {
+    let doc: Macro = serde_json::from_str(text).map_err(|e| e.to_string())?;
+    let version = serde_json::from_str::<serde_json::Value>(text)
+        .ok()
+        .and_then(|v| v.get("format_version").and_then(|n| n.as_u64()))
+        .unwrap_or(1);
+    let mut warnings = Vec::new();
+    if version > FORMAT_VERSION as u64 {
+        warnings.push("It was saved by a newer MacroFlow, so some things in it may not work here.".to_string());
+    }
+    let mut unknown = 0;
+    let mut root = doc.root.clone();
+    root.for_each_mut(&mut |n| {
+        if matches!(n.kind, NodeKind::Unknown { .. }) {
+            unknown += 1;
+        }
+    });
+    if unknown > 0 {
+        warnings.push(format!(
+            "{unknown} step{} couldn't be read by this version. {} kept, and runs skip {}.",
+            if unknown == 1 { "" } else { "s" },
+            if unknown == 1 { "It's" } else { "They're" },
+            if unknown == 1 { "it" } else { "them" },
+        ));
+    }
+    Ok((doc, warnings))
+}
+
+/// Open a macro file (see `load_macro`).
+pub fn load_macro_file(path: &std::path::Path) -> Result<(Macro, Vec<String>), String> {
+    let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+    load_macro(&text)
 }
 
 fn default_start_delay() -> u64 {
@@ -2238,6 +2427,7 @@ fn blank_node(id: u64, kind: NodeKind, x: f32, y: f32) -> Node {
         disabled: false,
         retries: 0,
         retry_wait_ms: default_retry_wait(),
+        continue_on_error: false,
     }
 }
 
@@ -2306,7 +2496,11 @@ impl Macro {
     /// connected (normally "next"; for a branching step, the first branch that leads
     /// somewhere). Returns the output and the step it leads to (None = nothing).
     pub fn skip_target(&self, id: u64) -> (usize, Option<u64>) {
-        let outputs = self.node(id).map_or(0, |n| n.kind.outputs().len());
+        let outputs = self.node(id).map_or(0, |n| match n.kind {
+            // Its outputs aren't known: take whichever connection comes first.
+            NodeKind::Unknown { .. } => 8,
+            ref k => k.outputs().len(),
+        });
         for port in 0..outputs {
             if let Some(to) = self.next(id, port) {
                 return (port, Some(to));
@@ -2427,6 +2621,52 @@ impl Macro {
                 }],
             },
         }
+    }
+
+    /// Turn a Recording step into a group of separate steps (clicks, drags, keys,
+    /// typing, scrolls and waits) in the same place, keeping its connections.
+    /// Returns how many steps it made.
+    pub fn recording_into_steps(&mut self, id: u64) -> Result<usize, String> {
+        let (events, speed, delay, note, name) = match self.node(id) {
+            Some(Node { kind: NodeKind::Recording { events, speed }, delay_ms, note, name, .. }) => {
+                (events.clone(), *speed, *delay_ms, note.clone(), name.clone())
+            }
+            _ => return Err("That step isn't a recording.".into()),
+        };
+        let steps = recording_to_steps(&events, speed);
+        if steps.is_empty() {
+            return Err("This recording has no clicks, keys or scrolls to turn into steps.".into());
+        }
+        let mut kind = self.new_group_kind();
+        if let NodeKind::Group { name: gname, graph } = &mut kind {
+            *gname = if name.trim().is_empty() { "Recorded steps".into() } else { name.trim().to_string() };
+            let in_id = graph.nodes[0].id;
+            let out_id = graph.nodes[1].id;
+            graph.edges.clear();
+            let mut prev = in_id;
+            for (i, k) in steps.iter().enumerate() {
+                let sid = self.next_id;
+                self.next_id += 1;
+                // Snake across the canvas in rows of six.
+                let (col, row) = ((i % 6) as f32, (i / 6) as f32);
+                let x = 60.0 + (col + 1.0) * (NODE_W + 60.0);
+                graph.nodes.push(blank_node(sid, k.clone(), x, 180.0 + row * 140.0));
+                graph.edges.push(Edge { from: prev, port: 0, to: sid });
+                prev = sid;
+            }
+            graph.edges.push(Edge { from: prev, port: 0, to: out_id });
+            let rows = steps.len().div_ceil(6) as f32;
+            if let Some(out) = graph.nodes.iter_mut().find(|n| n.id == out_id) {
+                out.y = 180.0 + (rows - 1.0) * 140.0 + 140.0;
+                out.x = 60.0;
+            }
+        }
+        let n = self.node_mut(id).ok_or_else(|| "That step no longer exists.".to_string())?;
+        n.kind = kind;
+        n.delay_ms = delay;
+        n.note = note;
+        n.name = String::new();
+        Ok(steps.len())
     }
 
     /// Give every step inside a (copied) group a new id, so a copy doesn't clash with the original.
@@ -2835,7 +3075,10 @@ pub fn map_kind(kind: &mut NodeKind, m: &Mapping) {
         NodeKind::Recording { events, .. } => {
             for e in events.iter_mut() {
                 match &mut e.action {
-                    RecAction::Move { x, y } | RecAction::Down { x, y, .. } | RecAction::Up { x, y, .. } => {
+                    RecAction::Move { x, y }
+                    | RecAction::Down { x, y, .. }
+                    | RecAction::Up { x, y, .. }
+                    | RecAction::Scroll { x, y, .. } => {
                         (*x, *y) = m.point(*x, *y);
                     }
                     _ => {}
@@ -2962,6 +3205,68 @@ enum Tok {
     Op(char),
     LParen,
     RParen,
+    Comma,
+}
+
+/// Functions a sum can use, e.g. `random(1, 10)` or `max(a, b)`.
+pub const FUNCTIONS: [&str; 7] = ["random", "min", "max", "abs", "round", "floor", "ceil"];
+
+/// A random number from 0 up to (not including) 1, for `random(…)` in sums.
+fn random_unit() -> f64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static STATE: AtomicU64 = AtomicU64::new(0);
+    let mut x = STATE.load(Ordering::Relaxed);
+    if x == 0 {
+        x = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0x9e37_79b9_7f4a_7c15)
+            | 1;
+    }
+    // xorshift64
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    STATE.store(x, Ordering::Relaxed);
+    (x >> 11) as f64 / (1u64 << 53) as f64
+}
+
+/// Work out `name(args)`.
+fn call_function(name: &str, args: &[f64]) -> Result<f64, EvalErr> {
+    let need = |n: usize| -> Result<(), EvalErr> {
+        if args.len() == n {
+            Ok(())
+        } else {
+            Err(EvalErr::Math(format!(
+                "{name}(…) takes {n} value{}, not {}",
+                if n == 1 { "" } else { "s" },
+                args.len()
+            )))
+        }
+    };
+    match name {
+        // random(a, b): a whole number from a to b (both included). random(): 0…1.
+        "random" => match args {
+            [] => Ok(random_unit()),
+            [hi] => Ok((random_unit() * (hi.floor() + 1.0)).floor()),
+            [a, b] => {
+                let (lo, hi) = if a <= b { (a.ceil(), b.floor()) } else { (b.ceil(), a.floor()) };
+                if hi < lo {
+                    return Ok(lo);
+                }
+                Ok((lo + (random_unit() * (hi - lo + 1.0)).floor()).min(hi))
+            }
+            _ => Err(EvalErr::Math("random(…) takes up to 2 values, e.g. random(1, 10)".into())),
+        },
+        "min" | "max" if args.is_empty() => Err(EvalErr::Math(format!("{name}(…) needs at least one value"))),
+        "min" => Ok(args.iter().copied().fold(f64::INFINITY, f64::min)),
+        "max" => Ok(args.iter().copied().fold(f64::NEG_INFINITY, f64::max)),
+        "abs" => need(1).map(|_| args[0].abs()),
+        "round" => need(1).map(|_| args[0].round()),
+        "floor" => need(1).map(|_| args[0].floor()),
+        "ceil" => need(1).map(|_| args[0].ceil()),
+        _ => Err(EvalErr::Syntax),
+    }
 }
 
 fn tokenize(src: &str) -> Option<Vec<Tok>> {
@@ -3014,6 +3319,7 @@ fn tokenize(src: &str) -> Option<Vec<Tok>> {
             '−' => Tok::Op('-'),
             '(' => Tok::LParen,
             ')' => Tok::RParen,
+            ',' => Tok::Comma,
             _ => return None,
         });
         i += 1;
@@ -3077,6 +3383,27 @@ impl Parser<'_> {
             Tok::Op('-') => Ok(-self.factor()?),
             Tok::Op('+') => self.factor(),
             Tok::Num(n) => Ok(n),
+            // A function call: random(1, 10), max(a, b)…
+            Tok::Ident(name) if self.peek() == Some(&Tok::LParen) && FUNCTIONS.contains(&name.as_str()) => {
+                self.pos += 1;
+                let mut args = Vec::new();
+                if self.peek() == Some(&Tok::RParen) {
+                    self.pos += 1;
+                } else {
+                    loop {
+                        args.push(self.expr()?);
+                        match self.peek() {
+                            Some(Tok::Comma) => self.pos += 1,
+                            Some(Tok::RParen) => {
+                                self.pos += 1;
+                                break;
+                            }
+                            _ => return Err(EvalErr::Syntax),
+                        }
+                    }
+                }
+                call_function(&name, &args)
+            }
             // Variables that haven't been set count as 0, so counters work straight away.
             Tok::Ident(name) => match self.vars.get(&name) {
                 None => Ok(0.0),
@@ -3128,7 +3455,7 @@ pub fn eval_expr(src: &str, vars: &HashMap<String, String>) -> Result<Value, Str
 // ---------------------------------------------------------------------------
 
 /// Variables every run has without setting them.
-pub const BUILTIN_VARS: [&str; 4] = ["text", "run", "found_x", "found_y"];
+pub const BUILTIN_VARS: [&str; 5] = ["text", "run", "found_x", "found_y", "found_image"];
 
 /// How a piece of text uses variables.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3234,7 +3561,14 @@ pub fn var_ranges(src: &str, mode: VarMode, known: &dyn Fn(&str) -> bool) -> Vec
                             i += 1;
                         }
                         let name: String = chars[start..i].iter().collect();
-                        out.push(VarRange { start, end: i, name, braced: false });
+                        let mut j = i;
+                        while j < chars.len() && chars[j].is_whitespace() {
+                            j += 1;
+                        }
+                        let is_call = chars.get(j) == Some(&'(') && FUNCTIONS.contains(&name.as_str());
+                        if !is_call {
+                            out.push(VarRange { start, end: i, name, braced: false });
+                        }
                         continue;
                     }
                     i += 1;
@@ -3430,6 +3764,222 @@ impl Macro {
 
 /// Where to tap for a Drag step with `taps` set: evenly along the line, both ends
 /// included (one tap goes in the middle).
+/// Read "08:30, 17:00" (or "8:30 17:00") as times of day: (hour, minute) pairs.
+pub fn parse_times(s: &str) -> Result<Vec<(u32, u32)>, String> {
+    let mut out = Vec::new();
+    for part in s.split(|c: char| c == ',' || c == ';' || c.is_whitespace()).filter(|p| !p.is_empty()) {
+        let bad = || format!("“{part}” isn't a time. Write times like 08:30 or 17:05 (24-hour clock).");
+        let (h, m) = part.split_once(':').ok_or_else(bad)?;
+        let h: u32 = h.parse().map_err(|_| bad())?;
+        let m: u32 = m.parse().map_err(|_| bad())?;
+        if h > 23 || m > 59 {
+            return Err(bad());
+        }
+        if !out.contains(&(h, m)) {
+            out.push((h, m));
+        }
+    }
+    Ok(out)
+}
+
+/// Turn a recording into separate steps: clicks, double-clicks, drags, scrolls,
+/// key presses, typed text and the waits between them. Mouse moves on their own
+/// aren't kept (the steps move the mouse where it's needed).
+pub fn recording_to_steps(events: &[RecEvent], speed: f32) -> Vec<NodeKind> {
+    let speed = if speed < 0.01 { 1.0 } else { speed };
+    let delay = |e: &RecEvent| (e.delay_ms as f32 / speed).round() as u64;
+    let mut out: Vec<NodeKind> = Vec::new();
+    let mut wait: u64 = 0;
+    // Where the steps so far have left the mouse.
+    let mut pointer: Option<(i32, i32)> = None;
+    let mut held = Mods::default();
+    let mut typing = String::new();
+    let flush_wait = |out: &mut Vec<NodeKind>, wait: &mut u64| {
+        // Very short pauses are left out: the gap between steps covers them.
+        if *wait >= 30 {
+            out.push(NodeKind::Wait { ms: *wait, jitter_ms: 0 });
+        }
+        *wait = 0;
+    };
+    let flush_typing = |out: &mut Vec<NodeKind>, typing: &mut String| {
+        if !typing.is_empty() {
+            out.push(NodeKind::TypeText { text: std::mem::take(typing), press_enter: false });
+        }
+    };
+    let click = |x: i32, y: i32, button: MouseBtn, clicks: u32| NodeKind::Click {
+        target: Target::Fixed,
+        x,
+        y,
+        offset_x: 0,
+        offset_y: 0,
+        button,
+        clicks,
+        area: None,
+        jitter_px: 0,
+        area_shape: AreaShape::default(),
+        move_speed: 0,
+    };
+    let far = |a: (i32, i32), b: (i32, i32), px: i32| (a.0 - b.0).abs() > px || (a.1 - b.1).abs() > px;
+    let mut i = 0;
+    while i < events.len() {
+        let e = &events[i];
+        wait += delay(e);
+        match &e.action {
+            RecAction::Move { .. } => {}
+            RecAction::Down { button, x, y } => {
+                // Where (and after how long) this button comes back up.
+                let mut held_ms = 0;
+                let mut up = None;
+                for (j, f) in events.iter().enumerate().skip(i + 1) {
+                    held_ms += delay(f);
+                    if let RecAction::Up { button: b, x: ux, y: uy } = &f.action {
+                        if b == button {
+                            up = Some((j, *ux, *uy));
+                            break;
+                        }
+                    }
+                }
+                let (j, ux, uy) = up.unwrap_or((i, *x, *y));
+                flush_typing(&mut out, &mut typing);
+                flush_wait(&mut out, &mut wait);
+                if far((*x, *y), (ux, uy), 8) {
+                    out.push(NodeKind::Drag {
+                        from_x: *x,
+                        from_y: *y,
+                        to_x: ux,
+                        to_y: uy,
+                        button: *button,
+                        duration_ms: held_ms.clamp(50, 10_000),
+                        taps: 0,
+                        hold_ms: default_hold_ms(),
+                        tap_in_area: false,
+                        tap_area: None,
+                        tap_shape: AreaShape::default(),
+                    });
+                    pointer = Some((ux, uy));
+                    i = j + 1;
+                    continue;
+                }
+                // A second quick click in the same place makes it a double-click.
+                let mut next = j + 1;
+                let mut clicks = 1;
+                let mut gap = 0;
+                let mut k = j + 1;
+                while k < events.len() {
+                    gap += delay(&events[k]);
+                    match &events[k].action {
+                        RecAction::Move { .. } => {}
+                        RecAction::Down { button: b, x: dx, y: dy } if b == button && gap <= 400 && !far((*x, *y), (*dx, *dy), 6) => {
+                            if let Some(u) = (k + 1..events.len())
+                                .find(|&u| matches!(&events[u].action, RecAction::Up { button: b2, .. } if b2 == button))
+                            {
+                                clicks = 2;
+                                next = u + 1;
+                            }
+                            break;
+                        }
+                        _ => break,
+                    }
+                    k += 1;
+                }
+                out.push(click(*x, *y, *button, clicks));
+                pointer = Some((*x, *y));
+                i = next;
+                continue;
+            }
+            RecAction::Up { .. } => {}
+            RecAction::Scroll { amount, horizontal, x, y } => {
+                // Turning the wheel a few clicks in a row is one Scroll step.
+                if typing.is_empty() && wait < 300 && pointer.is_some_and(|p| !far(p, (*x, *y), 4)) {
+                    if let Some(NodeKind::Scroll { amount: a, horizontal: h, .. }) = out.last_mut() {
+                        if *h == *horizontal && (*a < 0) == (*amount < 0) {
+                            *a += *amount;
+                            wait = 0;
+                            i += 1;
+                            continue;
+                        }
+                    }
+                }
+                flush_typing(&mut out, &mut typing);
+                flush_wait(&mut out, &mut wait);
+                if pointer.is_none_or(|p| far(p, (*x, *y), 4)) {
+                    out.push(NodeKind::MoveMouse {
+                        target: Target::Fixed,
+                        x: *x,
+                        y: *y,
+                        offset_x: 0,
+                        offset_y: 0,
+                        area: None,
+                        jitter_px: 0,
+                        area_shape: AreaShape::default(),
+                        move_speed: 0,
+                    });
+                    pointer = Some((*x, *y));
+                }
+                out.push(NodeKind::Scroll { amount: *amount, horizontal: *horizontal, strength: 1 });
+            }
+            RecAction::KeyDown { key } => {
+                let set = |m: &mut Mods, on: bool| match key.trim_start_matches('r') {
+                    "shift" => m.shift = on,
+                    "ctrl" => m.ctrl = on,
+                    "alt" => m.alt = on,
+                    "cmd" => m.cmd = on,
+                    _ => {}
+                };
+                if crate::keys::is_modifier(key) {
+                    set(&mut held, true);
+                } else {
+                    // Plain letters, digits and spaces are joined up into typed text.
+                    let mut chars = key.chars();
+                    let single = match (chars.next(), chars.next()) {
+                        (Some(c), None) if !c.is_control() => Some(c),
+                        _ if key == "space" => Some(' '),
+                        _ => None,
+                    };
+                    let plain = !held.cmd && !held.ctrl && !held.alt;
+                    let typed = match single {
+                        Some(c) if plain && !held.shift => Some(c),
+                        Some(c) if plain && c.is_ascii_alphabetic() => Some(c.to_ascii_uppercase()),
+                        _ => None,
+                    };
+                    match typed {
+                        Some(c) if typing.is_empty() || wait < 1500 => {
+                            if typing.is_empty() {
+                                flush_wait(&mut out, &mut wait);
+                            }
+                            // Pauses while typing are part of the typing.
+                            wait = 0;
+                            typing.push(c);
+                        }
+                        _ => {
+                            flush_typing(&mut out, &mut typing);
+                            flush_wait(&mut out, &mut wait);
+                            match typed {
+                                Some(c) => typing.push(c),
+                                None => out.push(NodeKind::KeyPress { key: key.clone(), mods: held }),
+                            }
+                        }
+                    }
+                }
+            }
+            RecAction::KeyUp { key } => {
+                if crate::keys::is_modifier(key) {
+                    match key.trim_start_matches('r') {
+                        "shift" => held.shift = false,
+                        "ctrl" => held.ctrl = false,
+                        "alt" => held.alt = false,
+                        "cmd" => held.cmd = false,
+                        _ => {}
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+    flush_typing(&mut out, &mut typing);
+    out
+}
+
 pub fn tap_points(from: (i32, i32), to: (i32, i32), taps: u32) -> Vec<(i32, i32)> {
     let n = taps.max(1);
     if n == 1 {
@@ -3756,14 +4306,34 @@ fn graph_problems(g: &Graph, top: bool, has_find: bool, known: &dyn Fn(&str) -> 
             push(id, false, "Never runs: nothing leads to this step.".into());
         }
         match &n.kind {
-            NodeKind::FindImage { template, .. } => match template {
-                None => push(id, true, "No image to look for yet. Drag a box, snip or choose one.".into()),
+            NodeKind::FindImage { template, more_templates, .. } => {
+                match template {
+                    None => push(id, true, "No image to look for yet. Drag a box, snip or choose one.".into()),
+                    Some(p) if !p.exists() => {
+                        let name = p.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default();
+                        push(id, true, format!("The image “{name}” is missing (moved or deleted?)."));
+                    }
+                    _ => {}
+                }
+                for p in more_templates.iter().filter(|p| !p.exists()) {
+                    let name = p.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default();
+                    push(id, true, format!("The extra image “{name}” is missing (moved or deleted?)."));
+                }
+            }
+            NodeKind::KeyCheck { key, .. } if key.trim().is_empty() => {
+                push(id, true, "No key chosen yet.".into());
+            }
+            NodeKind::RunMacro { path, .. } => match path {
+                None => push(id, true, "No macro file chosen yet.".into()),
                 Some(p) if !p.exists() => {
                     let name = p.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default();
-                    push(id, true, format!("The image “{name}” is missing (moved or deleted?)."));
+                    push(id, true, format!("The macro file “{name}” is missing (moved or deleted?)."));
                 }
                 _ => {}
             },
+            NodeKind::Unknown { .. } => {
+                push(id, false, "This version of MacroFlow doesn't know this step, so runs skip it. Saving keeps it as it was.".into());
+            }
             NodeKind::ReadText { w, h, compare, value, save_to, .. } => {
                 if *w <= 1 || *h <= 1 {
                     push(id, true, "No area to read yet. Use “Select area”.".into());
@@ -3799,12 +4369,22 @@ fn graph_problems(g: &Graph, top: bool, has_find: bool, known: &dyn Fn(&str) -> 
             NodeKind::Drag { taps, tap_in_area, tap_area, .. } if *taps > 0 && *tap_in_area && tap_area.is_none() => {
                 push(id, true, "It taps round a shape, but no area is selected yet.".into());
             }
-            NodeKind::Trigger { name, inputs, .. } => {
+            NodeKind::Trigger { name, inputs, hotkey, at_times, every_min, .. } => {
                 if let Err(e) = parse_inputs(inputs) {
                     push(id, false, format!("Inputs: {e}"));
                 }
+                if let Err(e) = parse_times(at_times) {
+                    push(id, false, format!("Times: {e}"));
+                }
+                let hk = hotkey.trim().to_lowercase();
+                if ["f8", "f9", "f10", "escape"].contains(&hk.as_str()) {
+                    push(id, false, format!("{} already starts, pauses or stops macros. Pick another key.", crate::keys::label(&hk)));
+                }
+                let other_start = !hk.is_empty() || !at_times.trim().is_empty() || *every_min > 0;
                 if !top {
                     push(id, false, "Triggers only work at the top level of the macro, not inside a group.".into());
+                } else if name.trim().is_empty() && other_start {
+                    // Started by its hotkey or timer; Discord just can't run it.
                 } else if name.trim().is_empty() {
                     push(id, false, "Give the trigger a command name so Discord can run it (e.g. /farm).".into());
                 } else if BOT_COMMANDS.contains(&name.trim().to_lowercase().as_str()) {
@@ -4707,8 +5287,8 @@ mod tests {
     #[test]
     fn triggers_are_found_by_name() {
         let mut m = Macro::default();
-        let t = m.add_node(NodeKind::Trigger { name: "Farm".into(), repeat: 1, inputs: String::new(), every_min: 0 }, 0.0, 0.0);
-        m.add_node(NodeKind::Trigger { name: String::new(), repeat: 1, inputs: String::new(), every_min: 0 }, 0.0, 0.0);
+        let t = m.add_node(NodeKind::Trigger { name: "Farm".into(), repeat: 1, inputs: String::new(), every_min: 0, hotkey: String::new(), at_times: String::new() }, 0.0, 0.0);
+        m.add_node(NodeKind::Trigger { name: String::new(), repeat: 1, inputs: String::new(), every_min: 0, hotkey: String::new(), at_times: String::new() }, 0.0, 0.0);
         assert_eq!(m.triggers(), vec![(t, "Farm".to_string())]);
         assert_eq!(m.trigger_named(" farm "), Some(t));
         assert_eq!(m.trigger_named("collect"), None);
@@ -4722,7 +5302,7 @@ mod tests {
         assert_eq!(command_name("!!"), "");
         // Older triggers with spaces / capitals still answer to their command.
         let mut m = Macro::default();
-        let t = m.add_node(NodeKind::Trigger { name: "My Farm".into(), repeat: 1, inputs: String::new(), every_min: 0 }, 0.0, 0.0);
+        let t = m.add_node(NodeKind::Trigger { name: "My Farm".into(), repeat: 1, inputs: String::new(), every_min: 0, hotkey: String::new(), at_times: String::new() }, 0.0, 0.0);
         assert_eq!(m.trigger_named("my-farm"), Some(t));
         assert_eq!(m.trigger_named("/My-Farm"), Some(t));
     }
@@ -4743,7 +5323,7 @@ mod tests {
 
         let mut m = Macro::default();
         let t = m.add_node(
-            NodeKind::Trigger { name: "farm".into(), repeat: 1, inputs: "times:number=1, message".into(), every_min: 0 },
+            NodeKind::Trigger { name: "farm".into(), repeat: 1, inputs: "times:number=1, message".into(), every_min: 0, hotkey: String::new(), at_times: String::new() },
             0.0,
             0.0,
         );
@@ -4775,7 +5355,8 @@ mod tests {
             interval_ms: 100,
             click_when_found: false,
             search_area: None,
-            until_gone: false
+            until_gone: false,
+            more_templates: Vec::new()
         }
         .is_check());
         assert!(!NodeKind::Loop { count: 1 }.can_retry());
@@ -4791,21 +5372,21 @@ mod tests {
     #[test]
     fn a_trigger_cant_take_a_bot_command_name() {
         let mut m = Macro::default();
-        let t = m.add_node(NodeKind::Trigger { name: "stop".into(), repeat: 1, inputs: String::new(), every_min: 0 }, 0.0, 0.0);
+        let t = m.add_node(NodeKind::Trigger { name: "stop".into(), repeat: 1, inputs: String::new(), every_min: 0, hotkey: String::new(), at_times: String::new() }, 0.0, 0.0);
         assert!(m.problems().iter().any(|p| p.step == t && p.text.contains("bot's own commands")));
     }
 
     #[test]
     fn a_trigger_only_macro_can_run() {
         let mut m = Macro::default();
-        let t = m.add_node(NodeKind::Trigger { name: "farm".into(), repeat: 1, inputs: String::new(), every_min: 0 }, 0.0, 0.0);
+        let t = m.add_node(NodeKind::Trigger { name: "farm".into(), repeat: 1, inputs: String::new(), every_min: 0, hotkey: String::new(), at_times: String::new() }, 0.0, 0.0);
         let w = m.add_node(NodeKind::Wait { ms: 10, jitter_ms: 0 }, 0.0, 0.0);
         m.connect(t, 0, w);
         // Start isn't connected, but that's only a warning while a trigger is.
         assert!(m.problems().iter().all(|p| !p.serious));
         // Steps after a trigger aren't "never runs".
         assert!(!m.problems().iter().any(|p| p.step == w));
-        assert!(!NodeKind::Trigger { name: String::new(), repeat: 1, inputs: String::new(), every_min: 0 }.has_input());
+        assert!(!NodeKind::Trigger { name: String::new(), repeat: 1, inputs: String::new(), every_min: 0, hotkey: String::new(), at_times: String::new() }.has_input());
     }
 
     #[test]
@@ -4823,7 +5404,206 @@ mod tests {
             }
         );
         let t: NodeKind = serde_json::from_str(r#"{"type":"Trigger","name":"go"}"#).unwrap();
-        assert_eq!(t, NodeKind::Trigger { name: "go".into(), repeat: 1, inputs: String::new(), every_min: 0 });
+        assert_eq!(
+            t,
+            NodeKind::Trigger {
+                name: "go".into(),
+                repeat: 1,
+                inputs: String::new(),
+                every_min: 0,
+                hotkey: String::new(),
+                at_times: String::new()
+            }
+        );
         assert_eq!(url_host("https://discord.com/api/webhooks/1/secret"), "discord.com");
+    }
+
+    #[test]
+    fn old_files_still_open_and_save_with_a_version() {
+        for text in [include_str!("../examples/hello.json"), include_str!("../examples/coc_sneaky_goblin_farm.json")] {
+            let (m, warnings) = load_macro(text).unwrap();
+            assert!(warnings.is_empty(), "{warnings:?}");
+            assert!(m.start_id().is_some());
+            assert!(m.problems().iter().all(|p| !p.text.contains("doesn't know")));
+            // Saving writes the version, and changes nothing else.
+            let saved = serde_json::to_string(&m).unwrap();
+            assert!(saved.contains(&format!("\"format_version\":{FORMAT_VERSION}")));
+            let (again, _) = load_macro(&saved).unwrap();
+            assert_eq!(again, m);
+        }
+        // A bare-bones file from the very first versions.
+        let tiny = r#"{"name":"Old","nodes":[{"id":1,"kind":{"type":"Start"},"x":0,"y":0},
+            {"id":2,"kind":{"type":"Wait","ms":10,"jitter_ms":0},"x":200,"y":0},
+            {"id":3,"kind":{"type":"FindImage","template":null,"threshold":0.8,"timeout_ms":100,"interval_ms":50,"click_when_found":false},"x":400,"y":0},
+            {"id":4,"kind":{"type":"Trigger","name":"go"},"x":0,"y":200},
+            {"id":5,"kind":{"type":"Recording","events":[{"delay_ms":5,"action":{"kind":"Move","x":1,"y":2}}],"speed":1.0},"x":0,"y":400}],
+            "edges":[{"from":1,"port":0,"to":2},{"from":2,"port":0,"to":3}],"next_id":6}"#;
+        let (m, warnings) = load_macro(tiny).unwrap();
+        assert!(warnings.is_empty());
+        assert!(matches!(m.node(3).unwrap().kind, NodeKind::FindImage { ref more_templates, .. } if more_templates.is_empty()));
+        assert!(matches!(m.node(4).unwrap().kind, NodeKind::Trigger { ref hotkey, ref at_times, .. } if hotkey.is_empty() && at_times.is_empty()));
+        assert!(!m.node(2).unwrap().continue_on_error);
+        // New fields that are off aren't written, so older versions still read the file.
+        let saved = serde_json::to_string(&m).unwrap();
+        for new_field in ["more_templates", "hotkey", "at_times", "continue_on_error"] {
+            assert!(!saved.contains(new_field), "{new_field} in {saved}");
+        }
+    }
+
+    #[test]
+    fn unknown_steps_are_kept_and_skipped() {
+        let text = r#"{"format_version":99,"name":"New","nodes":[{"id":1,"kind":{"type":"Start"},"x":0,"y":0},
+            {"id":2,"kind":{"type":"Teleport","to":"moon","speed":9},"x":200,"y":0,"note":"from the future"},
+            {"id":3,"kind":{"type":"Click","target":"Fixed","x":1,"y":1,"offset_x":0,"offset_y":0,"button":"Sideways","clicks":1},"x":400,"y":0},
+            {"id":4,"kind":{"type":"End"},"x":600,"y":0}],
+            "edges":[{"from":1,"port":0,"to":2},{"from":2,"port":1,"to":3},{"from":3,"port":0,"to":4}],"next_id":5}"#;
+        let (m, warnings) = load_macro(text).unwrap();
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(matches!(m.node(2).unwrap().kind, NodeKind::Unknown { .. }));
+        assert_eq!(m.node(2).unwrap().note, "from the future");
+        // A known step with a value this version can't read is kept the same way.
+        assert!(matches!(m.node(3).unwrap().kind, NodeKind::Unknown { .. }));
+        // Runs carry on along whatever it's connected to.
+        assert_eq!(m.skip_target(2), (1, Some(3)));
+        // Saving keeps it exactly as it was.
+        let saved: serde_json::Value = serde_json::to_value(&m).unwrap();
+        let kind = &saved["nodes"][1]["kind"];
+        assert_eq!(kind["type"], "Teleport");
+        assert_eq!(kind["to"], "moon");
+        assert_eq!(saved["nodes"][2]["kind"]["button"], "Sideways");
+        assert!(m.problems().iter().any(|p| p.step == 2 && !p.serious));
+    }
+
+    #[test]
+    fn functions_in_sums() {
+        let vars: HashMap<String, String> = [("a".to_string(), "4".to_string()), ("b".to_string(), "-9".to_string())].into();
+        let num = |s: &str| eval_expr(s, &vars).unwrap().as_num().unwrap();
+        assert_eq!(num("max(a, b, 2)"), 4.0);
+        assert_eq!(num("min(a, b)"), -9.0);
+        assert_eq!(num("abs(b) + 1"), 10.0);
+        assert_eq!(num("round(2.5) + floor(1.9) + ceil(1.1)"), 3.0 + 1.0 + 2.0);
+        for _ in 0..200 {
+            let r = num("random(1, 6)");
+            assert!((1.0..=6.0).contains(&r) && r.fract() == 0.0, "{r}");
+            let u = num("random()");
+            assert!((0.0..1.0).contains(&u));
+        }
+        assert!(eval_expr("abs(1, 2)", &vars).is_err());
+        // Plain text with commas is still text.
+        assert_eq!(eval_expr("Hello, world", &vars).unwrap().as_text(), "Hello, world");
+        assert_eq!(eval_expr("1,500", &vars).unwrap().as_text(), "1,500");
+        // Function names aren't shown as (missing) variables.
+        let names: Vec<String> = var_ranges("max(a, gold) + random(1, 3)", VarMode::Expr, &|_| true)
+            .into_iter()
+            .map(|r| r.name)
+            .collect();
+        assert_eq!(names, vec!["a", "gold"]);
+    }
+
+    #[test]
+    fn times_of_day() {
+        assert_eq!(parse_times("08:30, 17:05 8:30").unwrap(), vec![(8, 30), (17, 5)]);
+        assert_eq!(parse_times("").unwrap(), vec![]);
+        assert!(parse_times("25:00").is_err());
+        assert!(parse_times("noon").is_err());
+    }
+
+    fn ev(delay_ms: u64, action: RecAction) -> RecEvent {
+        RecEvent { delay_ms, action }
+    }
+
+    #[test]
+    fn recordings_become_steps() {
+        use RecAction::*;
+        let l = MouseBtn::Left;
+        let events = vec![
+            ev(0, Move { x: 5, y: 5 }),
+            ev(500, Down { button: l, x: 10, y: 10 }),
+            ev(80, Up { button: l, x: 10, y: 10 }),
+            ev(120, Down { button: l, x: 11, y: 10 }),
+            ev(80, Up { button: l, x: 11, y: 10 }),
+            ev(1000, Down { button: l, x: 100, y: 100 }),
+            ev(300, Move { x: 200, y: 150 }),
+            ev(200, Up { button: l, x: 300, y: 200 }),
+            ev(100, KeyDown { key: "h".into() }),
+            ev(50, KeyUp { key: "h".into() }),
+            ev(50, KeyDown { key: "shift".into() }),
+            ev(10, KeyDown { key: "i".into() }),
+            ev(10, KeyUp { key: "i".into() }),
+            ev(10, KeyUp { key: "shift".into() }),
+            ev(600, KeyDown { key: "cmd".into() }),
+            ev(20, KeyDown { key: "s".into() }),
+            ev(20, KeyUp { key: "s".into() }),
+            ev(20, KeyUp { key: "cmd".into() }),
+            ev(400, Scroll { amount: 2, horizontal: false, x: 50, y: 60 }),
+            ev(100, Scroll { amount: 1, horizontal: false, x: 50, y: 60 }),
+        ];
+        let steps = recording_to_steps(&events, 1.0);
+        let titles: Vec<&str> = steps.iter().map(|k| k.title()).collect();
+        assert_eq!(
+            titles,
+            vec!["Wait", "Click", "Wait", "Drag", "Wait", "Type text", "Wait", "Key press", "Wait", "Move mouse", "Scroll"]
+        );
+        assert!(matches!(steps[0], NodeKind::Wait { ms: 500, .. }));
+        assert!(matches!(steps[1], NodeKind::Click { x: 10, y: 10, clicks: 2, .. }));
+        assert!(matches!(steps[3], NodeKind::Drag { from_x: 100, to_x: 300, duration_ms: 500, .. }));
+        assert!(matches!(&steps[5], NodeKind::TypeText { text, .. } if text == "hI"));
+        assert!(matches!(&steps[7], NodeKind::KeyPress { key, mods } if key == "s" && mods.cmd && !mods.shift));
+        assert!(matches!(steps[10], NodeKind::Scroll { amount: 3, horizontal: false, .. }));
+        // Half speed doubles the waits.
+        assert!(matches!(recording_to_steps(&events, 0.5)[0], NodeKind::Wait { ms: 1000, .. }));
+    }
+
+    #[test]
+    fn a_recording_turns_into_a_group_in_place() {
+        let mut m = Macro::default();
+        let start = m.start_id().unwrap();
+        let rec = m.add_node(
+            NodeKind::Recording {
+                events: vec![
+                    ev(100, RecAction::Down { button: MouseBtn::Left, x: 1, y: 2 }),
+                    ev(50, RecAction::Up { button: MouseBtn::Left, x: 1, y: 2 }),
+                    ev(50, RecAction::KeyDown { key: "enter".into() }),
+                ],
+                speed: 1.0,
+            },
+            300.0,
+            0.0,
+        );
+        let end = m.add_node(NodeKind::End, 600.0, 0.0);
+        m.connect(start, 0, rec);
+        m.connect(rec, 0, end);
+        assert_eq!(m.recording_into_steps(rec).unwrap(), 4);
+        assert_eq!(m.next(start, 0), Some(rec));
+        assert_eq!(m.next(rec, 0), Some(end));
+        let NodeKind::Group { graph, .. } = &m.node(rec).unwrap().kind else { panic!("not a group") };
+        let gin = graph.nodes.iter().find(|n| matches!(n.kind, NodeKind::GroupIn)).unwrap().id;
+        let chain: Vec<&str> = graph.chain_from(gin).iter().map(|id| graph.node(*id).unwrap().kind.title()).collect();
+        assert_eq!(chain, vec!["Group start", "Wait", "Click", "Wait", "Key press", "Group end"]);
+        assert!(m.problems().iter().all(|p| !p.serious), "{:?}", m.problems());
+        // Ids are never reused.
+        assert!(m.next_id > m.root.max_id());
+    }
+
+    #[test]
+    fn scrolls_in_recordings_save() {
+        let e = ev(10, RecAction::Scroll { amount: -3, horizontal: true, x: 4, y: 5 });
+        let back: RecEvent = serde_json::from_str(&serde_json::to_string(&e).unwrap()).unwrap();
+        assert_eq!(back, e);
+        assert_eq!(e.action.describe(), "Scroll left 3× at (4, 5)");
+    }
+
+    #[test]
+    fn new_steps() {
+        assert_eq!(NodeKind::KeyCheck { key: "shift".into(), timeout_ms: 0 }.outputs(), &["pressed", "not pressed"]);
+        assert!(crate::keys::same_key("rshift", "shift"));
+        assert!(crate::keys::same_key("a", "a"));
+        assert!(!crate::keys::same_key("ra", "a"));
+        let mut m = Macro::default();
+        let r = m.add_node(NodeKind::RunMacro { path: None, trigger: String::new() }, 0.0, 0.0);
+        let k = m.add_node(NodeKind::KeyCheck { key: String::new(), timeout_ms: 0 }, 0.0, 0.0);
+        let p = m.problems();
+        assert!(p.iter().any(|p| p.step == r && p.serious));
+        assert!(p.iter().any(|p| p.step == k && p.serious));
     }
 }

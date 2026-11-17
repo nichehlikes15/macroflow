@@ -51,14 +51,15 @@ jobs:
         run: |
           mkdir -p dist
           if [ "${{ runner.os }}" = "macOS" ]; then
-            # A real MacroFlow.app with its icon and all four helpers, zipped so
-            # the download keeps the app's structure and signature.
+            # A real MacroFlow.app with its icon and all four helpers, in a disk
+            # image with an Applications shortcut to drag it onto. MacroFlow's
+            # "Update now" button installs from this same .dmg.
             ./scripts/bundle-macos.sh
-            ditto -c -k --keepParent dist/MacroFlow.app dist/MacroFlow-macos.zip
+            ./scripts/dmg-macos.sh
             rm -rf dist/MacroFlow.app
           else
             # The .exe has the app icon built in (build.rs).
-            cp "target/release/${{ matrix.exe }}" dist/
+            cp "target/release/${{ matrix.exe }}" dist/MacroFlow-windows-x64.exe
           fi
           cp README.md dist/
 
@@ -83,6 +84,6 @@ jobs:
         with:
           generate_release_notes: true
           files: |
-            dist/MacroFlow-macos.zip
-            dist/macroflow.exe
+            dist/MacroFlow-macos-arm64.dmg
+            dist/MacroFlow-windows-x64.exe
           fail_on_unmatched_files: false

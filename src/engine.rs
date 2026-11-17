@@ -7,7 +7,7 @@ use crate::model::*;
 use crate::remote;
 use crate::vision;
 use device_query::{DeviceQuery, DeviceState, Keycode};
-use enigo::{Axis, Button, Coordinate, Direction, Enigo, Key, Keyboard, Mouse, Settings};
+use enigo::{Axis, Button, Direction, Enigo, Key, Keyboard, Mouse, Settings};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -67,6 +67,10 @@ pub enum WorkerMsg {
     Bot(remote::BotState),
     /// The update check finished (`manual` = you asked for it, so say "up to date").
     Update { result: Result<Option<crate::update::UpdateInfo>, String>, manual: bool },
+    /// Installing an update: how far it got.
+    UpdateProgress(String),
+    /// The update was installed (the new app to start), or why it couldn't be.
+    UpdateInstalled(Result<PathBuf, String>),
 }
 
 /// What a drag-a-box selection is for.
@@ -76,6 +80,8 @@ pub enum AreaPurpose {
     ReadText(u64),
     /// The picture a Find image step looks for.
     Template(u64),
+    /// One more picture a Find image step looks for as well.
+    ExtraTemplate(u64),
     /// The only part of the screen a Find image step searches.
     SearchArea(u64),
     /// Where a Click / Move mouse step picks a random spot.
@@ -152,6 +158,20 @@ fn input_err<E: std::fmt::Debug>(e: E) -> String {
     format!("Couldn't send input: {e:?}. {NEEDS_ACCESSIBILITY}")
 }
 
+/// Put the mouse at (x, y) in desktop coordinates. On Windows MacroFlow does this
+/// itself, so positions on every monitor work (enigo only knows the main display).
+fn move_abs(enigo: &mut Enigo, x: i32, y: i32) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        let _ = enigo;
+        crate::platform::move_mouse_abs(x, y).map_err(|e| format!("{e} {NEEDS_ACCESSIBILITY}"))
+    }
+    #[cfg(not(windows))]
+    {
+        enigo.move_mouse(x, y, enigo::Coordinate::Abs).map_err(input_err)
+    }
+}
+
 fn to_button(b: MouseBtn) -> Button {
     match b {
         MouseBtn::Left => Button::Left,
@@ -210,7 +230,12 @@ pub enum Hotkey {
     Pause,
     /// F10: run just the next step (or start the macro one step at a time).
     Step,
+    /// A Trigger step's own hotkey: start the macro at that trigger.
+    Trigger(u64),
 }
+
+/// The Trigger steps' hotkeys the hotkey watcher listens for: (step, key name).
+pub type TriggerKeys = Arc<std::sync::Mutex<Vec<(u64, String)>>>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LogLevel {
@@ -534,15 +559,31 @@ fn failure_screenshot() -> Option<PathBuf> {
     Some(path)
 }
 
-/// Watch for F8 (start / stop) and F9 (pause / resume) in any app.
-pub fn spawn_hotkeys(tx: Tx) {
+/// Watch for F8 (start / stop), F9 (pause / resume), F10 (step) and the Trigger
+/// steps' own hotkeys in any app.
+pub fn spawn_hotkeys(tx: Tx, triggers: TriggerKeys) {
     let _ = thread::Builder::new().name("macroflow-hotkeys".into()).spawn(move || {
         let Ok(ds) = device() else {
             return;
         };
         let (mut f8, mut f9, mut f10) = (false, false, false);
+        let mut held: Vec<u64> = Vec::new();
         loop {
             let keys = ds.get_keys();
+            let names: Vec<String> = keys.iter().map(|k| keys::from_device(*k)).collect();
+            let wanted = triggers.lock().map(|t| t.clone()).unwrap_or_default();
+            for (id, key) in &wanted {
+                let now = names.iter().any(|n| keys::same_key(n, key));
+                let before = held.contains(id);
+                if now && !before {
+                    held.push(*id);
+                    if tx.send(WorkerMsg::Hotkey(Hotkey::Trigger(*id))).is_err() {
+                        return;
+                    }
+                } else if !now && before {
+                    held.retain(|h| h != id);
+                }
+            }
             let now8 = keys.contains(&Keycode::F8);
             let now9 = keys.contains(&Keycode::F9);
             let now10 = keys.contains(&Keycode::F10);
@@ -562,10 +603,18 @@ pub fn spawn_hotkeys(tx: Tx) {
 }
 
 struct Runner<'a> {
-    doc: &'a Macro,
+    /// The macro being played (another file's, while a Run macro file step runs it).
+    doc: Arc<Macro>,
+    /// How many Run macro file steps deep the run is (0 = the macro you opened).
+    nested: u32,
+    /// The Run macro file step in the macro you opened, while another file runs
+    /// (the log and the editor point at it).
+    outer_step: Option<u64>,
     tx: &'a Tx,
     stop: Arc<AtomicBool>,
-    enigo: Enigo,
+    /// Sends input. Made when the first step needs it, so a macro that only works
+    /// things out (variables, If, Run macro file…) runs even without permission.
+    enigo: Option<Enigo>,
     found: Option<(i32, i32)>,
     /// Text from the most recent Read text step (typed by `{text}` in Type text).
     last_text: Option<String>,
@@ -621,7 +670,6 @@ impl<'a> Runner<'a> {
         step_mode: Arc<AtomicBool>,
         last_step: Arc<AtomicU64>,
     ) -> Result<Self, String> {
-        let enigo = Enigo::new(&Settings::default()).map_err(input_err)?;
         if doc.show_clicks {
             // Start the dot's helper now, so it's ready by the first click.
             marker::prepare();
@@ -637,10 +685,12 @@ impl<'a> Runner<'a> {
             doc.failsafe.then(|| (failsafe_hit.clone(), last_auto.clone())),
         );
         Ok(Runner {
-            doc,
+            doc: Arc::new(doc.clone()),
+            nested: 0,
+            outer_step: None,
             tx,
             stop,
-            enigo,
+            enigo: None,
             found: None,
             last_text: None,
             prev_reads: HashMap::new(),
@@ -699,8 +749,8 @@ impl<'a> Runner<'a> {
             self.tx,
             WorkerMsg::Log(LogEntry {
                 ms: self.started.elapsed().as_millis() as u64,
-                step: self.current,
-                text,
+                step: self.log_step(),
+                text: self.nest_text(text),
                 level,
                 action: None,
             }),
@@ -734,12 +784,37 @@ impl<'a> Runner<'a> {
             self.tx,
             WorkerMsg::Log(LogEntry {
                 ms: self.started.elapsed().as_millis() as u64,
-                step: self.current,
-                text,
+                step: self.log_step(),
+                text: self.nest_text(text),
                 level: LogLevel::Info,
                 action: Some(LogAction { mark, at, to, shot }),
             }),
         );
+    }
+
+    /// The step in the opened macro that a log line belongs to.
+    fn log_step(&self) -> Option<u64> {
+        if self.nested > 0 {
+            self.outer_step
+        } else {
+            self.current
+        }
+    }
+
+    /// Log lines from another macro file are indented.
+    fn nest_text(&self, text: String) -> String {
+        if self.nested > 0 {
+            format!("{}↳ {text}", "  ".repeat(self.nested as usize - 1))
+        } else {
+            text
+        }
+    }
+
+    /// Tell the editor about a step (only steps of the macro it shows).
+    fn send_step(&self, m: WorkerMsg) {
+        if self.nested == 0 {
+            send(self.tx, m);
+        }
     }
 
     /// How to turn saved positions into positions on this screen right now.
@@ -952,7 +1027,21 @@ impl<'a> Runner<'a> {
                 self.current = Some(id);
                 let what = if node.kind.is_group() { "group" } else { "step" };
                 self.log(LogLevel::Info, format!("⊘ Skipped “{}” (disabled {what})", node.label()));
-                send(self.tx, WorkerMsg::StepResult { step: id, text: "⊘ skipped".into(), ok: true });
+                self.send_step(WorkerMsg::StepResult { step: id, text: "⊘ skipped".into(), ok: true });
+                let (port, to) = self.doc.skip_target(id);
+                cur = to;
+                if cur.is_none() {
+                    self.ended_at = Some(EndAt::Dangling(id, port));
+                }
+                continue;
+            }
+            // A step from a newer MacroFlow (or a damaged file): skip it like a disabled one.
+            if let NodeKind::Unknown { raw } = &node.kind {
+                self.sleep(0)?;
+                self.current = Some(id);
+                let t = raw.get("type").and_then(|t| t.as_str()).unwrap_or("?");
+                self.log(LogLevel::Warn, format!("⊘ Skipped a “{t}” step: this version of MacroFlow can't run it"));
+                self.send_step(WorkerMsg::StepResult { step: id, text: "⊘ unknown, skipped".into(), ok: false });
                 let (port, to) = self.doc.skip_target(id);
                 cur = to;
                 if cur.is_none() {
@@ -962,9 +1051,11 @@ impl<'a> Runner<'a> {
             }
             // Hold here while paused.
             self.sleep(0)?;
-            send(self.tx, WorkerMsg::Active(Some(id)));
+            self.send_step(WorkerMsg::Active(Some(id)));
             self.current = Some(id);
-            self.last_step.store(id, Ordering::Relaxed);
+            if self.nested == 0 {
+                self.last_step.store(id, Ordering::Relaxed);
+            }
             // Breakpoints and step-by-step mode pause *before* the step runs.
             let stepping = self.step_mode.load(Ordering::Relaxed);
             if node.breakpoint || stepping {
@@ -1014,9 +1105,29 @@ impl<'a> Runner<'a> {
                     .iter()
                     .find(|n| matches!(n.kind, NodeKind::GroupIn))
                     .map(|n| n.id);
-                if let Some(s) = inner_start {
-                    if let Exit::Ended = self.walk(s, iteration, total, first)? {
-                        return Ok(Exit::Ended);
+                // A group can be tried again (from its start) when a step inside it goes
+                // wrong, and can carry on after itself if it still goes wrong.
+                let max = node.retries.min(100);
+                let mut tries = 0u32;
+                while let Some(s) = inner_start {
+                    match self.walk(s, iteration, total, first) {
+                        Ok(Exit::Ended) => return Ok(Exit::Ended),
+                        Ok(Exit::LeftGroup) => break,
+                        Err(e) if e == STOPPED || self.stop.load(Ordering::Relaxed) => return Err(e),
+                        Err(e) if tries < max => {
+                            tries += 1;
+                            self.current = Some(id);
+                            self.log(LogLevel::Warn, format!("↻ {e} – running the group again ({tries}/{max})"));
+                            self.status(format!("↻ Retrying “{}” ({tries}/{max})…", node.label()));
+                            self.sleep(self.scaled(node.retry_wait_ms))?;
+                        }
+                        Err(e) if node.continue_on_error => {
+                            self.current = Some(id);
+                            self.log(LogLevel::Warn, format!("✗ {e} – carrying on after the group"));
+                            self.send_step(WorkerMsg::StepResult { step: id, text: "✗ went wrong → carried on".into(), ok: false });
+                            break;
+                        }
+                        Err(e) => return Err(e),
                     }
                 }
                 self.current = Some(id);
@@ -1042,7 +1153,19 @@ impl<'a> Runner<'a> {
                 }
             }
             self.note = None;
-            let result = self.exec_with_retries(&node)?;
+            let result = match self.exec_with_retries(&node) {
+                // "If it goes wrong, carry on": a check goes down its last path ("not
+                // found", "no"…), any other step carries on along its output.
+                Err(e) if node.continue_on_error && e != STOPPED && !self.stop.load(Ordering::Relaxed) => {
+                    self.release_all();
+                    marker::hide();
+                    let port = node.kind.outputs().len().saturating_sub(1);
+                    self.log(LogLevel::Warn, format!("✗ {e} – carrying on"));
+                    self.note = Some("✗ went wrong".into());
+                    Some(port)
+                }
+                r => r?,
+            };
             self.send_vars();
             match result {
                 Some(p) => {
@@ -1060,7 +1183,7 @@ impl<'a> Runner<'a> {
                         (None, None) => "✓".to_string(),
                     };
                     let ok = p == 0 || matches!(node.kind, NodeKind::Loop { .. });
-                    send(self.tx, WorkerMsg::StepResult { step: id, text, ok });
+                    self.send_step(WorkerMsg::StepResult { step: id, text, ok });
                     cur = self.doc.next(id, p);
                     if cur.is_none() {
                         self.ended_at = Some(EndAt::Dangling(id, p));
@@ -1147,7 +1270,7 @@ impl<'a> Runner<'a> {
             let base = match target {
                 Target::Fixed => Some((x, y)),
                 Target::Current if jitter == 0 => return Ok(None),
-                Target::Current => Some(self.enigo.location().map_err(input_err)?),
+                Target::Current => Some(self.input()?.location().map_err(input_err)?),
                 Target::FoundImage => Some(
                     self.found
                         .map(|(fx, fy)| (fx + ox, fy + oy))
@@ -1190,7 +1313,7 @@ impl<'a> Runner<'a> {
     /// `move_to` at this step's own speed (percent; 0 = the macro's mouse speed).
     fn move_to_at(&mut self, x: i32, y: i32, step_speed: u32) -> Result<(), String> {
         if self.doc.human_mouse {
-            if let Ok(from) = self.enigo.location() {
+            if let Ok(from) = self.input()?.location() {
                 let (dx, dy) = ((x - from.0) as f64, (y - from.1) as f64);
                 let dist = (dx * dx + dy * dy).sqrt();
                 if dist >= 3.0 {
@@ -1208,7 +1331,7 @@ impl<'a> Runner<'a> {
     /// Put the mouse straight at (x, y).
     fn jump_to(&mut self, x: i32, y: i32) -> Result<(), String> {
         self.last_auto.store(pack_point(x, y), Ordering::Relaxed);
-        self.enigo.move_mouse(x, y, Coordinate::Abs).map_err(input_err)
+        move_abs(self.input()?, x, y)
     }
 
     /// Move the mouse from `from` to `to` over `ms`, easing in and out. With `curved`,
@@ -1261,7 +1384,7 @@ impl<'a> Runner<'a> {
             // We're pressing Esc ourselves – don't treat it as "stop".
             self.suppress_esc_until.store(now_ms() + 800, Ordering::Relaxed);
         }
-        self.enigo.key(key, dir).map_err(input_err)?;
+        self.input()?.key(key, dir).map_err(input_err)?;
         match dir {
             Direction::Press => self.held_keys.push(key),
             Direction::Release => self.held_keys.retain(|k| *k != key),
@@ -1271,12 +1394,21 @@ impl<'a> Runner<'a> {
     }
 
     fn release_all(&mut self) {
+        let Some(enigo) = self.enigo.as_mut() else { return };
         for key in std::mem::take(&mut self.held_keys).into_iter().rev() {
-            let _ = self.enigo.key(key, Direction::Release);
+            let _ = enigo.key(key, Direction::Release);
         }
         for b in std::mem::take(&mut self.held_buttons) {
-            let _ = self.enigo.button(b, Direction::Release);
+            let _ = enigo.button(b, Direction::Release);
         }
+    }
+
+    /// What sends mouse and keyboard input (made the first time it's needed).
+    fn input(&mut self) -> Result<&mut Enigo, String> {
+        if self.enigo.is_none() {
+            self.enigo = Some(Enigo::new(&Settings::default()).map_err(input_err)?);
+        }
+        Ok(self.enigo.as_mut().expect("just made"))
     }
 
     /// Run one step. Returns which output to follow (None = stop here).
@@ -1312,6 +1444,93 @@ impl<'a> Runner<'a> {
         match &node.kind {
             NodeKind::Start | NodeKind::GroupIn | NodeKind::Group { .. } | NodeKind::Trigger { .. } => Ok(Some(0)),
             NodeKind::End | NodeKind::GroupOut => Ok(None),
+            NodeKind::Unknown { .. } => Ok(Some(0)),
+
+            NodeKind::KeyCheck { key, timeout_ms } => {
+                let key = key.trim();
+                if key.is_empty() {
+                    return Err("A Key check step has no key yet. Choose one with “Capture key”.".into());
+                }
+                let ds = device()?;
+                let label = keys::label(key);
+                let t0 = Instant::now();
+                loop {
+                    let held = ds.get_keys().iter().any(|k| keys::same_key(&keys::from_device(*k), key));
+                    if held {
+                        self.log(LogLevel::Info, format!("{label} is held down"));
+                        self.note = Some(format!("{label} pressed"));
+                        return Ok(Some(0));
+                    }
+                    let waited = t0.elapsed().as_millis() as u64;
+                    if waited >= *timeout_ms {
+                        let after = if *timeout_ms > 0 { format!(" after {:.1}s", waited as f32 / 1000.0) } else { String::new() };
+                        self.log(LogLevel::Info, format!("{label} isn't held down{after}"));
+                        self.note = Some(format!("{label} not pressed"));
+                        return Ok(Some(1));
+                    }
+                    if *timeout_ms > 0 {
+                        self.status(format!("⌨ Waiting for {label}…   (Esc to stop)"));
+                    }
+                    self.sleep(15)?;
+                }
+            }
+
+            NodeKind::RunMacro { path, trigger } => {
+                let path = path
+                    .as_ref()
+                    .ok_or_else(|| "A Run macro file step has no file yet. Choose one.".to_string())?;
+                if self.nested >= 8 {
+                    return Err("Macro files run each other more than 8 deep. Does one run itself?".into());
+                }
+                let file = path.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default();
+                let (sub, warnings) =
+                    load_macro_file(path).map_err(|e| format!("Couldn't open {}: {e}", path.display()))?;
+                for w in warnings {
+                    self.log(LogLevel::Warn, format!("{file}: {w}"));
+                }
+                let trigger = trigger.trim();
+                let start = if trigger.is_empty() {
+                    sub.start_id().ok_or_else(|| format!("{file} has no Start step."))?
+                } else {
+                    let want = command_name(trigger);
+                    sub.triggers()
+                        .into_iter()
+                        .find(|(_, n)| command_name(n) == want)
+                        .map(|(id, _)| id)
+                        .ok_or_else(|| format!("{file} has no trigger called /{want}."))?
+                };
+                self.log(LogLevel::Info, format!("▶ Running {file}"));
+                self.status(format!("▶ Running {file}…   (Esc to stop)"));
+                // Play the other file with this run's variables, then come back here.
+                let doc = std::mem::replace(&mut self.doc, Arc::new(sub));
+                let loops = std::mem::take(&mut self.loops);
+                let ended_at = self.ended_at.take();
+                let scale = self.scale;
+                if self.nested == 0 {
+                    self.outer_step = Some(node.id);
+                }
+                self.nested += 1;
+                let mut first = true;
+                let result = self.walk(start, 1, 1, &mut first);
+                self.nested -= 1;
+                self.doc = doc;
+                self.loops = loops;
+                self.ended_at = ended_at;
+                self.scale = scale;
+                self.current = Some(node.id);
+                if self.nested == 0 {
+                    self.outer_step = None;
+                }
+                match result {
+                    Ok(_) => {
+                        self.log(LogLevel::Good, format!("✓ {file} finished"));
+                        self.note = Some(format!("ran {file}"));
+                        Ok(Some(0))
+                    }
+                    Err(e) if e == STOPPED || self.nested > 0 => Err(e),
+                    Err(e) => Err(format!("in {file}: {e}")),
+                }
+            }
 
             NodeKind::Click {
                 target,
@@ -1348,7 +1567,7 @@ impl<'a> Runner<'a> {
                     if i > 0 {
                         self.sleep(60)?;
                     }
-                    self.enigo.button(b, Direction::Click).map_err(input_err)?;
+                    self.input()?.button(b, Direction::Click).map_err(input_err)?;
                 }
                 self.mark_click();
                 Ok(Some(0))
@@ -1433,7 +1652,7 @@ impl<'a> Runner<'a> {
                             self.jump_to(x, y)?;
                         }
                         self.sleep(12)?;
-                        self.enigo.button(b, Direction::Click).map_err(input_err)?;
+                        self.input()?.button(b, Direction::Click).map_err(input_err)?;
                         let wobble = self.random(gap / 3);
                         self.sleep(gap - gap / 6 + wobble)?;
                     }
@@ -1443,7 +1662,7 @@ impl<'a> Runner<'a> {
                 self.mark(*from_x, *from_y, true);
                 self.move_to(*from_x, *from_y)?;
                 self.sleep(40)?;
-                self.enigo.button(b, Direction::Press).map_err(input_err)?;
+                self.input()?.button(b, Direction::Press).map_err(input_err)?;
                 self.held_buttons.push(b);
                 // While dragging, a ring shows where it'll let go.
                 self.mark(*to_x, *to_y, false);
@@ -1455,7 +1674,7 @@ impl<'a> Runner<'a> {
                 let human = self.doc.human_mouse;
                 self.glide((*from_x, *from_y), (*to_x, *to_y), ms, human)?;
                 self.sleep(80)?;
-                self.enigo.button(b, Direction::Release).map_err(input_err)?;
+                self.input()?.button(b, Direction::Release).map_err(input_err)?;
                 self.held_buttons.retain(|h| *h != b);
                 self.mark_click();
                 self.log_action(
@@ -1489,7 +1708,7 @@ impl<'a> Runner<'a> {
                     let shown: String = text.chars().take(40).collect();
                     let more = if text.chars().count() > 40 { "…" } else { "" };
                     self.log_action(format!("T Typed “{shown}{more}”"), vision::Mark::None, None, None);
-                    self.enigo.text(&text).map_err(input_err)?;
+                    self.input()?.text(&text).map_err(input_err)?;
                 }
                 if *press_enter {
                     self.sleep(20)?;
@@ -1521,7 +1740,7 @@ impl<'a> Runner<'a> {
                         let gap = if self.doc.human_mouse { 30 + self.random(30) } else { 35 };
                         self.sleep(gap)?;
                     }
-                    scroll_click(&mut self.enigo, *amount < 0, *horizontal, *strength)?;
+                    scroll_click(self.input()?, *amount < 0, *horizontal, *strength)?;
                 }
                 Ok(Some(0))
             }
@@ -1543,14 +1762,14 @@ impl<'a> Runner<'a> {
                                 None,
                             );
                             let b = to_button(*button);
-                            self.enigo.button(b, Direction::Press).map_err(input_err)?;
+                            self.input()?.button(b, Direction::Press).map_err(input_err)?;
                             self.held_buttons.push(b);
                             self.mark_click();
                         }
                         RecAction::Up { button, x, y } => {
                             self.jump_to(*x, *y)?;
                             let b = to_button(*button);
-                            self.enigo.button(b, Direction::Release).map_err(input_err)?;
+                            self.input()?.button(b, Direction::Release).map_err(input_err)?;
                             self.held_buttons.retain(|h| *h != b);
                         }
                         RecAction::KeyDown { key } => {
@@ -1561,6 +1780,27 @@ impl<'a> Runner<'a> {
                         RecAction::KeyUp { key } => {
                             if let Some(k) = keys::to_enigo(key) {
                                 self.send_key(k, Direction::Release)?;
+                            }
+                        }
+                        RecAction::Scroll { amount, horizontal, x, y } => {
+                            self.jump_to(*x, *y)?;
+                            let dir = match (*horizontal, *amount < 0) {
+                                (false, false) => "down",
+                                (false, true) => "up",
+                                (true, false) => "right",
+                                (true, true) => "left",
+                            };
+                            self.log_action(
+                                format!("⇵ Scrolled {dir} {}× (recording)", amount.unsigned_abs()),
+                                vision::Mark::Scroll,
+                                Some((*x, *y)),
+                                None,
+                            );
+                            for i in 0..amount.unsigned_abs().min(200) {
+                                if i > 0 {
+                                    self.sleep(30)?;
+                                }
+                                scroll_click(self.input()?, *amount < 0, *horizontal, 1)?;
                             }
                         }
                     }
@@ -1577,19 +1817,34 @@ impl<'a> Runner<'a> {
                 click_when_found,
                 search_area,
                 until_gone,
+                more_templates,
             } => {
                 let area = search_area.map(|r| (r.x, r.y, r.w, r.h));
                 let path = template
                     .as_ref()
                     .ok_or_else(|| "A Find image step has no image yet – snip or choose one.".to_string())?;
-                let tpl = vision::load_template(path)?;
-                // On a bigger or smaller screen, the picture is bigger or smaller too.
-                let tpl = if (self.scale - 1.0).abs() > 0.03 {
-                    let w = ((tpl.width() as f64 * self.scale).round() as u32).max(4);
-                    let h = ((tpl.height() as f64 * self.scale).round() as u32).max(4);
-                    image::imageops::resize(&tpl, w, h, image::imageops::FilterType::Triangle)
-                } else {
-                    tpl
+                // The main picture first, then any others: the first one found wins.
+                let paths: Vec<&PathBuf> = std::iter::once(path).chain(more_templates.iter()).collect();
+                let mut tpls = Vec::with_capacity(paths.len());
+                for p in &paths {
+                    let tpl = vision::load_template(p)?;
+                    // On a bigger or smaller screen, the picture is bigger or smaller too.
+                    let tpl = if (self.scale - 1.0).abs() > 0.03 {
+                        let w = ((tpl.width() as f64 * self.scale).round() as u32).max(4);
+                        let h = ((tpl.height() as f64 * self.scale).round() as u32).max(4);
+                        image::imageops::resize(&tpl, w, h, image::imageops::FilterType::Triangle)
+                    } else {
+                        tpl
+                    };
+                    tpls.push(tpl);
+                }
+                let several = tpls.len() > 1;
+                let picture_name = |i: usize| -> String {
+                    paths
+                        .get(i)
+                        .and_then(|p| p.file_stem())
+                        .map(|s| s.to_string_lossy().to_string())
+                        .unwrap_or_default()
                 };
                 let t0 = Instant::now();
                 if *until_gone {
@@ -1598,16 +1853,23 @@ impl<'a> Runner<'a> {
                         if self.stop.load(Ordering::Relaxed) {
                             return Err(STOPPED.into());
                         }
-                        let (hit, view) = vision::locate_in_seen(&tpl, *threshold, area)?;
+                        let (which, hit, view) = vision::locate_any_in_seen(&tpls, *threshold, area)?;
                         let waited = t0.elapsed().as_millis() as u64;
                         if !hit.found || waited >= *timeout_ms {
                             let secs = waited as f32 / 1000.0;
-                            let caption = if hit.found {
+                            let caption = if hit.found && several {
+                                format!(
+                                    "Still there after {secs:.1}s (picture {} “{}”, {:.0}% match)",
+                                    which + 1,
+                                    picture_name(which),
+                                    hit.score * 100.0
+                                )
+                            } else if hit.found {
                                 format!("Still there after {secs:.1}s ({:.0}% match)", hit.score * 100.0)
                             } else {
                                 format!("Gone after {secs:.1}s")
                             };
-                            if let Some(view) = view {
+                            if let (Some(view), true) = (view, self.nested == 0) {
                                 send_seen(self.tx, node.id, view, caption.clone(), !hit.found);
                             }
                             self.status(format!("◎ {caption}"));
@@ -1626,11 +1888,16 @@ impl<'a> Runner<'a> {
                     if self.stop.load(Ordering::Relaxed) {
                         return Err(STOPPED.into());
                     }
-                    let (hit, view) = vision::locate_in_seen(&tpl, *threshold, area)?;
+                    let (which, hit, view) = vision::locate_any_in_seen(&tpls, *threshold, area)?;
+                    let which_text = if several {
+                        format!(" (picture {} “{}”)", which + 1, picture_name(which))
+                    } else {
+                        String::new()
+                    };
                     let gave_up = !hit.found && t0.elapsed().as_millis() as u64 >= *timeout_ms;
-                    if let (Some(view), true) = (view, hit.found || gave_up) {
+                    if let (Some(view), true) = (view, (hit.found || gave_up) && self.nested == 0) {
                         let caption = if hit.found {
-                            format!("Found at ({}, {}), {:.0}% match", hit.x, hit.y, hit.score * 100.0)
+                            format!("Found{which_text} at ({}, {}), {:.0}% match", hit.x, hit.y, hit.score * 100.0)
                         } else {
                             format!(
                                 "Not found: the closest was a {:.0}% match (needs {:.0}%)",
@@ -1645,15 +1912,19 @@ impl<'a> Runner<'a> {
                         self.found = Some((hit.x, hit.y));
                         self.vars.insert("found_x".into(), hit.x.to_string());
                         self.vars.insert("found_y".into(), hit.y.to_string());
+                        self.vars.insert("found_image".into(), (which + 1).to_string());
+                        if several {
+                            self.note = Some(format!("found #{} {:.0}%", which + 1, hit.score * 100.0));
+                        }
                         self.status(format!(
-                            "◎ Found image at ({}, {}) – {:.0}% match",
+                            "◎ Found image{which_text} at ({}, {}) – {:.0}% match",
                             hit.x,
                             hit.y,
                             hit.score * 100.0
                         ));
                         self.log(
                             LogLevel::Info,
-                            format!("Found at ({}, {}), {:.0}% match", hit.x, hit.y, hit.score * 100.0),
+                            format!("Found{which_text} at ({}, {}), {:.0}% match", hit.x, hit.y, hit.score * 100.0),
                         );
                         if *click_when_found {
                             self.mark(hit.x, hit.y, true);
@@ -1665,7 +1936,7 @@ impl<'a> Runner<'a> {
                                 Some((hit.x, hit.y)),
                                 None,
                             );
-                            self.enigo
+                            self.input()?
                                 .button(Button::Left, Direction::Click)
                                 .map_err(input_err)?;
                             self.mark_click();
@@ -1673,6 +1944,7 @@ impl<'a> Runner<'a> {
                         return Ok(Some(0));
                     }
                     if t0.elapsed().as_millis() as u64 >= *timeout_ms {
+                        self.vars.insert("found_image".into(), "0".into());
                         self.note = Some(format!("best {:.0}%", hit.score.max(0.0) * 100.0));
                         self.status(format!(
                             "◎ Image not found (best {:.0}% match) – taking the “not found” path",
@@ -2133,6 +2405,8 @@ pub fn record_macro(tx: Tx, stop: Arc<AtomicBool>, record_moves: bool) {
         let mut last_move = Instant::now();
         let mut last_pos = ds.get_mouse().coords;
         let mut stopped_by_button = false;
+        // The scroll wheel isn't something device_query can read, so it's heard separately.
+        let wheel = crate::platform::WheelWatch::start();
 
         loop {
             if stop.load(Ordering::Relaxed) {
@@ -2180,7 +2454,28 @@ pub fn record_macro(tx: Tx, stop: Arc<AtomicBool>, record_moves: bool) {
                 }
             }
             prev_keys = keys_now;
+            if let Some(w) = &wheel {
+                let (v, h) = w.take();
+                for (amount, horizontal) in [(v, false), (h, true)] {
+                    if amount == 0 {
+                        continue;
+                    }
+                    // Turning the wheel steadily: add to the scroll just before, if
+                    // nothing else happened in between.
+                    let gap = now.duration_since(last).as_millis() as u64;
+                    if let Some(RecEvent { action: RecAction::Scroll { amount: a, horizontal: hz, x, y }, .. }) =
+                        events.last_mut()
+                    {
+                        if *hz == horizontal && (*a < 0) == (amount < 0) && gap < 250 && (*x, *y) == (mx, my) {
+                            *a += amount;
+                            continue;
+                        }
+                    }
+                    push(&mut events, &mut last, now, RecAction::Scroll { amount, horizontal, x: mx, y: my });
+                }
+            }
         }
+        drop(wheel);
 
         if stopped_by_button {
             // Drop the click on MacroFlow's own Stop button.
@@ -2200,7 +2495,7 @@ pub fn record_macro(tx: Tx, stop: Arc<AtomicBool>, record_moves: bool) {
                 RecAction::KeyUp { key } => down_keys.retain(|k| k != key),
                 RecAction::Down { button, x, y } => down_btns.push((*button, *x, *y)),
                 RecAction::Up { button, .. } => down_btns.retain(|(b, _, _)| b != button),
-                RecAction::Move { .. } => {}
+                RecAction::Move { .. } | RecAction::Scroll { .. } => {}
             }
         }
         for key in down_keys.into_iter().rev() {
@@ -2411,7 +2706,7 @@ pub fn test_find(
             }
             if hit.found {
                 if let Ok(mut e) = Enigo::new(&Settings::default()) {
-                    let _ = e.move_mouse(hit.x, hit.y, Coordinate::Abs);
+                    let _ = move_abs(&mut e, hit.x, hit.y);
                 }
                 Ok(format!(
                     "✓ Found at ({}, {}) – {:.0}% match in {ms} ms. The mouse is pointing at it.",
@@ -2465,7 +2760,7 @@ pub fn capture_for_area(tx: Tx, stop: Arc<AtomicBool>, countdown_first: bool, pu
             );
             let hint = match purpose {
                 AreaPurpose::ReadText(_) => "Drag a box around the text or number to read",
-                AreaPurpose::Template(_) => "Drag a box around what to look for",
+                AreaPurpose::Template(_) | AreaPurpose::ExtraTemplate(_) => "Drag a box around what to look for",
                 AreaPurpose::SearchArea(_) => "Drag a box around where the image can appear",
                 AreaPurpose::ClickArea(_) => "Drag a box around where to click",
             };
@@ -2518,7 +2813,7 @@ pub fn capture_for_editor(tx: Tx, stop: Arc<AtomicBool>, step: u64, at: Option<(
 pub fn crop_area(tx: Tx, shot: vision::Shot, sel: (u32, u32, u32, u32), purpose: AreaPurpose) {
     thread::spawn(move || {
         let result = (|| -> Result<PathBuf, String> {
-            let to_points = matches!(purpose, AreaPurpose::Template(_));
+            let to_points = matches!(purpose, AreaPurpose::Template(_) | AreaPurpose::ExtraTemplate(_));
             let img = vision::crop_shot(&shot, sel.0, sel.1, sel.2, sel.3, to_points)?;
             let dir = images_dir();
             std::fs::create_dir_all(&dir).map_err(|e| format!("Couldn't create {}: {e}", dir.display()))?;

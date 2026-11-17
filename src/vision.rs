@@ -123,6 +123,46 @@ pub fn locate_in_seen(
     Ok((hit, view))
 }
 
+/// Like `locate_in_seen`, for several pictures on one screenshot: the first one that
+/// is found wins. Returns which picture (an index into `templates`), its hit and the
+/// view. When none is found, the index is the closest one.
+pub fn locate_any_in_seen(
+    templates: &[GrayImage],
+    threshold: f32,
+    area: Option<(i32, i32, i32, i32)>,
+) -> Result<(usize, Hit, Option<RgbaImage>), String> {
+    let first = templates.first().ok_or_else(|| "There's no picture to look for.".to_string())?;
+    let screens = match area {
+        Some((x, y, w, h)) => {
+            let too_small = templates
+                .iter()
+                .any(|t| (w as u32) < t.width() / 2 || (h as u32) < t.height() / 2);
+            if too_small {
+                return Err("The search area is smaller than an image to find. Select a bigger search area.".into());
+            }
+            capture_search_area(x, y, w, h)?
+        }
+        None => capture_all()?,
+    };
+    let mut best: Option<(usize, Hit)> = None;
+    for (i, t) in templates.iter().enumerate() {
+        let hit = locate_on(&screens, t, threshold)?;
+        if hit.found {
+            best = Some((i, hit));
+            break;
+        }
+        if best.as_ref().is_none_or(|(_, b)| hit.score > b.score) {
+            best = Some((i, hit));
+        }
+    }
+    let (i, hit) = match best {
+        Some(b) => b,
+        None => (0, locate_on(&screens, first, threshold)?),
+    };
+    let view = seen_view(&screens, &hit, area.is_some());
+    Ok((i, hit, view))
+}
+
 fn seen_view(screens: &[Screen], hit: &Hit, whole: bool) -> Option<RgbaImage> {
     let s = screens.iter().find(|s| {
         hit.x >= s.ox && hit.y >= s.oy && hit.x < s.ox + s.gray.width() as i32 && hit.y < s.oy + s.gray.height() as i32

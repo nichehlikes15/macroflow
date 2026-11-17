@@ -245,6 +245,8 @@ enum Field {
     TriggerRepeat,
     TriggerInputs,
     TriggerEvery,
+    TriggerTimes,
+    RunTrigger,
     Retries,
     RetryWait,
     HookUrl,
@@ -268,6 +270,8 @@ impl Field {
             self,
             Field::TriggerName
                 | Field::TriggerInputs
+                | Field::TriggerTimes
+                | Field::RunTrigger
                 | Field::HookUrl
                 | Field::HookMessage
                 | Field::HookBody
@@ -431,11 +435,19 @@ pub struct MacroApp {
     schedules_on: bool,
     /// When each scheduled trigger runs next.
     schedule_next: HashMap<u64, Instant>,
+    /// Times of day already run today: (trigger, day, hour, minute).
+    daily_done: std::collections::HashSet<(u64, i64, u32, u32)>,
+    /// The Trigger steps' hotkeys, shared with the hotkey watcher.
+    trigger_keys: engine::TriggerKeys,
     /// The countdown second last drawn in the status bar.
     sched_shown: Option<u64>,
     /// A newer MacroFlow found on GitHub.
     update: Option<UpdateInfo>,
     update_checking: bool,
+    /// Downloading and installing an update right now (what it's doing).
+    update_installing: Option<String>,
+    /// An update is installed: start this when MacroFlow quits.
+    relaunch: Option<PathBuf>,
 }
 
 /// A "How it works" sheet: explanations that would crowd the settings panel.
@@ -479,7 +491,8 @@ impl MacroApp {
             }
         });
         vision::warm_up_selector();
-        engine::spawn_hotkeys(tx.clone());
+        let trigger_keys: engine::TriggerKeys = Default::default();
+        engine::spawn_hotkeys(tx.clone(), trigger_keys.clone());
         let poll = cx.spawn_in(window, async move |this, cx| loop {
             cx.background_executor()
                 .timer(Duration::from_millis(33))
@@ -506,9 +519,13 @@ impl MacroApp {
             pending_inputs: Vec::new(),
             schedules_on: false,
             schedule_next: HashMap::new(),
+            daily_done: std::collections::HashSet::new(),
+            trigger_keys,
             sched_shown: None,
             update: None,
             update_checking: false,
+            update_installing: None,
+            relaunch: None,
             focus,
             doc: first_doc.clone(),
             path: None,
@@ -596,6 +613,7 @@ impl MacroApp {
 
     fn drain(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let mut changed = self.tick_schedules();
+        self.sync_trigger_keys();
         while let Ok(msg) = self.rx.try_recv() {
             changed = true;
             match msg {
@@ -612,6 +630,27 @@ impl MacroApp {
                 }
                 WorkerMsg::Remote { cmd, reply } => self.on_remote(cmd, reply),
                 WorkerMsg::Update { result, manual } => self.on_update_result(result, manual),
+                WorkerMsg::UpdateProgress(s) => {
+                    self.status = s.clone();
+                    self.update_installing = Some(s);
+                }
+                WorkerMsg::UpdateInstalled(result) => {
+                    self.update_installing = None;
+                    match result {
+                        Ok(app) => {
+                            self.relaunch = Some(app);
+                            self.info = None;
+                            self.status = "Update installed. MacroFlow restarts with the new version now…".into();
+                            // Quit (asking to save first if needed); the new version starts as this one closes.
+                            if self.confirm_close(AfterSave::Quit, window, cx) {
+                                self.quit_now(cx);
+                            } else {
+                                self.status = "Update installed. It starts the next time MacroFlow opens (or when you quit now).".into();
+                            }
+                        }
+                        Err(e) => self.status = format!("Couldn't install the update: {e}"),
+                    }
+                }
                 WorkerMsg::Bot(state) => {
                     if let BotState::Failed(why) = &state {
                         self.status = format!("Discord bot: {why}");
@@ -632,6 +671,13 @@ impl MacroApp {
                     _ => {}
                 },
                 WorkerMsg::Hotkey(Hotkey::Pause) => self.toggle_pause(),
+                WorkerMsg::Hotkey(Hotkey::Trigger(id)) => {
+                    if self.mode == Mode::Idle && self.run_check.is_none() && self.doc.node(id).is_some() {
+                        // Like F8: MacroFlow may be hidden, so problems show as a pop-up.
+                        self.hotkey_start = true;
+                        self.start_run_with(Some(id), false);
+                    }
+                }
                 WorkerMsg::Hotkey(Hotkey::Step) => self.step_once(),
                 WorkerMsg::Pixel { x, y, color } => {
                     if let Mode::Picking(id) = self.mode {
@@ -767,6 +813,17 @@ impl MacroApp {
                                 }
                             });
                             self.status = format!("Saved {}. Use “Test now” to check it.", path.display());
+                        }
+                        AreaPurpose::ExtraTemplate(id) => {
+                            self.forget_seen(id);
+                            let mut n = 0;
+                            self.update_node(id, |k| {
+                                if let NodeKind::FindImage { more_templates, .. } = k {
+                                    more_templates.push(path.clone());
+                                    n = more_templates.len() + 1;
+                                }
+                            });
+                            self.status = format!("Added picture {n}. The step now looks for any of {n} pictures.");
                         }
                         AreaPurpose::SearchArea(_) | AreaPurpose::ClickArea(_) => {}
                     }
@@ -1414,6 +1471,32 @@ impl MacroApp {
     }
 
     /// Don't offer this version again.
+    /// Download and install the update in the background.
+    fn install_update(&mut self) {
+        let Some(u) = self.update.clone() else { return };
+        if self.update_installing.is_some() || !self.idle() {
+            return;
+        }
+        self.update_installing = Some("Starting the download…".into());
+        self.status = "Starting the download…".into();
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let p = tx.clone();
+            let result = update::install(&u, &move |s| {
+                let _ = p.send(WorkerMsg::UpdateProgress(s));
+            });
+            let _ = tx.send(WorkerMsg::UpdateInstalled(result));
+        });
+    }
+
+    /// Quit, starting the newly installed version if there is one.
+    fn quit_now(&mut self, cx: &mut Context<Self>) {
+        if let Some(app) = self.relaunch.take() {
+            update::relaunch(&app);
+        }
+        cx.quit();
+    }
+
     fn skip_update(&mut self) {
         if let Some(u) = self.update.take() {
             let mut next = self.remote.clone();
@@ -1443,11 +1526,78 @@ impl MacroApp {
             .collect()
     }
 
+    /// Tell the hotkey watcher which keys start which trigger.
+    fn sync_trigger_keys(&mut self) {
+        let want: Vec<(u64, String)> = self
+            .doc
+            .root
+            .nodes
+            .iter()
+            .filter(|n| !n.disabled)
+            .filter_map(|n| match &n.kind {
+                NodeKind::Trigger { hotkey, .. } if !hotkey.trim().is_empty() => Some((n.id, hotkey.trim().to_string())),
+                _ => None,
+            })
+            .collect();
+        if let Ok(mut keys) = self.trigger_keys.lock() {
+            if *keys != want {
+                *keys = want;
+            }
+        }
+    }
+
+    /// The top-level triggers that run at times of day: (id, command, times).
+    fn timed_triggers(&self) -> Vec<TimedTrigger> {
+        self.doc
+            .root
+            .nodes
+            .iter()
+            .filter(|n| !n.disabled)
+            .filter_map(|n| match &n.kind {
+                NodeKind::Trigger { name, at_times, .. } => match parse_times(at_times) {
+                    Ok(t) if !t.is_empty() => Some((n.id, command_name(name), t)),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Start any trigger whose time of day has come. Returns true if one started.
+    fn tick_daily(&mut self) -> bool {
+        let timed = self.timed_triggers();
+        if timed.is_empty() {
+            return false;
+        }
+        let (h, m, day) = crate::platform::local_time();
+        let mut changed = false;
+        for (id, name, times) in timed {
+            if !times.contains(&(h, m)) || !self.daily_done.insert((id, day, h, m)) {
+                continue;
+            }
+            changed = true;
+            let label = if name.is_empty() { "a trigger".to_string() } else { format!("/{name}") };
+            if self.mode != Mode::Idle || self.run_check.is_some() {
+                self.status = format!("⏰ Skipped {label} at {h:02}:{m:02}: something else is running.");
+                continue;
+            }
+            self.hotkey_start = true;
+            self.start_run_with(Some(id), false);
+            if self.mode == Mode::Running {
+                self.status = format!("⏰ Started {label} at {h:02}:{m:02}.");
+            }
+        }
+        // Old days aren't needed.
+        self.daily_done.retain(|(_, d, _, _)| *d == day);
+        changed
+    }
+
     /// Start any scheduled trigger that's due. Returns true if something changed.
     fn tick_schedules(&mut self) -> bool {
         if !self.schedules_on {
             return false;
         }
+        let daily = self.tick_daily();
         let now = Instant::now();
         let due: Vec<(u64, String, u32)> = self.scheduled_triggers();
         // Forget triggers that were deleted or had their timer turned off.
@@ -1484,16 +1634,24 @@ impl MacroApp {
             self.sched_shown = shown;
             changed = true;
         }
-        changed
+        changed || daily
     }
 
     fn set_schedules(&mut self, on: bool) {
         self.schedules_on = on;
         // Every trigger starts its countdown again from now.
         self.schedule_next.clear();
-        let n = self.scheduled_triggers().len();
+        // A time that has already passed this minute doesn't run straight away.
+        self.daily_done.clear();
+        if on {
+            let (h, m, day) = crate::platform::local_time();
+            for (id, _, _) in self.timed_triggers() {
+                self.daily_done.insert((id, day, h, m));
+            }
+        }
+        let n = self.scheduled_triggers().len() + self.timed_triggers().len();
         self.status = match (on, n) {
-            (true, 0) => "Schedules are on, but no trigger has “Also run every…” set.".into(),
+            (true, 0) => "Schedules are on, but no trigger has “Also run every…” or “Run at” set.".into(),
             (true, _) => format!("⏱ Schedules on: {n} trigger{} will run on their timers.", if n == 1 { "" } else { "s" }),
             (false, _) => "Schedules off.".into(),
         };
@@ -1875,7 +2033,7 @@ impl MacroApp {
                 });
                 self.status = format!("Area set to {w}×{h} at ({gx}, {gy}). Press “Read now” to test it.");
             }
-            AreaPurpose::Template(_) => self.status = "Saving the picture…".into(),
+            AreaPurpose::Template(_) | AreaPurpose::ExtraTemplate(_) => self.status = "Saving the picture…".into(),
             AreaPurpose::SearchArea(id) => {
                 let _ = std::fs::remove_file(&shot.path);
                 let rect = saved;
@@ -1992,13 +2150,13 @@ impl MacroApp {
         self.stop.store(true, Ordering::Relaxed);
         match after {
             AfterSave::CloseWindow => window.remove_window(),
-            AfterSave::Quit => cx.quit(),
+            AfterSave::Quit => self.quit_now(cx),
         }
     }
 
     fn on_quit(&mut self, _: &crate::Quit, window: &mut Window, cx: &mut Context<Self>) {
         if self.confirm_close(AfterSave::Quit, window, cx) {
-            cx.quit();
+            self.quit_now(cx);
         }
     }
 
@@ -3161,11 +3319,8 @@ impl MacroApp {
     }
 
     fn load(&mut self, path: PathBuf) {
-        let parsed = std::fs::read_to_string(&path)
-            .map_err(|e| e.to_string())
-            .and_then(|s| serde_json::from_str::<Macro>(&s).map_err(|e| e.to_string()));
-        match parsed {
-            Ok(doc) => {
+        match load_macro_file(&path) {
+            Ok((doc, warnings)) => {
                 remember_recent(&path);
                 self.recent = recent_macros();
                 self.show_start = false;
@@ -3186,6 +3341,10 @@ impl MacroApp {
                 self.reset_history();
                 let file = path.file_name().map(|f| f.to_string_lossy().to_string());
                 self.status = format!("Opened {}", file.unwrap_or_else(|| path.display().to_string()));
+                for w in warnings {
+                    self.status.push_str(". ");
+                    self.status.push_str(w.trim_end_matches('.'));
+                }
             }
             Err(e) => self.status = format!("Couldn't open {}: {e}", path.display()),
         }
@@ -3253,6 +3412,63 @@ impl MacroApp {
         .detach();
     }
 
+    fn choose_extra_template(&mut self, id: u64, cx: &mut Context<Self>) {
+        let rx = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: true,
+            prompt: Some("Also look for".into()),
+        });
+        cx.spawn(async move |this, cx| {
+            if let Ok(Ok(Some(paths))) = rx.await {
+                let _ = this.update(cx, |app, cx| {
+                    app.update_node(id, |k| {
+                        if let NodeKind::FindImage { more_templates, .. } = k {
+                            more_templates.extend(paths);
+                        }
+                    });
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
+    fn choose_macro_file(&mut self, id: u64, cx: &mut Context<Self>) {
+        let rx = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Run this macro".into()),
+        });
+        let own = self.path.clone();
+        cx.spawn(async move |this, cx| {
+            if let Ok(Ok(Some(paths))) = rx.await {
+                if let Some(p) = paths.into_iter().next() {
+                    let _ = this.update(cx, |app, cx| {
+                        if own.as_ref() == Some(&p) {
+                            app.status = "A macro can't run its own file (it would never end).".into();
+                        } else {
+                            match load_macro_file(&p) {
+                                Ok(_) => {
+                                    app.update_node(id, |k| {
+                                        if let NodeKind::RunMacro { path, .. } = k {
+                                            *path = Some(p.clone());
+                                        }
+                                    });
+                                    app.status = format!("This step runs {}.", p.display());
+                                }
+                                Err(e) => app.status = format!("Couldn't open {}: {e}", p.display()),
+                            }
+                        }
+                        cx.notify();
+                    });
+                }
+            }
+        })
+        .detach();
+    }
+
     // -----------------------------------------------------------------------
     // Inspector fields
     // -----------------------------------------------------------------------
@@ -3306,6 +3522,8 @@ impl MacroApp {
             (Field::TriggerRepeat, NodeKind::Trigger { repeat, .. }) => repeat.to_string(),
             (Field::TriggerInputs, NodeKind::Trigger { inputs, .. }) => inputs.clone(),
             (Field::TriggerEvery, NodeKind::Trigger { every_min, .. }) => every_min.to_string(),
+            (Field::TriggerTimes, NodeKind::Trigger { at_times, .. }) => at_times.clone(),
+            (Field::RunTrigger, NodeKind::RunMacro { trigger, .. }) => trigger.clone(),
             (Field::Retries, _) => n.retries.to_string(),
             (Field::RetryWait, _) => n.retry_wait_ms.to_string(),
             (Field::HookUrl, NodeKind::Webhook { url, .. }) => url.clone(),
@@ -3389,7 +3607,8 @@ impl MacroApp {
                 NodeKind::FindImage { timeout_ms, .. }
                 | NodeKind::ReadText { timeout_ms, .. }
                 | NodeKind::WindowCheck { timeout_ms, .. }
-                | NodeKind::PixelColor { timeout_ms, .. },
+                | NodeKind::PixelColor { timeout_ms, .. }
+                | NodeKind::KeyCheck { timeout_ms, .. },
             ) => timeout_ms.to_string(),
             (
                 Field::Interval,
@@ -3480,6 +3699,11 @@ impl MacroApp {
                 *inputs = raw.trim().to_string()
             }
             (Field::TriggerEvery, NodeKind::Trigger { every_min, .. }) => *every_min = int()?.clamp(0, 7 * 24 * 60) as u32,
+            (Field::TriggerTimes, NodeKind::Trigger { at_times, .. }) => {
+                let times = parse_times(raw)?;
+                *at_times = times.iter().map(|(h, m)| format!("{h:02}:{m:02}")).collect::<Vec<_>>().join(", ");
+            }
+            (Field::RunTrigger, NodeKind::RunMacro { trigger, .. }) => *trigger = command_name(raw),
             (Field::Retries, _) => n.retries = int()?.clamp(0, 100) as u32,
             (Field::RetryWait, _) => n.retry_wait_ms = int()?.clamp(0, 600_000) as u64,
             (Field::HookUrl, NodeKind::Webhook { url, .. }) => *url = raw.trim().to_string(),
@@ -3608,7 +3832,8 @@ impl MacroApp {
                 NodeKind::FindImage { timeout_ms, .. }
                 | NodeKind::ReadText { timeout_ms, .. }
                 | NodeKind::WindowCheck { timeout_ms, .. }
-                | NodeKind::PixelColor { timeout_ms, .. },
+                | NodeKind::PixelColor { timeout_ms, .. }
+                | NodeKind::KeyCheck { timeout_ms, .. },
             ) => *timeout_ms = int()?.max(0) as u64,
             (
                 Field::Interval,
@@ -3795,13 +4020,19 @@ impl MacroApp {
                         alt: m.alt,
                         ctrl: m.control,
                     };
-                    let label = keys::combo_label(&name, &mods);
+                    let mut label = keys::combo_label(&name, &mods);
                     if let Some(id) = self.selected {
-                        self.update_node(id, |k| {
-                            if let NodeKind::KeyPress { key, mods: md } = k {
-                                *key = name;
+                        self.update_node(id, |k| match k {
+                            NodeKind::KeyPress { key, mods: md } => {
+                                *key = name.clone();
                                 *md = mods;
                             }
+                            // These are one key on its own.
+                            NodeKind::KeyCheck { key, .. } | NodeKind::Trigger { hotkey: key, .. } => {
+                                *key = name.clone();
+                                label = keys::label(&name);
+                            }
+                            _ => {}
                         });
                     }
                     self.capturing_key = false;
@@ -6751,12 +6982,27 @@ impl MacroApp {
                     );
                 };
                 let (intro, how) = match u.kind {
+                    UpdateKind::Release if update::can_install(u) => (
+                        format!("Version {} is out. You have {}.", u.version, update::version_label()),
+                        vec![
+                            "Update now downloads the new version, checks it and puts it in place of this one. MacroFlow then restarts (asking to save first if you have unsaved changes).".to_string(),
+                            "Your macros, images and Remote settings are kept.".to_string(),
+                            if cfg!(target_os = "macos") {
+                                "macOS may ask you to allow Accessibility and Screen Recording again for the new version: turn MacroFlow off and on again in System Settings → Privacy & Security.".to_string()
+                            } else {
+                                "Windows may ask whether to let the new version run the first time it starts.".to_string()
+                            },
+                        ],
+                    ),
                     UpdateKind::Release => (
                         format!("Version {} is out. You have {}.", u.version, update::version_label()),
                         vec![
-                            "Download opens the release page. Get the file for your computer: MacroFlow-macos.zip on a Mac, macroflow.exe on Windows.".to_string(),
+                            match update::installed_app() {
+                                Err(why) => why,
+                                Ok(_) => "This release has no file MacroFlow can install by itself on this computer.".to_string(),
+                            },
+                            "Download opens the release page. Get the file for your computer: the .dmg on a Mac, the .exe on Windows.".to_string(),
                             "Quit MacroFlow, then replace the old app with the new one. Your macros, images and Remote settings are kept.".to_string(),
-                            "On a Mac, you may need to allow Accessibility and Screen Recording again for the new app.".to_string(),
                         ],
                     ),
                     UpdateKind::Commits(n) => (
@@ -7032,19 +7278,46 @@ impl MacroApp {
             return vec![close("Got it  (Esc)").bg(rgb(ACCENT)).text_color(rgb(0xffffff))];
         };
         let url = u.url.clone();
+        let page = |primary: bool| {
+            let b = small_btn("update-download", if primary { "Download" } else { "Release page" });
+            let b = if primary { b.bg(rgb(ACCENT)).text_color(rgb(0xffffff)) } else { b };
+            b.on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                cx.open_url(&url);
+                this.info = None;
+                this.status = "Opened the download page in your browser.".into();
+                cx.notify();
+            }))
+        };
+        if let Some(doing) = &self.update_installing {
+            return vec![small_btn("update-busy", "Installing…").child(div().ml_2().text_color(rgb(MUTED)).child(doing.clone()))];
+        }
+        if !update::can_install(u) {
+            return vec![
+                small_btn("update-skip", "Skip this version").on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                    this.skip_update();
+                    cx.notify();
+                })),
+                close("Later"),
+                page(true),
+            ];
+        }
         vec![
             small_btn("update-skip", "Skip this version").on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                 this.skip_update();
                 cx.notify();
             })),
             close("Later"),
-            small_btn("update-download", "Download")
+            page(false),
+            small_btn("update-install", "Update now")
                 .bg(rgb(ACCENT))
                 .text_color(rgb(0xffffff))
-                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                    cx.open_url(&url);
-                    this.info = None;
-                    this.status = "Opened the download page in your browser.".into();
+                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                    if !this.idle() {
+                        this.status = "Stop the macro (or recording) first, then update.".into();
+                    } else {
+                        this.commit_edit();
+                        this.install_update();
+                    }
                     cx.notify();
                 })),
         ]
@@ -8301,10 +8574,36 @@ impl MacroApp {
                 if n.retries > 0 {
                     general.push(self.num_field("Wait between tries (ms)", Field::RetryWait, 250.0, cx).into_any_element());
                     general.push(
-                        help(if n.kind.is_check() {
+                        help(if n.kind.is_group() {
+                            "Runs the whole group again from its start if a step inside it goes wrong."
+                        } else if n.kind.is_check() {
                             "Tries again if it goes wrong or doesn't find it."
                         } else {
                             "Tries again if it goes wrong."
+                        })
+                        .into_any_element(),
+                    );
+                }
+                let on = n.continue_on_error;
+                general.push(
+                    toggle("n-continue", "If it goes wrong, carry on", on)
+                        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                            if let Some(n) = this.doc.node_mut(id) {
+                                n.continue_on_error = !n.continue_on_error;
+                                this.dirty = true;
+                            }
+                            cx.notify();
+                        }))
+                        .into_any_element(),
+                );
+                if on {
+                    general.push(
+                        help(if n.kind.is_group() {
+                            "If a step inside still goes wrong, the macro carries on after the group instead of stopping."
+                        } else if n.kind.outputs().len() > 1 {
+                            "If it still goes wrong (after any retries), the macro goes down its last path instead of stopping."
+                        } else {
+                            "If it still goes wrong (after any retries), the macro carries on with the next step instead of stopping."
                         })
                         .into_any_element(),
                     );
@@ -8613,6 +8912,22 @@ impl MacroApp {
                 );
             }
             NodeKind::Recording { events, .. } => {
+                out.push(
+                    small_btn("rec-explode", "Turn into separate steps")
+                        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                            this.commit_edit();
+                            match this.doc.recording_into_steps(id) {
+                                Ok(n) => {
+                                    this.dirty = true;
+                                    this.status = format!("Turned the recording into a group of {n} steps. Double-click it to open it, or Ungroup it.");
+                                }
+                                Err(e) => this.status = e,
+                            }
+                            cx.notify();
+                        }))
+                        .into_any_element(),
+                );
+                out.push(help("Makes a group of Click, Drag, Key press, Type text, Scroll and Wait steps from the recording, so you can edit each one, add checks between them and change waits.").into_any_element());
                 out.extend(self.recording_settings(id, events, cx));
             }
             NodeKind::FindImage {
@@ -8688,8 +9003,28 @@ impl MacroApp {
                 out.push(help("e.g. times:number=1, message").into_any_element());
                 out.push(self.num_field("Times to run (0 = until stopped)", Field::TriggerRepeat, 1.0, cx).into_any_element());
                 out.push(self.num_field("Also run every (minutes, 0 = off)", Field::TriggerEvery, 5.0, cx).into_any_element());
-                if let NodeKind::Trigger { every_min, .. } = &n.kind {
-                    if *every_min > 0 && !self.schedules_on {
+                out.push(self.text_field("Also run at (times of day)", Field::TriggerTimes, cx).into_any_element());
+                out.push(help("e.g. 08:30, 17:00 (24-hour clock). Like the timer, this only runs while schedules are on.").into_any_element());
+                out.extend(self.key_picker(id, "Hotkey (from any app)", "trig-key", cx));
+                if let NodeKind::Trigger { hotkey, .. } = &n.kind {
+                    if !hotkey.is_empty() {
+                        out.push(
+                            small_btn("trig-key-clear", "No hotkey")
+                                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                    this.update_node(id, |k| {
+                                        if let NodeKind::Trigger { hotkey, .. } = k {
+                                            hotkey.clear();
+                                        }
+                                    });
+                                    cx.notify();
+                                }))
+                                .into_any_element(),
+                        );
+                        out.push(help("Pressing it in any app starts the macro here, like F8 does for Start.").into_any_element());
+                    }
+                }
+                if let NodeKind::Trigger { every_min, at_times, .. } = &n.kind {
+                    if (*every_min > 0 || !at_times.trim().is_empty()) && !self.schedules_on {
                         out.push(
                             small_btn("trig-sched-on", "Turn schedules on")
                                 .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
@@ -8734,6 +9069,51 @@ impl MacroApp {
                         .into_any_element(),
                 );
                 out.push(self.info_link("trig-info", "How triggers work", InfoTopic::Trigger, cx).into_any_element());
+            }
+            NodeKind::KeyCheck { .. } => {
+                out.extend(self.key_picker(id, "Key", "kc-key", cx));
+                out.push(
+                    div()
+                        .flex()
+                        .flex_wrap()
+                        .gap_1()
+                        .children(
+                            [("shift", "Shift"), ("ctrl", "Ctrl"), ("alt", if cfg!(target_os = "macos") { "Option" } else { "Alt" }), ("cmd", if cfg!(target_os = "macos") { "Cmd" } else { "Win" }), ("space", "Space")]
+                                .into_iter()
+                                .enumerate()
+                                .map(|(i, (name, label))| {
+                                    let on = matches!(&n.kind, NodeKind::KeyCheck { key, .. } if key == name);
+                                    chip(("kc-quick", i), label, on).on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                        this.update_node(id, |k| {
+                                            if let NodeKind::KeyCheck { key, .. } = k {
+                                                *key = name.to_string();
+                                            }
+                                        });
+                                        cx.notify();
+                                    }))
+                                }),
+                        )
+                        .into_any_element(),
+                );
+                out.push(self.num_field("Keep checking for (ms, 0 = just now)", Field::Timeout, 500.0, cx).into_any_element());
+                out.push(help("Follows “pressed” if the key is held down, or “not pressed” if it isn't. With a time, it waits up to that long for you to press it, e.g. hold Shift during a run to take a different path.").into_any_element());
+            }
+            NodeKind::RunMacro { path, .. } => {
+                match path {
+                    Some(p) => out.push(help(&p.display().to_string()).into_any_element()),
+                    None => out.push(help("No macro file chosen yet.").into_any_element()),
+                }
+                out.push(
+                    small_btn("run-file", if path.is_some() { "Choose another file…" } else { "Choose macro file…" })
+                        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.choose_macro_file(id, cx)))
+                        .into_any_element(),
+                );
+                out.push(self.prefixed_field("Start at trigger (empty = Start)", "/", Field::RunTrigger, cx).into_any_element());
+                out.push(help("Runs that macro from its Start (or the trigger named here) until it ends, then carries on here. It shares this run's variables, so it can use and change them. Use it for steps several macros need, so a fix in one file fixes them all.").into_any_element());
+            }
+            NodeKind::Unknown { raw } => {
+                let t = raw.get("type").and_then(|t| t.as_str()).unwrap_or("?").to_string();
+                out.push(help(&format!("This is a “{t}” step, which this version of MacroFlow doesn't know (it was probably made by a newer version). Runs skip it and carry on with whatever it's connected to. Saving keeps it exactly as it was, so the newer version can still use it.")).into_any_element());
             }
             NodeKind::Webhook { format, screenshot, .. } => {
                 let fmt = *format;
@@ -9244,6 +9624,7 @@ impl MacroApp {
         if let Some(p) = &template {
             out.push(help(&p.display().to_string()).into_any_element());
         }
+        out.extend(self.extra_images(id, cx));
         out.push(
             div()
                 .flex()
@@ -9368,6 +9749,116 @@ impl MacroApp {
         out
     }
 
+    /// The other pictures a Find image step looks for, with buttons to add and remove them.
+    fn extra_images(&self, id: u64, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let more = match self.doc.node(id).map(|n| &n.kind) {
+            Some(NodeKind::FindImage { more_templates, template, .. }) if template.is_some() => more_templates.clone(),
+            _ => return Vec::new(),
+        };
+        let mut out: Vec<AnyElement> = Vec::new();
+        out.push(div().h(px(4.)).into_any_element());
+        out.push(section_title("Or any of these").into_any_element());
+        for (i, p) in more.iter().enumerate() {
+            let name = p.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default();
+            out.push(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex_none()
+                            .size(px(34.))
+                            .rounded_md()
+                            .bg(rgb(UI_INPUT))
+                            .border_1()
+                            .border_color(rgb(UI_EDGE))
+                            .p(px(2.))
+                            .child(img(p.clone()).size_full().object_fit(ObjectFit::Contain)),
+                    )
+                    .child(div().flex_1().min_w(px(0.)).text_xs().text_color(rgb(MUTED)).child(format!("{}. {name}", i + 2)))
+                    .child(small_btn(("extra-img-del", i), "Remove").on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        this.update_node(id, |k| {
+                            if let NodeKind::FindImage { more_templates, .. } = k {
+                                if i < more_templates.len() {
+                                    more_templates.remove(i);
+                                }
+                            }
+                        });
+                        cx.notify();
+                    })))
+                    .into_any_element(),
+            );
+        }
+        out.push(
+            div()
+                .flex()
+                .flex_wrap()
+                .gap_1()
+                .child(small_btn("extra-img-box", "Add: drag a box").on_click(cx.listener(
+                    move |this, ev: &ClickEvent, window, cx| {
+                        this.start_area(AreaPurpose::ExtraTemplate(id), ev.modifiers().shift, window, cx);
+                        cx.notify();
+                    },
+                )))
+                .child(small_btn("extra-img-file", "Add: choose image…").on_click(cx.listener(
+                    move |this, _: &ClickEvent, _, cx| this.choose_extra_template(id, cx),
+                )))
+                .into_any_element(),
+        );
+        out.push(
+            help(if more.is_empty() {
+                "Add more pictures to look for at the same time, e.g. two kinds of button. Whichever is found first counts."
+            } else {
+                "Looks for every picture at once; the first one found counts. The found_image variable says which: 1 for the main picture, 2 for the next… (0 when none was found)."
+            })
+            .into_any_element(),
+        );
+        out
+    }
+
+    /// A key shown in a box, with a button to capture it from the keyboard.
+    fn key_picker(&self, id: u64, label: &str, btn_id: &'static str, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let capturing = self.capturing_key;
+        let current = match self.doc.node(id).map(|n| &n.kind) {
+            Some(NodeKind::KeyCheck { key, .. }) | Some(NodeKind::Trigger { hotkey: key, .. }) => key.clone(),
+            _ => String::new(),
+        };
+        let shown = if capturing {
+            "Press a key…".to_string()
+        } else if current.is_empty() {
+            "None".to_string()
+        } else {
+            keys::label(&current)
+        };
+        vec![
+            labeled(
+                label,
+                div()
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .bg(rgb(UI_INPUT))
+                    .border_1()
+                    .border_color(if capturing { rgb(ACCENT) } else { rgb(UI_EDGE) })
+                    .child(shown),
+            )
+            .into_any_element(),
+            small_btn(btn_id, if capturing { "Cancel" } else { "Capture key from keyboard" })
+                .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                    this.commit_edit();
+                    this.capturing_key = !this.capturing_key;
+                    if this.capturing_key {
+                        this.status = "Press the key you want (Esc cancels).".into();
+                    }
+                    this.focus.focus(window);
+                    cx.notify();
+                }))
+                .into_any_element(),
+        ]
+    }
+
     fn set_var_settings(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
         vec![
             self.text_field("Variable name", Field::VarName, cx).into_any_element(),
@@ -9377,7 +9868,8 @@ impl MacroApp {
             help("• a sum using other variables: gold + 1000, (a + b) / 2, count * 3, total % 10").into_any_element(),
             help("• text, with {name} for a variable: Gold is {gold}").into_any_element(),
             help("• another variable: gold_before").into_any_element(),
-            help("A variable that hasn't been set yet counts as 0 in sums, so “count + 1” works straight away. Built-in: text (the last Read text), run (which repeat this is), found_x / found_y (the last found image).").into_any_element(),
+            help("• a function: random(1, 10) (a whole number from 1 to 10), min(a, b), max(a, b), abs(x), round(x), floor(x), ceil(x)").into_any_element(),
+            help("A variable that hasn't been set yet counts as 0 in sums, so “count + 1” works straight away. Built-in: text (the last Read text), run (which repeat this is), found_x / found_y (the last found image), found_image (which of a Find image step's pictures it found).").into_any_element(),
             help("Use variables in If steps, and as {name} in Type text and Pop-up steps.").into_any_element(),
         ]
     }
@@ -11462,7 +11954,7 @@ fn step_group(k: &NodeKind) -> usize {
         NodeKind::Notify { .. } => 5,
         NodeKind::Trigger { .. } | NodeKind::Webhook { .. } => 7,
         NodeKind::SetVar { .. } | NodeKind::IfCompare { .. } => 6,
-        NodeKind::PixelColor { .. } => 2,
+        NodeKind::PixelColor { .. } | NodeKind::KeyCheck { .. } => 2,
         _ => 3,
     }
 }
@@ -11493,8 +11985,14 @@ fn step_blurb(k: &NodeKind) -> &'static str {
         NodeKind::PixelColor { .. } => "Branch on the colour of one spot",
         NodeKind::Trigger { .. } => "A /command that starts the macro here",
         NodeKind::Webhook { .. } => "Post to Discord or any web address",
+        NodeKind::KeyCheck { .. } => "Branch on a key being held down",
+        NodeKind::RunMacro { .. } => "Run another macro file, then carry on",
+        NodeKind::Unknown { .. } => "A step from another version",
     }
 }
+
+/// A trigger that runs at times of day: (step, command, (hour, minute) times).
+type TimedTrigger = (u64, String, Vec<(u32, u32)>);
 
 /// The macro's trigger names, as the Discord bot offers them.
 /// The macro's triggers with the values they ask for, as the bot registers them.

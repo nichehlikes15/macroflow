@@ -3403,7 +3403,7 @@ dependencies = [
 
 [[package]]
 name = "macroflow"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "device_query",
  "embed-resource",
@@ -3413,6 +3413,7 @@ dependencies = [
  "objc",
  "raw-window-handle",
  "regex",
+ "ring",
  "serde",
  "serde_json",
  "tungstenite",
