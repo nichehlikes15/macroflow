@@ -295,8 +295,28 @@ const NAMES: &[(&str, &str)] = &[
     ("help", "Insert"),
 ];
 
+/// Every key and mouse button held down right now, by name (mouse buttons are
+/// "mouse_left", "mouse_middle", "mouse_back"…).
+pub fn held_names(ds: &device_query::DeviceState) -> Vec<String> {
+    use device_query::DeviceQuery;
+    let mut names: Vec<String> = ds.get_keys().iter().map(|k| from_device(*k)).collect();
+    let down = crate::platform::buttons_down(&ds.get_mouse().button_pressed);
+    for (b, on) in crate::model::MouseBtn::ALL.into_iter().zip(down) {
+        if on {
+            names.push(b.key_name().to_string());
+        }
+    }
+    names
+}
+
 /// Human friendly label for a key name.
 pub fn label(name: &str) -> String {
+    if let Some(b) = crate::model::MouseBtn::from_key_name(name) {
+        return match b {
+            crate::model::MouseBtn::Middle => "Mouse wheel press".to_string(),
+            b => format!("Mouse {}", b.label().to_lowercase()),
+        };
+    }
     if let Some((_, l)) = NAMES.iter().find(|(n, _)| *n == name) {
         return l.to_string();
     }

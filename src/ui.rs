@@ -3129,6 +3129,7 @@ impl MacroApp {
         };
         let path = self.view.clone();
         let new_id = self.doc.add_node_in(&path, kind, x, y);
+        self.new_step_defaults(new_id);
         if let Some(from) = from {
             if self.doc.next(from, 0).is_none() {
                 self.doc.connect(from, 0, new_id);
@@ -3148,6 +3149,7 @@ impl MacroApp {
         };
         let path = self.view.clone();
         let id = self.doc.add_node_in(&path, kind, (x - 24.0).round(), (y - 16.0).round());
+        self.new_step_defaults(id);
         self.clear_selection();
         self.selected = Some(id);
         self.side_tab = SideTab::Edit;
@@ -3220,6 +3222,13 @@ impl MacroApp {
         self.clear_selection();
         self.selected = Some(id);
         self.dirty = true;
+    }
+
+    /// New checks wait by looking again (rather than keeping looking for a time).
+    fn new_step_defaults(&mut self, id: u64) {
+        if let Some(n) = self.doc.node_mut(id) {
+            n.set_retry_style(true);
+        }
     }
 
     fn update_node(&mut self, id: u64, f: impl FnOnce(&mut NodeKind)) {
@@ -8569,7 +8578,11 @@ impl MacroApp {
         if !matches!(n.kind, NodeKind::GroupIn | NodeKind::GroupOut) {
             general.push(self.text_field("Note", Field::Note, cx).into_any_element());
             general.push(self.num_field("Delay before (ms)", Field::Delay, 50.0, cx).into_any_element());
-            if n.kind.can_retry() {
+            // A check that waits by looking again shows its retries with its other settings.
+            let retries_shown_above = n.waits_by_retrying();
+            // "Keep looking" checks don't need retries too (older macros may have both).
+            let retries_here = n.kind.can_retry() && !retries_shown_above && (!n.kind.can_wait() || n.retries > 0);
+            if retries_here {
                 general.push(self.num_field("Retries if it fails", Field::Retries, 1.0, cx).into_any_element());
                 if n.retries > 0 {
                     general.push(self.num_field("Wait between tries (ms)", Field::RetryWait, 250.0, cx).into_any_element());
@@ -8584,6 +8597,8 @@ impl MacroApp {
                         .into_any_element(),
                     );
                 }
+            }
+            if n.kind.can_retry() {
                 let on = n.continue_on_error;
                 general.push(
                     toggle("n-continue", "If it goes wrong, carry on", on)
@@ -8672,7 +8687,7 @@ impl MacroApp {
                         div()
                             .flex()
                             .gap_1()
-                            .children([MouseBtn::Left, MouseBtn::Right, MouseBtn::Middle].into_iter().map(|opt| {
+                            .flex_wrap().children(MouseBtn::ALL.into_iter().map(|opt| {
                                 chip(("btn", opt as usize), opt.label(), b == opt).on_click(cx.listener(
                                     move |this, _: &ClickEvent, _, cx| {
                                         this.update_node(id, |k| {
@@ -8725,7 +8740,7 @@ impl MacroApp {
                 out.push(
                     labeled(
                         "Button",
-                        div().flex().gap_1().children([MouseBtn::Left, MouseBtn::Right, MouseBtn::Middle].into_iter().map(|opt| {
+                        div().flex().gap_1().flex_wrap().children(MouseBtn::ALL.into_iter().map(|opt| {
                             chip(("drag-btn", opt as usize), opt.label(), b == opt).on_click(cx.listener(
                                 move |this, _: &ClickEvent, _, cx| {
                                     this.update_node(id, |k| {
@@ -8827,6 +8842,29 @@ impl MacroApp {
                             cx.notify();
                         }))
                         .into_any_element(),
+                );
+                let current = key.clone();
+                out.push(
+                    labeled(
+                        "Or a mouse button",
+                        div().flex().flex_wrap().gap_1().children(
+                            [MouseBtn::Middle, MouseBtn::Back, MouseBtn::Forward].into_iter().map(|b| {
+                                let label = if b == MouseBtn::Middle { "Wheel press" } else { b.label() };
+                                chip(("kp-mouse", b as usize), label, current == b.key_name()).on_click(cx.listener(
+                                    move |this, _: &ClickEvent, _, cx| {
+                                        this.capturing_key = false;
+                                        this.update_node(id, |k| {
+                                            if let NodeKind::KeyPress { key, .. } = k {
+                                                *key = b.key_name().to_string();
+                                            }
+                                        });
+                                        cx.notify();
+                                    },
+                                ))
+                            }),
+                        ),
+                    )
+                    .into_any_element(),
                 );
                 let md = *mods;
                 #[cfg(target_os = "macos")]
@@ -9006,6 +9044,31 @@ impl MacroApp {
                 out.push(self.text_field("Also run at (times of day)", Field::TriggerTimes, cx).into_any_element());
                 out.push(help("e.g. 08:30, 17:00 (24-hour clock). Like the timer, this only runs while schedules are on.").into_any_element());
                 out.extend(self.key_picker(id, "Hotkey (from any app)", "trig-key", cx));
+                let hk = match &n.kind {
+                    NodeKind::Trigger { hotkey, .. } => hotkey.clone(),
+                    _ => String::new(),
+                };
+                out.push(
+                    div()
+                        .flex()
+                        .flex_wrap()
+                        .gap_1()
+                        .children([MouseBtn::Middle, MouseBtn::Back, MouseBtn::Forward].into_iter().map(|b| {
+                            let label = if b == MouseBtn::Middle { "Wheel press" } else { b.label() };
+                            chip(("trig-mouse", b as usize), label, hk == b.key_name()).on_click(cx.listener(
+                                move |this, _: &ClickEvent, _, cx| {
+                                    this.capturing_key = false;
+                                    this.update_node(id, |k| {
+                                        if let NodeKind::Trigger { hotkey, .. } = k {
+                                            *hotkey = b.key_name().to_string();
+                                        }
+                                    });
+                                    cx.notify();
+                                },
+                            ))
+                        }))
+                        .into_any_element(),
+                );
                 if let NodeKind::Trigger { hotkey, .. } = &n.kind {
                     if !hotkey.is_empty() {
                         out.push(
@@ -9078,7 +9141,7 @@ impl MacroApp {
                         .flex_wrap()
                         .gap_1()
                         .children(
-                            [("shift", "Shift"), ("ctrl", "Ctrl"), ("alt", if cfg!(target_os = "macos") { "Option" } else { "Alt" }), ("cmd", if cfg!(target_os = "macos") { "Cmd" } else { "Win" }), ("space", "Space")]
+                            [("shift", "Shift"), ("ctrl", "Ctrl"), ("alt", if cfg!(target_os = "macos") { "Option" } else { "Alt" }), ("cmd", if cfg!(target_os = "macos") { "Cmd" } else { "Win" }), ("space", "Space"), ("mouse_middle", "Wheel press"), ("mouse_back", "Side back"), ("mouse_forward", "Side forward"), ("mouse_right", "Right button")]
                                 .into_iter()
                                 .enumerate()
                                 .map(|(i, (name, label))| {
@@ -9712,11 +9775,7 @@ impl MacroApp {
         }
         out.push(div().h(px(4.)).into_any_element());
         out.push(self.num_field("Match threshold", Field::Threshold, 0.01, cx).into_any_element());
-        out.push(
-            self.num_field(if gone { "Wait up to (ms)" } else { "Keep looking for (ms)" }, Field::Timeout, 500.0, cx)
-                .into_any_element(),
-        );
-        out.push(self.num_field("Check every (ms)", Field::Interval, 50.0, cx).into_any_element());
+        out.extend(self.wait_block(id, if gone { "Wait up to (ms)" } else { "Keep looking for (ms)" }, "Check every (ms)", 50.0, cx));
         out.push(
             toggle("find-gone", "Wait until it's gone", gone)
                 .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
@@ -9902,7 +9961,7 @@ impl MacroApp {
     }
 
     fn pixel_settings(&self, id: u64, color: u32, cx: &mut Context<Self>) -> Vec<AnyElement> {
-        vec![
+        let mut out = vec![
             labeled(
                 "Colour",
                 div()
@@ -9941,10 +10000,67 @@ impl MacroApp {
                 )))
                 .into_any_element(),
             self.num_field("Tolerance (0–255)", Field::PixelTol, 4.0, cx).into_any_element(),
-            self.num_field("Keep checking for (ms)", Field::Timeout, 500.0, cx).into_any_element(),
-            self.num_field("Check every (ms)", Field::Interval, 20.0, cx).into_any_element(),
-            help("Goes out “match” if the spot is this colour (each of red / green / blue within the tolerance), otherwise “no match”. Much faster than Find image, e.g. for a health bar or a button turning green. Keep checking 0 = check once; set it higher to wait for the colour.").into_any_element(),
-        ]
+        ];
+        out.extend(self.wait_block(id, "Keep checking for (ms)", "Check every (ms)", 20.0, cx));
+        out.push(help("Goes out “match” if the spot is this colour (each of red / green / blue within the tolerance), otherwise “no match”. Much faster than Find image, e.g. for a health bar or a button turning green.").into_any_element());
+        out
+    }
+
+    /// How a check waits for what it's looking for: keep looking for a while, or
+    /// try again a number of times. Either one or the other.
+    fn wait_block(&self, id: u64, keep_label: &str, every_label: &str, every_step: f64, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let Some(n) = self.doc.node(id) else { return Vec::new() };
+        let retrying = n.waits_by_retrying();
+        let gone = matches!(n.kind, NodeKind::FindImage { until_gone: true, .. } | NodeKind::ReadText { until_gone: true, .. });
+        let mut out: Vec<AnyElement> = vec![div().h(px(4.)).into_any_element()];
+        out.push(
+            labeled(
+                if gone { "While it's still there" } else { "If it isn't there yet" },
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .gap_1()
+                    .children([(false, "Keep looking"), (true, "Look again")].into_iter().map(|(on, label)| {
+                        chip(("wait-style", on as usize), label, retrying == on).on_click(cx.listener(
+                            move |this, _: &ClickEvent, _, cx| {
+                                this.commit_edit();
+                                if let Some(n) = this.doc.node_mut(id) {
+                                    n.set_retry_style(on);
+                                    this.dirty = true;
+                                }
+                                cx.notify();
+                            },
+                        ))
+                    })),
+            )
+            .into_any_element(),
+        );
+        if retrying {
+            out.push(self.num_field("Look again (times, 0 = look once)", Field::Retries, 1.0, cx).into_any_element());
+            out.push(self.num_field("Wait between looks (ms)", Field::RetryWait, 50.0, cx).into_any_element());
+            let total = n.retries as u64 * n.retry_wait_ms;
+            out.push(
+                help(&if n.retries == 0 {
+                    "Looks once. Set “Look again” to wait for it: it looks that many more times, pausing between looks.".to_string()
+                } else {
+                    format!(
+                        "Looks once, then up to {} more times, {} ms apart (about {:.1}s in all). It also looks again if the step goes wrong. Each look is a fresh check, so the Log shows only the last one and how many it took.",
+                        n.retries,
+                        n.retry_wait_ms,
+                        total as f32 / 1000.0
+                    )
+                })
+                .into_any_element(),
+            );
+        } else {
+            out.push(self.num_field(keep_label, Field::Timeout, 500.0, cx).into_any_element());
+            out.push(self.num_field(every_label, Field::Interval, every_step, cx).into_any_element());
+            out.push(
+                help("Keeps checking until it finds it or the time runs out, checking this often. 0 = check once.")
+                    .into_any_element(),
+            );
+        }
+        out
     }
 
     fn notify_settings(
@@ -10321,9 +10437,8 @@ impl MacroApp {
                 ))
                 .into_any_element(),
         );
-        out.push(self.num_field("Keep checking for (ms)", Field::Timeout, 500.0, cx).into_any_element());
-        out.push(self.num_field("Check every (ms)", Field::Interval, 50.0, cx).into_any_element());
-        out.push(help("“yes” if a window matches, otherwise “no”. Keep checking 0 = check once; set it higher to wait for a window to open or come to the front.").into_any_element());
+        out.extend(self.wait_block(id, "Keep checking for (ms)", "Check every (ms)", 50.0, cx));
+        out.push(help("“yes” if a window matches, otherwise “no”. Wait to catch a window opening or coming to the front.").into_any_element());
 
         out.push(div().h(px(4.)).into_any_element());
         out.push(
@@ -10507,8 +10622,7 @@ impl MacroApp {
             );
         }
         out.push(self.text_field("Save what's read into variable (optional)", Field::ReadSaveTo, cx).into_any_element());
-        out.push(self.num_field("Keep reading for (ms)", Field::Timeout, 500.0, cx).into_any_element());
-        out.push(self.num_field("Read every (ms)", Field::Interval, 100.0, cx).into_any_element());
+        out.extend(self.wait_block(id, "Keep reading for (ms)", "Read every (ms)", 100.0, cx));
         let explain = if compare.is_number() {
             "Uses the first number in the area (commas, £/$ and minus signs are handled). “match” if the comparison is true, otherwise “no match”."
         } else if compare == TextCompare::Changed {

@@ -260,6 +260,41 @@ fn virtual_desk_coords(x: i32, y: i32, vx: i32, vy: i32, vw: i32, vh: i32) -> (i
     (norm(x, vx, vw), norm(y, vy, vh))
 }
 
+/// Which mouse buttons are down: left, right, middle, side back, side forward.
+/// `reported` is what device_query saw; the side buttons (which it can't see on a
+/// Mac) are asked for directly.
+pub fn buttons_down(reported: &[bool]) -> [bool; 5] {
+    let get = |i: usize| reported.get(i).copied().unwrap_or(false);
+    #[allow(unused_mut)]
+    let mut out = [get(1), get(2), get(3), get(4), get(5)];
+    #[cfg(target_os = "macos")]
+    {
+        #[link(name = "CoreGraphics", kind = "framework")]
+        extern "C" {
+            fn CGEventSourceButtonState(state: i32, button: u32) -> bool;
+        }
+        // SAFETY: a read-only query; 0 = the combined session state.
+        unsafe {
+            out[3] = CGEventSourceButtonState(0, 3);
+            out[4] = CGEventSourceButtonState(0, 4);
+        }
+    }
+    out
+}
+
+/// Windows: a windowed app has no console, so print to the terminal it was started
+/// from (for `macroflow run …`). Does nothing when started by double-clicking.
+pub fn attach_console() {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::Console::{AttachConsole, ATTACH_PARENT_PROCESS};
+        // SAFETY: a plain Win32 call; failing (no parent console) is harmless.
+        unsafe {
+            AttachConsole(ATTACH_PARENT_PROCESS);
+        }
+    }
+}
+
 /// The local time of day: (hour, minute), and a number for the day that changes at
 /// local midnight (so a daily time runs once a day).
 pub fn local_time() -> (u32, u32, i64) {

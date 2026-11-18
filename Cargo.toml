@@ -1,6 +1,6 @@
 [package]
 name = "macroflow"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 description = "A flowchart-style smart macro builder for macOS and Windows, built with GPUI"
 publish = false
@@ -54,6 +54,7 @@ windows-sys = { version = "0.61", features = [
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_System_LibraryLoader",
     "Win32_System_SystemInformation",
+    "Win32_System_Console",
 ] }
 # The same version GPUI uses, to get MacroFlow's own window handle.
 raw-window-handle = "0.6"

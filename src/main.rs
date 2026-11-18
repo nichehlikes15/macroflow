@@ -1,3 +1,7 @@
+// On Windows, MacroFlow is a windowed app: no console window opens behind it.
+// (`macroflow run …` attaches to the terminal it was started from instead.)
+#![cfg_attr(all(windows, not(test)), windows_subsystem = "windows")]
+
 mod assets;
 mod cli;
 mod engine;
@@ -54,6 +58,9 @@ fn install_crash_alert() {
 fn main() {
     // `macroflow run my-macro.json` plays a macro without the editor.
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if !args.is_empty() {
+        platform::attach_console();
+    }
     if let Some(code) = cli::main(&args) {
         std::process::exit(code);
     }

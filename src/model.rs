@@ -13,16 +13,40 @@ pub enum MouseBtn {
     #[default]
     Left,
     Right,
+    /// Pressing the scroll wheel.
     Middle,
+    /// The side button nearer you (usually "back" in a browser).
+    Back,
+    /// The other side button (usually "forward").
+    Forward,
 }
 
 impl MouseBtn {
+    pub const ALL: [MouseBtn; 5] = [MouseBtn::Left, MouseBtn::Right, MouseBtn::Middle, MouseBtn::Back, MouseBtn::Forward];
+
     pub fn label(self) -> &'static str {
         match self {
             MouseBtn::Left => "Left",
             MouseBtn::Right => "Right",
             MouseBtn::Middle => "Middle",
+            MouseBtn::Back => "Side back",
+            MouseBtn::Forward => "Side forward",
         }
+    }
+
+    /// The name a Key press / Key check step uses for this button ("mouse_back"…).
+    pub fn key_name(self) -> &'static str {
+        match self {
+            MouseBtn::Left => "mouse_left",
+            MouseBtn::Right => "mouse_right",
+            MouseBtn::Middle => "mouse_middle",
+            MouseBtn::Back => "mouse_back",
+            MouseBtn::Forward => "mouse_forward",
+        }
+    }
+
+    pub fn from_key_name(name: &str) -> Option<MouseBtn> {
+        MouseBtn::ALL.into_iter().find(|b| b.key_name() == name)
     }
 }
 
@@ -2007,6 +2031,11 @@ pub struct Node {
     /// Optional, so older macros still open.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub continue_on_error: bool,
+    /// A check waits for what it's looking for by trying again (its retries) instead
+    /// of keeping looking for a set time. Only changes which settings the editor
+    /// shows; older macros keep "keep looking".
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub retry_style: bool,
 }
 
 pub fn default_retry_wait() -> u64 {
@@ -2017,7 +2046,58 @@ fn is_default_retry_wait(v: &u64) -> bool {
     *v == default_retry_wait()
 }
 
+impl NodeKind {
+    /// A check that can wait for what it looks for: (keep looking for, check every), in ms.
+    pub fn wait_parts_mut(&mut self) -> Option<(&mut u64, &mut u64)> {
+        match self {
+            NodeKind::FindImage { timeout_ms, interval_ms, .. }
+            | NodeKind::ReadText { timeout_ms, interval_ms, .. }
+            | NodeKind::WindowCheck { timeout_ms, interval_ms, .. }
+            | NodeKind::PixelColor { timeout_ms, interval_ms, .. } => Some((timeout_ms, interval_ms)),
+            _ => None,
+        }
+    }
+
+    /// Can this step wait either by keeping looking or by trying again?
+    pub fn can_wait(&self) -> bool {
+        self.clone().wait_parts_mut().is_some()
+    }
+}
+
 impl Node {
+    /// Does this check wait by trying again (rather than keeping looking)?
+    pub fn waits_by_retrying(&self) -> bool {
+        self.retry_style && self.kind.can_wait()
+    }
+
+    /// Switch how a check waits, keeping roughly the same total time: 5 s of
+    /// looking every 250 ms becomes 20 tries 250 ms apart, and back.
+    pub fn set_retry_style(&mut self, on: bool) {
+        if self.retry_style == on {
+            return;
+        }
+        let (retries, wait) = (self.retries, self.retry_wait_ms);
+        let Some((timeout, interval)) = self.kind.wait_parts_mut() else { return };
+        if on {
+            let every = (*interval).max(50);
+            let mut tries = timeout.div_ceil(every);
+            let mut gap = every;
+            if tries > 100 {
+                tries = 100;
+                gap = timeout.div_ceil(100);
+            }
+            *timeout = 0;
+            self.retries = tries as u32;
+            self.retry_wait_ms = if tries == 0 { every } else { gap };
+        } else {
+            *timeout = retries as u64 * wait;
+            *interval = wait.clamp(50, 60_000);
+            self.retries = 0;
+            self.retry_wait_ms = default_retry_wait();
+        }
+        self.retry_style = on;
+    }
+
     /// What to call this step: its own name, a group's name, or its type.
     pub fn label(&self) -> String {
         if !self.name.trim().is_empty() {
@@ -2428,6 +2508,7 @@ fn blank_node(id: u64, kind: NodeKind, x: f32, y: f32) -> Node {
         retries: 0,
         retry_wait_ms: default_retry_wait(),
         continue_on_error: false,
+        retry_style: false,
     }
 }
 
@@ -5591,6 +5672,54 @@ mod tests {
         let back: RecEvent = serde_json::from_str(&serde_json::to_string(&e).unwrap()).unwrap();
         assert_eq!(back, e);
         assert_eq!(e.action.describe(), "Scroll left 3× at (4, 5)");
+    }
+
+    #[test]
+    fn checks_switch_between_keep_looking_and_retrying() {
+        let mut n = blank_node(1, NodeKind::palette().into_iter().find(|k| matches!(k, NodeKind::FindImage { until_gone: false, .. })).unwrap(), 0.0, 0.0);
+        n.set_retry_style(true);
+        assert!(n.waits_by_retrying());
+        assert!(matches!(n.kind, NodeKind::FindImage { timeout_ms: 0, interval_ms: 250, .. }));
+        assert_eq!((n.retries, n.retry_wait_ms), (20, 250));
+        n.set_retry_style(false);
+        assert!(matches!(n.kind, NodeKind::FindImage { timeout_ms: 5000, interval_ms: 250, .. }));
+        assert_eq!(n.retries, 0);
+        // Long waits keep their length within the 100-try limit.
+        if let Some((t, _)) = n.kind.wait_parts_mut() {
+            *t = 60_000;
+        }
+        n.set_retry_style(true);
+        assert_eq!((n.retries, n.retry_wait_ms), (100, 600));
+        // Older files keep "keep looking", and the new setting isn't written when off.
+        let old = blank_node(2, NodeKind::PixelColor { x: 0, y: 0, color: 0, tolerance: 0, timeout_ms: 0, interval_ms: 100 }, 0.0, 0.0);
+        assert!(!serde_json::to_string(&old).unwrap().contains("retry_style"));
+        assert!(!NodeKind::End.can_wait());
+    }
+
+    #[test]
+    fn mouse_buttons_as_keys() {
+        for b in MouseBtn::ALL {
+            assert_eq!(MouseBtn::from_key_name(b.key_name()), Some(b));
+            let back: MouseBtn = serde_json::from_str(&serde_json::to_string(&b).unwrap()).unwrap();
+            assert_eq!(back, b);
+        }
+        assert_eq!(crate::keys::label("mouse_back"), "Mouse side back");
+        assert_eq!(crate::keys::label("mouse_middle"), "Mouse wheel press");
+        assert!(crate::keys::same_key("mouse_forward", "mouse_forward"));
+        // Older files only ever have the first three, which still read the same.
+        let old: MouseBtn = serde_json::from_str("\"Middle\"").unwrap();
+        assert_eq!(old, MouseBtn::Middle);
+        let p = Macro::default().problems();
+        assert!(p.is_empty() || p.iter().all(|p| !p.text.contains("key")));
+        // A recorded side-button click becomes a Click step with that button.
+        let steps = recording_to_steps(
+            &[
+                RecEvent { delay_ms: 0, action: RecAction::Down { button: MouseBtn::Back, x: 3, y: 4 } },
+                RecEvent { delay_ms: 50, action: RecAction::Up { button: MouseBtn::Back, x: 3, y: 4 } },
+            ],
+            1.0,
+        );
+        assert!(matches!(steps[0], NodeKind::Click { button: MouseBtn::Back, .. }));
     }
 
     #[test]

@@ -177,6 +177,8 @@ fn to_button(b: MouseBtn) -> Button {
         MouseBtn::Left => Button::Left,
         MouseBtn::Right => Button::Right,
         MouseBtn::Middle => Button::Middle,
+        MouseBtn::Back => Button::Back,
+        MouseBtn::Forward => Button::Forward,
     }
 }
 
@@ -456,6 +458,8 @@ fn button_name(b: MouseBtn) -> &'static str {
         MouseBtn::Left => "Left",
         MouseBtn::Right => "Right",
         MouseBtn::Middle => "Middle",
+        MouseBtn::Back => "Side back",
+        MouseBtn::Forward => "Side forward",
     }
 }
 
@@ -570,7 +574,7 @@ pub fn spawn_hotkeys(tx: Tx, triggers: TriggerKeys) {
         let mut held: Vec<u64> = Vec::new();
         loop {
             let keys = ds.get_keys();
-            let names: Vec<String> = keys.iter().map(|k| keys::from_device(*k)).collect();
+            let names = keys::held_names(&ds);
             let wanted = triggers.lock().map(|t| t.clone()).unwrap_or_default();
             for (id, key) in &wanted {
                 let now = names.iter().any(|n| keys::same_key(n, key));
@@ -659,6 +663,8 @@ struct Runner<'a> {
     live: Option<&'a remote::LiveRun>,
     /// The Remote settings when the run started.
     settings: remote::RemoteSettings,
+    /// Log lines held back while a step looks again (only the last look's are kept).
+    held_logs: Option<Vec<LogEntry>>,
 }
 
 impl<'a> Runner<'a> {
@@ -716,6 +722,7 @@ impl<'a> Runner<'a> {
             sent_vars: Vec::new(),
             live: None,
             settings: remote::RemoteSettings::default(),
+            held_logs: None,
         })
     }
 
@@ -744,17 +751,20 @@ impl<'a> Runner<'a> {
         }
     }
 
-    fn log(&self, level: LogLevel, text: String) {
-        send(
-            self.tx,
-            WorkerMsg::Log(LogEntry {
-                ms: self.started.elapsed().as_millis() as u64,
-                step: self.log_step(),
-                text: self.nest_text(text),
-                level,
-                action: None,
-            }),
-        );
+    fn log(&mut self, level: LogLevel, text: String) {
+        let entry = LogEntry {
+            ms: self.started.elapsed().as_millis() as u64,
+            step: self.log_step(),
+            text: self.nest_text(text),
+            level,
+            action: None,
+        };
+        // While a check is looking again, its notes wait to see if it's the last look.
+        if let (Some(held), LogLevel::Info) = (self.held_logs.as_mut(), level) {
+            held.push(entry);
+            return;
+        }
+        send(self.tx, WorkerMsg::Log(entry));
     }
 
     /// Log something the macro did with the mouse or keyboard, with a picture of the
@@ -1416,27 +1426,67 @@ impl<'a> Runner<'a> {
     /// check, when it doesn't find what it's looking for.
     fn exec_with_retries(&mut self, node: &Node) -> Result<Option<usize>, String> {
         let max = if node.kind.can_retry() { node.retries.min(100) } else { 0 };
+        if max == 0 {
+            return self.exec(node);
+        }
+        // A check that looks again because it didn't find it yet is just waiting, so
+        // only its last look is logged, plus one line saying how many it took.
+        // A step inside another (e.g. in a Run macro file step that retries): send what
+        // the outer one held so far, and hold again for it afterwards.
+        self.flush_held_logs();
+        let outer = self.held_logs.is_some();
+        self.held_logs = Some(Vec::new());
+        let t0 = Instant::now();
         let mut tries = 0u32;
-        loop {
+        let mut looks = 0u32;
+        let result = loop {
+            if let Some(h) = self.held_logs.as_mut() {
+                h.clear();
+            }
             let result = self.exec(node);
+            looks += 1;
+            let not_yet = matches!(&result, Ok(Some(p)) if *p != 0 && node.kind.is_check());
             let why = match &result {
                 Err(e) if e != STOPPED && !self.stop.load(Ordering::Relaxed) => e.clone(),
-                Ok(Some(p)) if *p != 0 && node.kind.is_check() => {
-                    let outputs = node.kind.outputs();
-                    format!("went down “{}”", outputs.get(*p).copied().unwrap_or("?"))
-                }
-                _ => return result,
+                _ if not_yet => String::new(),
+                _ => break result,
             };
             if tries >= max {
-                if tries > 0 {
-                    self.log(LogLevel::Warn, format!("↻ Gave up after {} tries", tries + 1));
-                }
-                return result;
+                break result;
             }
             tries += 1;
-            self.log(LogLevel::Warn, format!("↻ {why} – trying again ({}/{max})", tries));
-            self.status(format!("↻ Retrying “{}” ({tries}/{max})…", node.label()));
+            if not_yet {
+                self.status(format!("◎ Looking again for “{}” ({tries}/{max})…   (Esc to stop)", node.label()));
+            } else {
+                self.flush_held_logs();
+                self.log(LogLevel::Warn, format!("↻ {why} – trying again ({tries}/{max})"));
+                self.status(format!("↻ Retrying “{}” ({tries}/{max})…", node.label()));
+            }
             self.sleep(self.scaled(node.retry_wait_ms))?;
+        };
+        self.flush_held_logs();
+        self.held_logs = outer.then(Vec::new);
+        if looks > 1 {
+            let secs = t0.elapsed().as_secs_f32();
+            let ok = matches!(result, Ok(Some(0)));
+            let what = if node.kind.is_check() { "looks" } else { "tries" };
+            let text = match &result {
+                Ok(Some(0)) => format!("↻ Took {looks} {what} ({secs:.1}s)"),
+                _ => format!("↻ Gave up after {looks} {what} ({secs:.1}s)"),
+            };
+            self.log(if ok { LogLevel::Info } else { LogLevel::Warn }, text);
+            if let Some(n) = self.note.take() {
+                self.note = Some(format!("{n} · {looks}×"));
+            }
+        }
+        result
+    }
+
+    /// Send the log lines held back while a check looked again.
+    fn flush_held_logs(&mut self) {
+        let held = self.held_logs.as_mut().map(std::mem::take).unwrap_or_default();
+        for e in held {
+            send(self.tx, WorkerMsg::Log(e));
         }
     }
 
@@ -1455,7 +1505,7 @@ impl<'a> Runner<'a> {
                 let label = keys::label(key);
                 let t0 = Instant::now();
                 loop {
-                    let held = ds.get_keys().iter().any(|k| keys::same_key(&keys::from_device(*k), key));
+                    let held = keys::held_names(&ds).iter().any(|n| keys::same_key(n, key));
                     if held {
                         self.log(LogLevel::Info, format!("{label} is held down"));
                         self.note = Some(format!("{label} pressed"));
@@ -1683,6 +1733,25 @@ impl<'a> Runner<'a> {
                     Some((*from_x, *from_y)),
                     Some((*to_x, *to_y)),
                 );
+                Ok(Some(0))
+            }
+
+            NodeKind::KeyPress { key, mods } if MouseBtn::from_key_name(key).is_some() => {
+                // A mouse button (side buttons, wheel press…), with any keys held.
+                let b = to_button(MouseBtn::from_key_name(key).expect("checked above"));
+                let mod_keys = keys::modifier_keys(mods);
+                self.log_action(format!("⌨ Pressed {}", keys::combo_label(key, mods)), vision::Mark::None, None, None);
+                self.mark_here();
+                for m in &mod_keys {
+                    self.send_key(*m, Direction::Press)?;
+                    self.sleep(8)?;
+                }
+                self.input()?.button(b, Direction::Click).map_err(input_err)?;
+                for m in mod_keys.iter().rev() {
+                    self.sleep(8)?;
+                    self.send_key(*m, Direction::Release)?;
+                }
+                self.mark_click();
                 Ok(Some(0))
             }
 
@@ -2383,7 +2452,7 @@ fn push(events: &mut Vec<RecEvent>, last: &mut Instant, now: Instant, action: Re
     events.push(RecEvent { delay_ms, action });
 }
 
-const BUTTONS: [MouseBtn; 3] = [MouseBtn::Left, MouseBtn::Right, MouseBtn::Middle];
+const BUTTONS: [MouseBtn; 5] = MouseBtn::ALL;
 
 /// Record everything until Esc is pressed (or the stop flag is set).
 pub fn record_macro(tx: Tx, stop: Arc<AtomicBool>, record_moves: bool) {
@@ -2400,7 +2469,7 @@ pub fn record_macro(tx: Tx, stop: Arc<AtomicBool>, record_moves: bool) {
 
         let mut events: Vec<RecEvent> = Vec::new();
         let mut prev_keys: Vec<Keycode> = Vec::new();
-        let mut prev_btn = [false; 3];
+        let mut prev_btn = [false; 5];
         let mut last = Instant::now();
         let mut last_move = Instant::now();
         let mut last_pos = ds.get_mouse().coords;
@@ -2430,8 +2499,9 @@ pub fn record_macro(tx: Tx, stop: Arc<AtomicBool>, record_moves: bool) {
                 last_move = now;
                 last_pos = (mx, my);
             }
+            let down = crate::platform::buttons_down(&mouse.button_pressed);
             for (i, b) in BUTTONS.iter().enumerate() {
-                let is = mouse.button_pressed.get(i + 1).copied().unwrap_or(false);
+                let is = down[i];
                 if is != prev_btn[i] {
                     let action = if is {
                         RecAction::Down { button: *b, x: mx, y: my }
@@ -2520,7 +2590,7 @@ pub fn record_step(tx: Tx, stop: Arc<AtomicBool>) {
             &tx,
             WorkerMsg::Status("◎ Waiting for one click or key press… (Esc cancels)".into()),
         );
-        let pressed = |i: usize| ds.get_mouse().button_pressed.get(i + 1).copied().unwrap_or(false);
+        let pressed = |i: usize| crate::platform::buttons_down(&ds.get_mouse().button_pressed)[i];
         let wait_release = |i: usize| {
             let t0 = Instant::now();
             while pressed(i) && t0.elapsed() < Duration::from_secs(10) {
@@ -2537,8 +2607,9 @@ pub fn record_step(tx: Tx, stop: Arc<AtomicBool>) {
                 return send(&tx, WorkerMsg::Failed("Step recording cancelled.".into()));
             }
             let mouse = ds.get_mouse();
+            let down = crate::platform::buttons_down(&mouse.button_pressed);
             for (i, b) in BUTTONS.iter().enumerate() {
-                if mouse.button_pressed.get(i + 1).copied().unwrap_or(false) {
+                if down[i] {
                     let (x, y) = mouse.coords;
                     wait_release(i);
                     let mut clicks = 1;
